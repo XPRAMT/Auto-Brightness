@@ -462,24 +462,24 @@ class MonitorWrapper:
         try:
             with monitor:
                 caps = monitor.get_vcp_capabilities()
-                cmds = caps.get("cmds", {}) if isinstance(caps, dict) else {}
-                if 0x10 in cmds:
-                    self.brightness_supported = True
-                if 0x12 in cmds:
-                    self.contrast_supported = True
+                supported_vcp = {}
+                if isinstance(caps, dict):
+                    supported_vcp = caps.get("vcp", {}) or caps.get("cmds", {})
+
+                if isinstance(supported_vcp, dict):
+                    self.brightness_supported = 0x10 in supported_vcp
+                    self.contrast_supported = 0x12 in supported_vcp
 
                 try:
-                    br = monitor.get_vcp_feature(0x10)
+                    brightness = int(monitor.get_luminance())
                     self.brightness_supported = True
-                    self.brightness_range = [0, br.maximum]
                 except Exception:
-                    pass
+                    brightness = None
                 try:
-                    cr = monitor.get_vcp_feature(0x12)
+                    contrast = int(monitor.get_contrast())
                     self.contrast_supported = True
-                    self.contrast_range = [0, cr.maximum]
                 except Exception:
-                    pass
+                    contrast = None
 
                 self.supported = self.brightness_supported or self.contrast_supported
         except Exception:
@@ -487,24 +487,19 @@ class MonitorWrapper:
         self.name = get_monitor_display_name(monitor, index, caps)
 
     def read_current_levels(self):
-        if not self.supported:
-            return None, None
-
         brightness = None
         contrast = None
         try:
             with self.lock:
                 with self.monitor as m:
-                    if self.brightness_supported:
-                        try:
-                            brightness = int(m.get_luminance())
-                        except Exception:
-                            brightness = None
-                    if self.contrast_supported:
-                        try:
-                            contrast = int(m.get_contrast())
-                        except Exception:
-                            contrast = None
+                    try:
+                        brightness = int(m.get_luminance())
+                    except Exception:
+                        brightness = None
+                    try:
+                        contrast = int(m.get_contrast())
+                    except Exception:
+                        contrast = None
         except Exception:
             pass
 
