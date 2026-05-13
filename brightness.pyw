@@ -62,7 +62,7 @@ SHORTCUT_KEY_OPTIONS = (
     + [f"F{i}" for i in range(1, 13)]
     + ["Left", "Up", "Right", "Down", "PageUp", "PageDown", "Home", "End"]
 )
-SHORTCUT_TYPE_OPTIONS = ["絕對值", "+Step", "-Step"]
+SHORTCUT_TYPE_OPTIONS = ["絕對值", "+Step", "-Step", "切換自動亮度"]
 KEY_NAME_TO_VK = {
     **{str(i): 0x30 + i for i in range(10)},
     **{chr(code): code for code in range(ord("A"), ord("Z") + 1)},
@@ -178,6 +178,7 @@ def qt_key_event_to_name(event):
 class GlobalHotkeyWheelHook(QtCore.QObject):
     step_requested = QtCore.pyqtSignal(int)
     level_requested = QtCore.pyqtSignal(int)
+    toggle_auto_requested = QtCore.pyqtSignal()
 
     WH_KEYBOARD_LL = 13
     WH_MOUSE_LL = 14
@@ -336,6 +337,8 @@ class GlobalHotkeyWheelHook(QtCore.QObject):
                             self.step_requested.emit(1)
                         elif sc_type == "-Step":
                             self.step_requested.emit(-1)
+                        elif sc_type == "切換自動亮度":
+                            self.toggle_auto_requested.emit()
                         else:
                             self.level_requested.emit(value)
                         return 1
@@ -1634,6 +1637,7 @@ class MainWindow(QtWidgets.QWidget):
             self.global_hook = GlobalHotkeyWheelHook(self)
             self.global_hook.step_requested.connect(self.on_global_hook_step)
             self.global_hook.level_requested.connect(self.on_global_hook_level)
+            self.global_hook.toggle_auto_requested.connect(self.on_global_hook_toggle_auto)
             self.apply_shortcut_to_hook()
             self.apply_level_shortcuts_to_hook()
             self.global_hook.start()
@@ -1975,6 +1979,10 @@ class MainWindow(QtWidgets.QWidget):
         # 絕對值快捷鍵：不管模式，同時更新目標亮度與背光亮度
         self.set_auto_adjust_target(value, trigger_save=False)
         self.set_global_link(value)
+
+    def on_global_hook_toggle_auto(self):
+        # 切換自動亮度開關
+        self.on_auto_adjust_toggled(not self.auto_adjust_enabled)
 
     def adjust_global_link(self, delta):
         new_value = max(0, min(100, self.snap_to_step(self.global_link_value + delta)))
