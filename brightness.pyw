@@ -121,7 +121,6 @@ def get_dynamic_content_coeff(luminance):
 
 
 def get_monitor_display_name(monitor, index, caps=None):
-    print(caps)
     if isinstance(caps, dict):
         model = caps.get("model", "").strip()
         if model:
@@ -456,38 +455,56 @@ class MonitorWrapper:
         self.index = index
         self.brightness_range = [0, 100]
         self.contrast_range = [0, 100]
+        self.supported = False
+        self.brightness_supported = False
+        self.contrast_supported = False
         caps = None
         try:
             with monitor:
                 caps = monitor.get_vcp_capabilities()
+                cmds = caps.get("cmds", {}) if isinstance(caps, dict) else {}
+                if 0x10 in cmds:
+                    self.brightness_supported = True
+                if 0x12 in cmds:
+                    self.contrast_supported = True
+
                 try:
                     br = monitor.get_vcp_feature(0x10)
-                    self.brightness_range = [br.maximum - br.maximum, br.maximum]
+                    self.brightness_supported = True
+                    self.brightness_range = [0, br.maximum]
                 except Exception:
                     pass
                 try:
                     cr = monitor.get_vcp_feature(0x12)
-                    self.contrast_range = [cr.maximum - cr.maximum, cr.maximum]
+                    self.contrast_supported = True
+                    self.contrast_range = [0, cr.maximum]
                 except Exception:
                     pass
+
+                self.supported = self.brightness_supported or self.contrast_supported
         except Exception:
             pass
         self.name = get_monitor_display_name(monitor, index, caps)
 
     def read_current_levels(self):
+        if not self.supported:
+            return None, None
+
         brightness = None
         contrast = None
         try:
             with self.lock:
                 with self.monitor as m:
-                    try:
-                        brightness = int(m.get_luminance())
-                    except Exception:
-                        brightness = None
-                    try:
-                        contrast = int(m.get_contrast())
-                    except Exception:
-                        contrast = None
+                    if self.brightness_supported:
+                        try:
+                            brightness = int(m.get_luminance())
+                        except Exception:
+                            brightness = None
+                    if self.contrast_supported:
+                        try:
+                            contrast = int(m.get_contrast())
+                        except Exception:
+                            contrast = None
         except Exception:
             pass
 
@@ -1310,7 +1327,8 @@ class MainWindow(QtWidgets.QWidget):
         self._last_luminance_source = "—"
         self.current_effective_brightness = 0.0
 
-        self.monitor_wrappers = [MonitorWrapper(m, i) for i, m in enumerate(get_monitors())]
+        wrappers = [MonitorWrapper(m, i) for i, m in enumerate(get_monitors())]
+        self.monitor_wrappers = [wrapper for wrapper in wrappers if wrapper.supported]
         self.monitor_widgets = []
         self.monitor_range_widgets = []
         self.shortcut_rows = []
