@@ -61,6 +61,7 @@ SHORTCUT_KEY_OPTIONS = (
     + [chr(code) for code in range(ord("A"), ord("Z") + 1)]
     + [f"F{i}" for i in range(1, 13)]
     + ["Left", "Up", "Right", "Down", "PageUp", "PageDown", "Home", "End"]
+    + ["滑鼠左鍵", "滑鼠右鍵", "滑鼠中鍵", "滑鼠上一頁", "滑鼠下一頁"]
 )
 SHORTCUT_TYPE_OPTIONS = ["絕對值", "+Step", "-Step", "切換自動亮度"]
 KEY_NAME_TO_VK = {
@@ -77,6 +78,11 @@ KEY_NAME_TO_VK = {
     "PageDown": 0x22,
     "Home": 0x24,
     "End": 0x23,
+    "滑鼠左鍵": 0x01,   # VK_LBUTTON
+    "滑鼠右鍵": 0x02,   # VK_RBUTTON
+    "滑鼠中鍵": 0x04,   # VK_MBUTTON
+    "滑鼠上一頁": 0x05, # VK_XBUTTON1
+    "滑鼠下一頁": 0x06, # VK_XBUTTON2
 }
 DEFAULT_LEVEL_SHORTCUTS = [
     {"modifiers": ["Ctrl"], "key": "NumPad0", "type": "絕對值", "value": 0},
@@ -188,6 +194,10 @@ class GlobalHotkeyWheelHook(QtCore.QObject):
     WM_SYSKEYDOWN = 0x0104
     WM_SYSKEYUP = 0x0105
     WM_MOUSEWHEEL = 0x020A
+    WM_LBUTTONDOWN = 0x0201
+    WM_RBUTTONDOWN = 0x0204
+    WM_MBUTTONDOWN = 0x0207
+    WM_XBUTTONDOWN = 0x020B
 
     VK_MENU = 0x12
     VK_CONTROL = 0x11
@@ -349,7 +359,32 @@ class GlobalHotkeyWheelHook(QtCore.QObject):
             if nCode >= 0:
                 msg = int(wParam)
 
-                # 除錯：觀察是否有進入 mouse hook
+                # 檢查滑鼠按鍵是否匹配 level shortcuts
+                mouse_vk = {
+                    self.WM_LBUTTONDOWN: 0x01,   # VK_LBUTTON
+                    self.WM_RBUTTONDOWN: 0x02,   # VK_RBUTTON
+                    self.WM_MBUTTONDOWN: 0x04,   # VK_MBUTTON
+                }.get(msg)
+                if mouse_vk is None and msg == self.WM_XBUTTONDOWN:
+                    ms = ctypes.cast(lParam, ctypes.POINTER(self.MSLLHOOKSTRUCT)).contents
+                    xbtn = (ms.mouseData >> 16) & 0xFFFF
+                    mouse_vk = {0x0001: 0x05, 0x0002: 0x06}.get(xbtn)  # XBUTTON1→0x05, XBUTTON2→0x06
+
+                if mouse_vk is not None:
+                    match = self._match_level_shortcut(mouse_vk)
+                    if match is not None:
+                        sc_type, value = match
+                        if sc_type == "+Step":
+                            self.step_requested.emit(1)
+                        elif sc_type == "-Step":
+                            self.step_requested.emit(-1)
+                        elif sc_type == "切換自動亮度":
+                            self.toggle_auto_requested.emit()
+                        else:
+                            self.level_requested.emit(value)
+                        return 1
+
+                # 原有的滾輪處理
                 if msg == self.WM_MOUSEWHEEL:
                     ms = ctypes.cast(lParam, ctypes.POINTER(self.MSLLHOOKSTRUCT)).contents
                     high_word = (ms.mouseData >> 16) & 0xFFFF
@@ -796,6 +831,22 @@ class KeyCaptureButton(QtWidgets.QPushButton):
         if key_name is not None:
             self.set_key_name(key_name)
 
+        event.accept()
+
+    def mousePressEvent(self, event):
+        if not self._capture_mode:
+            return super().mousePressEvent(event)
+
+        mouse_btn_map = {
+            QtCore.Qt.MouseButton.LeftButton: "滑鼠左鍵",
+            QtCore.Qt.MouseButton.RightButton: "滑鼠右鍵",
+            QtCore.Qt.MouseButton.MiddleButton: "滑鼠中鍵",
+            QtCore.Qt.MouseButton.XButton1: "滑鼠上一頁",
+            QtCore.Qt.MouseButton.XButton2: "滑鼠下一頁",
+        }
+        key_name = mouse_btn_map.get(event.button())
+        if key_name is not None:
+            self.set_key_name(key_name)
         event.accept()
 
     def focusOutEvent(self, event):
