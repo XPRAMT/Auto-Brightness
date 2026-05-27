@@ -1361,16 +1361,10 @@ class MainWindow(QtWidgets.QWidget):
         self.show_main_page()
 
     def _check_monitors_changed(self):
-        """定時檢查螢幕數量是否變化（熱插拔），觸發安全重建"""
+        """定時檢查螢幕是否變化（熱插拔），觸發安全重建"""
         if self._loading_settings:
             return
-        try:
-            count = len(list(get_monitors()))
-        except Exception:
-            return
-        if count != len(self.monitor_wrappers):
-            print(f"Monitor count changed: {len(self.monitor_wrappers)} → {count}")
-            self._rebuild_monitor_ui()
+        self._rebuild_monitor_ui()
 
     def _rebuild_monitor_ui(self):
         """螢幕熱插拔時安全重建UI，避免當機"""
@@ -1384,6 +1378,11 @@ class MainWindow(QtWidgets.QWidget):
 
         new_names = sorted(w.name for w in wrappers)
         if new_names == self._prev_monitor_names:
+            return
+
+        # 避免暫時性 DDC 通訊失敗導致誤判為無螢幕
+        if not new_names and self._prev_monitor_names:
+            print(f"Monitor detection transient: {self._prev_monitor_names} → [] (skipped)")
             return
 
         print(f"Monitor change: {self._prev_monitor_names} → {new_names}")
