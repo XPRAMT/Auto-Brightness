@@ -1325,6 +1325,7 @@ class MainWindow(QtWidgets.QWidget):
         wrappers = [MonitorWrapper(m, i) for i, m in enumerate(get_monitors())]
         self.monitor_wrappers = [wrapper for wrapper in wrappers if wrapper.supported]
         self._prev_monitor_names = sorted(w.name for w in self.monitor_wrappers)
+        self._prev_raw_monitor_count = len(list(get_monitors()))
         self.monitor_widgets = []
         self.monitor_range_widgets = []
         self.shortcut_rows = []
@@ -1335,10 +1336,10 @@ class MainWindow(QtWidgets.QWidget):
         self.save_timer.setSingleShot(True)
         self.save_timer.timeout.connect(self.save_settings)
 
-        # 定時偵測螢幕熱插拔（每 3 秒檢查一次）
+        # 定時偵測螢幕熱插拔（每 10 秒輕量檢查一次，避免 DDC 通訊塞住 UI）
         self._monitor_watch_timer = QtCore.QTimer()
         self._monitor_watch_timer.timeout.connect(self._check_monitors_changed)
-        self._monitor_watch_timer.start(3000)
+        self._monitor_watch_timer.start(10000)
 
         root_layout = QtWidgets.QVBoxLayout()
         root_layout.setContentsMargins(10, 10, 10, 10)
@@ -1361,10 +1362,17 @@ class MainWindow(QtWidgets.QWidget):
         self.show_main_page()
 
     def _check_monitors_changed(self):
-        """定時檢查螢幕是否變化（熱插拔），觸發安全重建"""
+        """輕量檢查螢幕數量是否變化，避免每 10 秒做完整 DDC 通訊"""
         if self._loading_settings:
             return
-        self._rebuild_monitor_ui()
+        try:
+            current_count = len(list(get_monitors()))
+        except Exception:
+            return
+        if current_count != self._prev_raw_monitor_count:
+            print(f"Monitor raw count changed: {self._prev_raw_monitor_count} → {current_count}")
+            self._prev_raw_monitor_count = current_count
+            self._rebuild_monitor_ui()
 
     def _rebuild_monitor_ui(self):
         """螢幕熱插拔時安全重建UI，避免當機"""
@@ -1386,6 +1394,22 @@ class MainWindow(QtWidgets.QWidget):
             return
 
         print(f"Monitor change: {self._prev_monitor_names} → {new_names}")
+
+        # 重建前先讀取已儲存的螢幕設定，套用到新 wrappers
+        saved_ranges = {}
+        try:
+            with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+                for i, item in enumerate(saved.get("monitors", [])):
+                    saved_ranges[i] = (
+                        list(item.get("b_range", [0, 100])),
+                        list(item.get("c_range", [0, 100])),
+                    )
+        except Exception:
+            pass
+        for i, w in enumerate(wrappers):
+            if i in saved_ranges:
+                w.brightness_range, w.contrast_range = saved_ranges[i]
 
         # 釋放舊 widget（自動斷開 Qt 訊號連線）
         for w in self.monitor_widgets:
