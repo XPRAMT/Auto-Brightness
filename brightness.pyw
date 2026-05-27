@@ -1324,6 +1324,7 @@ class MainWindow(QtWidgets.QWidget):
 
         wrappers = [MonitorWrapper(m, i) for i, m in enumerate(get_monitors())]
         self.monitor_wrappers = [wrapper for wrapper in wrappers if wrapper.supported]
+        self._prev_monitor_names = sorted(w.name for w in self.monitor_wrappers)
         self.monitor_widgets = []
         self.monitor_range_widgets = []
         self.shortcut_rows = []
@@ -1333,6 +1334,11 @@ class MainWindow(QtWidgets.QWidget):
         self.save_timer = QtCore.QTimer()
         self.save_timer.setSingleShot(True)
         self.save_timer.timeout.connect(self.save_settings)
+
+        # 定時偵測螢幕熱插拔（每 3 秒檢查一次）
+        self._monitor_watch_timer = QtCore.QTimer()
+        self._monitor_watch_timer.timeout.connect(self._check_monitors_changed)
+        self._monitor_watch_timer.start(3000)
 
         root_layout = QtWidgets.QVBoxLayout()
         root_layout.setContentsMargins(10, 10, 10, 10)
@@ -1353,6 +1359,67 @@ class MainWindow(QtWidgets.QWidget):
 
         self.load_settings()
         self.show_main_page()
+
+    def _check_monitors_changed(self):
+        """定時檢查螢幕數量是否變化（熱插拔），觸發安全重建"""
+        if self._loading_settings:
+            return
+        try:
+            count = len(list(get_monitors()))
+        except Exception:
+            return
+        if count != len(self.monitor_wrappers):
+            print(f"Monitor count changed: {len(self.monitor_wrappers)} → {count}")
+            self._rebuild_monitor_ui()
+
+    def _rebuild_monitor_ui(self):
+        """螢幕熱插拔時安全重建UI，避免當機"""
+        try:
+            monitors = list(get_monitors())
+            wrappers = [MonitorWrapper(m, i) for i, m in enumerate(monitors)]
+            wrappers = [w for w in wrappers if w.supported]
+        except Exception as e:
+            print("Monitor detection error:", e)
+            return
+
+        new_names = sorted(w.name for w in wrappers)
+        if new_names == self._prev_monitor_names:
+            return
+
+        print(f"Monitor change: {self._prev_monitor_names} → {new_names}")
+
+        # 釋放舊 widget（自動斷開 Qt 訊號連線）
+        for w in self.monitor_widgets:
+            w.deleteLater()
+        for rw in self.monitor_range_widgets:
+            rw.deleteLater()
+
+        self.monitor_wrappers = wrappers
+        self.monitor_widgets = []
+        self.monitor_range_widgets = []
+
+        # 重建主頁面與設定頁
+        old_main = self.main_page
+        old_settings = self.settings_page
+
+        self.main_page = self.build_main_page()
+        self.settings_page = self.build_settings_page()
+        self.settings_page.setMinimumWidth(600)
+
+        self.stack.removeWidget(old_main)
+        self.stack.removeWidget(old_settings)
+        self.stack.insertWidget(0, self.main_page)
+        self.stack.insertWidget(1, self.settings_page)
+        old_main.deleteLater()
+        old_settings.deleteLater()
+
+        self.stack.setCurrentWidget(self.main_page)
+
+        # 重新同步狀態
+        self.sync_ui_with_current_monitor_levels()
+        self._update_analyzer_levels()
+        self.refresh_tray_display()
+        self._prev_monitor_names = new_names
 
     def build_main_page(self):
         page = QtWidgets.QWidget()
@@ -1671,23 +1738,29 @@ class MainWindow(QtWidgets.QWidget):
     def sync_ui_with_current_monitor_levels(self):
         if not self.monitor_wrappers or not self.monitor_widgets:
             return
+        if len(self.monitor_wrappers) != len(self.monitor_widgets):
+            return
 
         link_values = []
         for wrapper, widget in zip(self.monitor_wrappers, self.monitor_widgets):
-            brightness, contrast = wrapper.read_current_levels()
-            if brightness is None:
-                brightness = widget.b_slider.slider.value()
-            if contrast is None:
-                contrast = widget.c_slider.slider.value()
+            try:
+                brightness, contrast = wrapper.read_current_levels()
+                if brightness is None:
+                    brightness = widget.b_slider.slider.value()
+                if contrast is None:
+                    contrast = widget.c_slider.slider.value()
 
-            widget.sync_sliders(brightness, contrast)
+                widget.sync_sliders(brightness, contrast)
 
-            link_value = self._link_value_from_levels(wrapper, brightness, contrast)
-            widget.link_slider.slider.blockSignals(True)
-            widget.link_slider.slider.setValue(link_value)
-            widget.link_slider.slider.blockSignals(False)
-            widget.link_slider.value_label.setText(str(link_value))
-            link_values.append(link_value)
+                link_value = self._link_value_from_levels(wrapper, brightness, contrast)
+                widget.link_slider.slider.blockSignals(True)
+                widget.link_slider.slider.setValue(link_value)
+                widget.link_slider.slider.blockSignals(False)
+                widget.link_slider.value_label.setText(str(link_value))
+                link_values.append(link_value)
+            except RuntimeError:
+                # widget 已被刪除，跳過
+                pass
 
         self.global_link_value = int(round(sum(link_values) / len(link_values))) if link_values else 0
         self.screen_analyzer.set_current_ddc(self.global_link_value)
@@ -1790,6 +1863,8 @@ class MainWindow(QtWidgets.QWidget):
     def on_screen_adjust_requested(self, delta_percent):
         if not self.monitor_wrappers or not self.monitor_widgets:
             return
+        if len(self.monitor_wrappers) != len(self.monitor_widgets):
+            return
 
         try:
             delta_percent = float(delta_percent)
@@ -1803,50 +1878,54 @@ class MainWindow(QtWidgets.QWidget):
 
         link_values = []
         for wrapper, widget in zip(self.monitor_wrappers, self.monitor_widgets):
-            b_min, b_max = wrapper.brightness_range
-            c_min, c_max = wrapper.contrast_range
-            b_range = max(0, b_max - b_min)
-            c_range = max(0, c_max - c_min)
-            total_levels = b_range + c_range
-            if total_levels <= 0:
-                continue
+            try:
+                b_min, b_max = wrapper.brightness_range
+                c_min, c_max = wrapper.contrast_range
+                b_range = max(0, b_max - b_min)
+                c_range = max(0, c_max - c_min)
+                total_levels = b_range + c_range
+                if total_levels <= 0:
+                    continue
 
-            level_step = int(round(total_levels * (abs_percent / 100.0)))
-            if level_step <= 0:
-                level_step = 1
+                level_step = int(round(total_levels * (abs_percent / 100.0)))
+                if level_step <= 0:
+                    level_step = 1
 
-            brightness = int(widget.b_slider.slider.value())
-            contrast = int(widget.c_slider.slider.value())
-            brightness = max(b_min, min(b_max, brightness))
-            contrast = max(c_min, min(c_max, contrast))
+                brightness = int(widget.b_slider.slider.value())
+                contrast = int(widget.c_slider.slider.value())
+                brightness = max(b_min, min(b_max, brightness))
+                contrast = max(c_min, min(c_max, contrast))
 
-            # 先走對比，再走亮度（與 Link 滑桿同邏輯）
-            if brightness <= b_min:
-                current_units = max(0, min(c_range, contrast - c_min))
-            else:
-                current_units = c_range + max(0, min(b_range, brightness - b_min))
+                # 先走對比，再走亮度（與 Link 滑桿同邏輯）
+                if brightness <= b_min:
+                    current_units = max(0, min(c_range, contrast - c_min))
+                else:
+                    current_units = c_range + max(0, min(b_range, brightness - b_min))
 
-            new_units = max(0, min(total_levels, current_units + sign * level_step))
+                new_units = max(0, min(total_levels, current_units + sign * level_step))
 
-            if new_units <= c_range:
-                new_contrast = c_min + new_units
-                new_brightness = b_min
-            else:
-                new_contrast = c_max
-                new_brightness = b_min + (new_units - c_range)
+                if new_units <= c_range:
+                    new_contrast = c_min + new_units
+                    new_brightness = b_min
+                else:
+                    new_contrast = c_max
+                    new_brightness = b_min + (new_units - c_range)
 
-            link_value = int(round((new_units / total_levels) * 100))
-            widget.link_slider.slider.blockSignals(True)
-            widget.link_slider.slider.setValue(link_value)
-            widget.link_slider.slider.blockSignals(False)
-            widget.link_slider.value_label.setText(str(link_value))
+                link_value = int(round((new_units / total_levels) * 100))
+                widget.link_slider.slider.blockSignals(True)
+                widget.link_slider.slider.setValue(link_value)
+                widget.link_slider.slider.blockSignals(False)
+                widget.link_slider.value_label.setText(str(link_value))
 
-            widget.pending_brightness = int(round(new_brightness))
-            widget.pending_contrast = int(round(new_contrast))
-            widget.sync_sliders(widget.pending_brightness, widget.pending_contrast)
-            widget.restart()
+                widget.pending_brightness = int(round(new_brightness))
+                widget.pending_contrast = int(round(new_contrast))
+                widget.sync_sliders(widget.pending_brightness, widget.pending_contrast)
+                widget.restart()
 
-            link_values.append(link_value)
+                link_values.append(link_value)
+            except RuntimeError:
+                # widget 已被刪除（熱插拔），跳過
+                pass
 
         if link_values:
             self.global_link_value = int(round(sum(link_values) / len(link_values)))
@@ -2084,11 +2163,15 @@ class MainWindow(QtWidgets.QWidget):
         self._update_auto_adjust_info()
         try:
             for w in self.monitor_widgets:
-                w.link_slider.slider.blockSignals(True)
-                w.link_slider.slider.setValue(value)
-                w.link_slider.slider.blockSignals(False)
-                w.link_slider.value_label.setText(str(value))
-                w.on_link(value) # 確保發送 DDC 指令
+                try:
+                    w.link_slider.slider.blockSignals(True)
+                    w.link_slider.slider.setValue(value)
+                    w.link_slider.slider.blockSignals(False)
+                    w.link_slider.value_label.setText(str(value))
+                    w.on_link(value) # 確保發送 DDC 指令
+                except RuntimeError:
+                    # widget 已被刪除（熱插拔後），跳過
+                    pass
         finally:
             self._updating_global_link = False
 
@@ -2146,6 +2229,18 @@ class MainWindow(QtWidgets.QWidget):
                 "b_range": wrapper.brightness_range,
                 "c_range": wrapper.contrast_range
             })
+
+        # 無螢幕時保留既有設定，避免重啟後螢幕範圍遺失
+        if not data["monitors"]:
+            try:
+                with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+                    old = json.load(f)
+                    old_monitors = old.get("monitors", [])
+                    if old_monitors:
+                        data["monitors"] = old_monitors
+            except Exception:
+                pass
+
         try:
             with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
                 json.dump(data, f)
