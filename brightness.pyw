@@ -1310,6 +1310,319 @@ class ScreenAnalyzer(QtCore.QObject):
 
 
 # =========================
+# Network: mDNS Discovery + TCP Control
+# =========================
+NETWORK_SERVICE_TYPE = "_brightnessddc._tcp.local."
+NETWORK_PORT = 9876
+
+class NetworkMonitorServer:
+    """在背景執行緒啟動 TCP server，透過 mDNS 廣播本機 DDC 螢幕資訊。
+    
+    客戶端連線後可取得所有螢幕列表，並可下達亮度/對比設定指令。
+    通訊協定為 JSON line-based (一行一個 JSON 物件)。
+    """
+    def __init__(self, get_monitor_wrappers, set_monitor_callback):
+        self._get_wrappers = get_monitor_wrappers
+        self._set_callback = set_monitor_callback
+        self._running = False
+        self._server_thread = None
+        self._sock = None
+        self._zeroconf = None
+
+    def start(self):
+        if self._running:
+            return
+        self._running = True
+        self._server_thread = threading.Thread(target=self._run_server, daemon=True, name="NetServer")
+        self._server_thread.start()
+
+    def stop(self):
+        self._running = False
+        if self._sock:
+            try:
+                self._sock.close()
+            except Exception:
+                pass
+        if self._zeroconf:
+            try:
+                self._zeroconf.unregister_all_services()
+                self._zeroconf.close()
+            except Exception:
+                pass
+        self._zeroconf = None
+
+    def _run_server(self):
+        import socket
+        try:
+            self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self._sock.settimeout(1.0)
+            self._sock.bind(("0.0.0.0", NETWORK_PORT))
+            self._sock.listen(5)
+        except Exception as e:
+            print(f"NetServer bind error: {e}")
+            self._running = False
+            return
+
+        # 註冊 mDNS
+        try:
+            local_ip = self._get_local_ip()
+            hostname = socket.gethostname()
+            info = ServiceInfo(
+                type_=NETWORK_SERVICE_TYPE,
+                name=f"{hostname}-ddc.{NETWORK_SERVICE_TYPE}",
+                addresses=[socket.inet_aton(local_ip)],
+                port=NETWORK_PORT,
+                properties={"hostname": hostname},
+            )
+            self._zeroconf = Zeroconf()
+            self._zeroconf.register_service(info)
+        except Exception as e:
+            print(f"mDNS register error: {e}")
+
+        print(f"NetServer started on port {NETWORK_PORT}")
+        while self._running:
+            try:
+                client, addr = self._sock.accept()
+                client.settimeout(5.0)
+                threading.Thread(target=self._handle_client, args=(client, addr), daemon=True).start()
+            except TimeoutError:
+                continue
+            except Exception:
+                if self._running:
+                    continue
+                break
+
+    def _get_local_ip(self):
+        import socket
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.settimeout(1.0)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        except Exception:
+            return "127.0.0.1"
+
+    def _handle_client(self, client, addr):
+        import socket
+        try:
+            with client:
+                buf = b""
+                while self._running:
+                    data = client.recv(4096)
+                    if not data:
+                        break
+                    buf += data
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        line = line.strip()
+                        if not line:
+                            continue
+                        response = self._process_request(line)
+                        client.sendall((json.dumps(response) + "\n").encode())
+        except (socket.timeout, ConnectionResetError, OSError):
+            pass
+        except Exception as e:
+            print(f"NetServer client error: {e}")
+
+    def _process_request(self, line):
+        try:
+            req = json.loads(line)
+        except json.JSONDecodeError:
+            return {"error": "invalid json"}
+        cmd = req.get("cmd", "")
+        if cmd == "list":
+            monitors = []
+            for w in self._get_wrappers():
+                if not w.available:
+                    continue
+                b, c = w.read_current_levels()
+                monitors.append({
+                    "name": w.name,
+                    "brightness": b,
+                    "contrast": c,
+                    "brightness_range": w.brightness_range,
+                    "contrast_range": w.contrast_range,
+                    "brightness_supported": w.brightness_supported,
+                    "contrast_supported": w.contrast_supported,
+                })
+            return {"monitors": monitors}
+        elif cmd == "set":
+            name = req.get("name", "")
+            brightness = req.get("brightness")
+            contrast = req.get("contrast")
+            self._set_callback(name, brightness, contrast)
+            return {"ok": True}
+        elif cmd == "ping":
+            return {"pong": True}
+        return {"error": "unknown cmd"}
+
+
+class NetworkMonitorClient(QtCore.QObject):
+    """mDNS 偵測網路上的 DDC server，提供遠端螢幕唯讀控制。"""
+    remote_monitors_updated = QtCore.pyqtSignal(list)  # list of dict
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._running = False
+        self._discovered_servers = {}  # name -> {"info": ServiceInfo, "monitors": []}
+        self._browser = None
+        self._zeroconf = None
+
+    def start(self):
+        if self._running:
+            return
+        self._running = True
+        self._zeroconf = Zeroconf()
+        self._browser = self._zeroconf.add_service_listener(
+            NETWORK_SERVICE_TYPE, _ServiceListener(self._on_service_changed)
+        )
+        # 定期刷新
+        self._refresh_timer = QtCore.QTimer(self)
+        self._refresh_timer.timeout.connect(self._refresh_all)
+        self._refresh_timer.start(10000)
+
+    def stop(self):
+        self._running = False
+        if self._refresh_timer:
+            self._refresh_timer.stop()
+        if self._browser and self._zeroconf:
+            try:
+                self._zeroconf.remove_service_listener(self._browser)
+            except Exception:
+                pass
+        if self._zeroconf:
+            try:
+                self._zeroconf.close()
+            except Exception:
+                pass
+        self._zeroconf = None
+
+    def _on_service_changed(self, name, info=None, added=True):
+        if not added:
+            self._discovered_servers.pop(name, None)
+            self._emit_remote_monitors()
+            return
+        if info is None:
+            return
+        self._discovered_servers[name] = {"info": info, "monitors": []}
+        self._query_server(name)
+
+    def _query_server(self, name):
+        entry = self._discovered_servers.get(name)
+        if not entry:
+            return
+        info = entry["info"]
+        if not info.parsed_addresses():
+            return
+        import socket
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(3.0)
+            addr = info.parsed_addresses()[0]
+            s.connect((addr, info.port))
+            s.sendall(json.dumps({"cmd": "list"}).encode() + b"\n")
+            buf = b""
+            while True:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                buf += chunk
+                if b"\n" in buf:
+                    line, _ = buf.split(b"\n", 1)
+                    resp = json.loads(line)
+                    monitors = resp.get("monitors", [])
+                    entry["monitors"] = monitors
+                    hostname = info.properties.get(b"hostname", b"unknown").decode()
+                    print(f"Remote server {hostname}: {len(monitors)} monitors")
+                    self._emit_remote_monitors()
+                    break
+            s.close()
+        except Exception as e:
+            print(f"Query {name} error: {e}")
+
+    def _refresh_all(self):
+        for name in list(self._discovered_servers.keys()):
+            self._query_server(name)
+
+    def _emit_remote_monitors(self):
+        all_monitors = []
+        for srv_name, entry in self._discovered_servers.items():
+            hostname = entry["info"].properties.get(b"hostname", srv_name).decode()
+            for mon in entry.get("monitors", []):
+                mon["_remote_server"] = hostname
+                mon["_remote_name"] = srv_name
+                all_monitors.append(mon)
+        self.remote_monitors_updated.emit(all_monitors)
+
+    def remote_set(self, server_name, monitor_name, brightness=None, contrast=None):
+        entry = self._discovered_servers.get(server_name)
+        if not entry:
+            return
+        info = entry["info"]
+        if not info.parsed_addresses():
+            return
+        import socket
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(3.0)
+            s.connect((info.parsed_addresses()[0], info.port))
+            req = {"cmd": "set", "name": monitor_name}
+            if brightness is not None:
+                req["brightness"] = int(brightness)
+            if contrast is not None:
+                req["contrast"] = int(contrast)
+            s.sendall(json.dumps(req).encode() + b"\n")
+            s.close()
+        except Exception as e:
+            print(f"Remote set error: {e}")
+
+
+class _ServiceListener:
+    """Zeroconf service listener callback wrapper."""
+    def __init__(self, callback):
+        self._callback = callback
+
+    def add_service(self, zeroconf, type_, name):
+        info = zeroconf.get_service_info(type_, name)
+        if info:
+            self._callback(name, info, True)
+
+    def remove_service(self, zeroconf, type_, name):
+        self._callback(name, None, False)
+
+    def update_service(self, zeroconf, type_, name):
+        self.remove_service(zeroconf, type_, name)
+        self.add_service(zeroconf, type_, name)
+
+
+class RemoteMonitorWrapper:
+    """遠端螢幕的 MonitorWrapper 等價物件（唯讀/可遠端設定）。"""
+    def __init__(self, data, server_name):
+        self.name = data.get("name", f"Remote {server_name}")
+        self._server_name = server_name
+        self.brightness_range = list(data.get("brightness_range", [0, 100]))
+        self.contrast_range = list(data.get("contrast_range", [0, 100]))
+        self.brightness_supported = data.get("brightness_supported", True)
+        self.contrast_supported = data.get("contrast_supported", True)
+        self.supported = True
+        self.available = True
+        self._brightness = data.get("brightness")
+        self._contrast = data.get("contrast")
+
+    def read_current_levels(self):
+        return self._brightness, self._contrast
+
+    def update_from_data(self, data):
+        self._brightness = data.get("brightness", self._brightness)
+        self._contrast = data.get("contrast", self._contrast)
+        self.brightness_range = list(data.get("brightness_range", self.brightness_range))
+        self.contrast_range = list(data.get("contrast_range", self.contrast_range))
+
+
+# =========================
 # Main Window
 # =========================
 class MainWindow(QtWidgets.QWidget):
@@ -1334,6 +1647,14 @@ class MainWindow(QtWidgets.QWidget):
         self.global_hook = None
         self._loading_settings = False
 
+        # 網路功能
+        self._network_server_enabled = False
+        self._network_client_enabled = False
+        self._remote_wrappers = []
+        self._remote_widgets = []
+        self._remote_monitor_data = []
+        self.remote_servers_map = {}
+
         # 畫面自動調整
         self.auto_adjust_enabled = False
         self.auto_adjust_target = 50
@@ -1357,6 +1678,19 @@ class MainWindow(QtWidgets.QWidget):
         self._last_avg_luminance = None
         self._last_luminance_source = "—"
         self.current_effective_brightness = 0.0
+
+        # 網路功能
+        self._network_server_enabled = False
+        self._network_client_enabled = False
+        self._net_server = NetworkMonitorServer(
+            get_monitor_wrappers=lambda: self.monitor_wrappers,
+            set_monitor_callback=self._remote_set_monitor,
+        )
+        self._net_client = NetworkMonitorClient(self)
+        self._net_client.remote_monitors_updated.connect(self._on_remote_monitors_updated)
+        self._remote_wrappers = []  # RemoteMonitorWrapper 列表
+        self._remote_widgets = []   # 遠端螢幕的 MonitorWidget
+        self._remote_monitor_data = []  # 原始資料（用於 remote_set）
 
         wrappers = [MonitorWrapper(m, i) for i, m in enumerate(get_monitors())]
         self.monitor_wrappers = []
@@ -1617,6 +1951,29 @@ class MainWindow(QtWidgets.QWidget):
         global_group.setLayout(global_grid)
         scroll_layout.addWidget(global_group)
 
+        # ---- 網路功能 ----
+        net_group = QtWidgets.QGroupBox("網路功能 (DDC over LAN)")
+        net_grid = QtWidgets.QGridLayout()
+        net_grid.setContentsMargins(6, 6, 6, 6)
+        net_grid.setSpacing(6)
+
+        self.net_server_checkbox = QtWidgets.QCheckBox("啟用伺服器 (分享本機螢幕給區域網路)")
+        self.net_server_checkbox.setChecked(self._network_server_enabled)
+        self.net_server_checkbox.toggled.connect(self._on_net_server_toggled)
+
+        self.net_client_checkbox = QtWidgets.QCheckBox("啟用用戶端 (發現並控制區域網路其他螢幕)")
+        self.net_client_checkbox.setChecked(self._network_client_enabled)
+        self.net_client_checkbox.toggled.connect(self._on_net_client_toggled)
+
+        self.net_servers_label = QtWidgets.QLabel("已發現伺服器: 0")
+        self.net_servers_label.setWordWrap(True)
+
+        net_grid.addWidget(self.net_server_checkbox, 0, 0, 1, 2)
+        net_grid.addWidget(self.net_client_checkbox, 1, 0, 1, 2)
+        net_grid.addWidget(self.net_servers_label, 2, 0, 1, 2)
+        net_group.setLayout(net_grid)
+        scroll_layout.addWidget(net_group)
+
         wheel_group = QtWidgets.QGroupBox("滾輪快捷鍵")
         wheel_grid = QtWidgets.QGridLayout()
         wheel_grid.setContentsMargins(6, 6, 6, 6)
@@ -1785,6 +2142,127 @@ class MainWindow(QtWidgets.QWidget):
         self._update_monitor_availability()
         self._update_analyzer_levels()
         self.trigger_save()
+
+    # ---- 網路功能 ----
+    def _on_net_server_toggled(self, enabled):
+        self._network_server_enabled = enabled
+        if enabled:
+            self._net_server.start()
+        else:
+            self._net_server.stop()
+        self.trigger_save()
+
+    def _on_net_client_toggled(self, enabled):
+        self._network_client_enabled = enabled
+        if enabled:
+            self._net_client.start()
+        else:
+            self._net_client.stop()
+            self._clear_remote_wrappers()
+        self.trigger_save()
+
+    def _on_remote_monitors_updated(self, monitors):
+        if hasattr(self, "net_servers_label"):
+            server_count = len(set(m.get("_remote_server", "?") for m in monitors))
+            self.net_servers_label.setText(f"已發現伺服器: {server_count} 台，共 {len(monitors)} 個螢幕")
+
+        # 更新/新增遠端 wrappers
+        used_server_names = set()
+        for data in monitors:
+            srv = data.get("_remote_name", "")
+            used_server_names.add(srv)
+            existing = next((x for x in self._remote_wrappers if x._server_name == srv and x.name == data.get("name")), None)
+            if existing:
+                existing.update_from_data(data)
+            else:
+                wrapper = RemoteMonitorWrapper(data, srv)
+                self._remote_wrappers.append(wrapper)
+                self.monitor_wrappers.append(wrapper)
+                widget = MonitorWidget(wrapper, self.threadpool)
+                widget.value_changed.connect(self._on_remote_monitor_link_changed)
+                self._remote_widgets.append(widget)
+                self.remote_servers_map[srv] = widget  # track
+
+        self._rebuild_remote_widgets()
+        self.refresh_tray_display()
+
+    def _clear_remote_wrappers(self):
+        for w in self._remote_wrappers:
+            if w in self.monitor_wrappers:
+                self.monitor_wrappers.remove(w)
+        for widget in self._remote_widgets:
+            widget.deleteLater()
+        self._remote_wrappers.clear()
+        self._remote_widgets.clear()
+        self._rebuild_remote_widgets()
+
+    def _rebuild_remote_widgets(self):
+        """將遠端螢幕加入主頁面 layout（在 local 螢幕之後）"""
+        if not hasattr(self, "main_page") or not self.main_page:
+            return
+        layout = self.main_page.layout()
+        if layout is None:
+            return
+        # 在 auto info label 之前插入遠端 widget
+        info_idx = -1
+        for i in range(layout.count()):
+            item = layout.itemAt(i)
+            if item and item.widget() is self.main_auto_adjust_info_label:
+                info_idx = i
+                break
+        # 移除所有現有遠端 widget（避免重複）
+        for w in self._remote_widgets:
+            if w.isVisible():
+                layout.removeWidget(w)
+        # 重新插入
+        for w in self._remote_widgets:
+            if info_idx >= 0:
+                layout.insertWidget(info_idx, w)
+            else:
+                layout.addWidget(w)
+
+    def _on_remote_monitor_link_changed(self, percent):
+        """遠端螢幕聯動滑桿變更 → 透過網路發送 set 指令"""
+        widget = self.sender()
+        if not isinstance(widget, MonitorWidget):
+            return
+        wrapper = widget.monitor
+        if not isinstance(wrapper, RemoteMonitorWrapper):
+            return
+        srv = wrapper._server_name
+        b_min, b_max = wrapper.brightness_range
+        c_min, c_max = wrapper.contrast_range
+        b_range = b_max - b_min
+        c_range = c_max - c_min
+        total = b_range + c_range
+        value = percent / 100 * total
+        if value <= c_range:
+            contrast = c_min + value
+            brightness = b_min
+        else:
+            contrast = c_max
+            brightness = b_min + (value - c_range)
+        self._net_client.remote_set(srv, wrapper.name, int(brightness), int(contrast))
+
+    def _remote_set_monitor(self, name, brightness, contrast):
+        """由 NetworkMonitorServer 回呼：遠端要求設定本機螢幕"""
+        for w in self.monitor_wrappers:
+            if w.name == name and w.available:
+                if brightness is not None:
+                    try:
+                        with w.lock:
+                            with w.monitor as m:
+                                m.set_luminance(int(brightness))
+                    except Exception as e:
+                        print(f"Remote set luminance error: {e}")
+                if contrast is not None:
+                    try:
+                        with w.lock:
+                            with w.monitor as m:
+                                m.set_contrast(int(contrast))
+                    except Exception as e:
+                        print(f"Remote set contrast error: {e}")
+                break
 
     def show_settings_page(self):
         self.stack.setCurrentWidget(self.settings_page)
@@ -2295,6 +2773,8 @@ class MainWindow(QtWidgets.QWidget):
         if self.global_hook is not None:
             self.global_hook.stop()
         self.screen_analyzer.stop()
+        self._net_server.stop()
+        self._net_client.stop()
         self._is_quitting = True
         QtWidgets.QApplication.quit()
 
@@ -2324,6 +2804,10 @@ class MainWindow(QtWidgets.QWidget):
                 "step_percent": self.auto_adjust_step_percent,
                 "resource_saving_enabled": self.auto_adjust_resource_saving_enabled,
                 "resource_saving_idle_seconds": self.auto_adjust_resource_saving_idle_seconds,
+            },
+            "network": {
+                "server_enabled": self._network_server_enabled,
+                "client_enabled": self._network_client_enabled,
             },
             "monitors": [],
         }
@@ -2366,6 +2850,11 @@ class MainWindow(QtWidgets.QWidget):
             saved_key2 = shortcut.get("key2", "Win") if isinstance(shortcut, dict) else "Win"
             monitors_data = data.get("monitors", data) if isinstance(data, dict) else data
             auto_adjust_data = data.get("auto_adjust", {}) if isinstance(data, dict) else {}
+            net_data = data.get("network", {}) if isinstance(data, dict) else {}
+
+            # 載入網路功能設定（先存值，等 UI 建立後再啟動 server/client）
+            self._network_server_enabled = bool(net_data.get("server_enabled", False))
+            self._network_client_enabled = bool(net_data.get("client_enabled", False))
 
             # 先決定是否啟用自動調整，避免啟動流程誤下發 DDC 指令
             self.auto_adjust_enabled = bool(auto_adjust_data.get("enabled", False))
@@ -2497,6 +2986,16 @@ class MainWindow(QtWidgets.QWidget):
             print("Load Error:", e)
         finally:
             self._loading_settings = False
+
+        # 啟動網路功能（需在 load_settings 完成後，確保 UI checkbox 已存在）
+        if self._network_server_enabled:
+            self._net_server.start()
+            if hasattr(self, "net_server_checkbox"):
+                self.net_server_checkbox.setChecked(True)
+        if self._network_client_enabled:
+            self._net_client.start()
+            if hasattr(self, "net_client_checkbox"):
+                self.net_client_checkbox.setChecked(True)
 
 
 # =========================
