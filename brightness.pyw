@@ -490,9 +490,12 @@ class MonitorWrapper:
                 self.supported = self.brightness_supported or self.contrast_supported
                 self.available = self.supported
         except Exception:
-            pass
-        if caps:
-            self.name = get_monitor_display_name(monitor, index, caps)
+            # DDC 通訊失敗 → 不支援 DDC
+            self.supported = False
+            self.brightness_supported = False
+            self.contrast_supported = False
+            self.available = False
+        self.name = get_monitor_display_name(monitor, index, caps)
 
     def set_available(self, available):
         self.available = available
@@ -615,6 +618,8 @@ class MonitorWidget(QtWidgets.QGroupBox):
         self.restart()
 
     def on_link(self, percent):
+        if not self.monitor.available:
+            return
         b_min, b_max = self.monitor.brightness_range
         c_min, c_max = self.monitor.contrast_range
 
@@ -1354,7 +1359,11 @@ class MainWindow(QtWidgets.QWidget):
         self.current_effective_brightness = 0.0
 
         wrappers = [MonitorWrapper(m, i) for i, m in enumerate(get_monitors())]
-        self.monitor_wrappers = [wrapper for wrapper in wrappers if wrapper.supported]
+        self.monitor_wrappers = []
+        for w in wrappers:
+            if not w.supported:
+                w.available = False
+            self.monitor_wrappers.append(w)
         self._known_monitor_names = sorted(w.name for w in self.monitor_wrappers)
         self._prev_raw_monitor_count = len(list(get_monitors()))
 
