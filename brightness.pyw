@@ -544,6 +544,9 @@ class MonitorWidget(QtWidgets.QGroupBox):
         self.pending_brightness = None
         self.pending_contrast = None
 
+        # 螢幕名稱字體設為白色
+        self.setStyleSheet("QGroupBox::title { color: white; }")
+
         layout = QtWidgets.QVBoxLayout()
         # 讓版面更加緊湊
         layout.setContentsMargins(5, 5, 5, 5)
@@ -660,9 +663,8 @@ class MonitorWidget(QtWidgets.QGroupBox):
 
     def set_available(self, available):
         """灰階/恢復顯示，可用時啟用滑桿，不可用時鎖定"""
-        alpha = 1.0 if available else 0.4
-        style = self.styleSheet()
-        self.setStyleSheet(f"QGroupBox{{color: rgba(0,0,0,{alpha})}}")
+        opacity = 1.0 if available else 0.4
+        self.setStyleSheet(f"QGroupBox::title {{ color: white; }} QGroupBox {{ color: rgba(255,255,255,{opacity}); }}")
         for attr in ("b_slider", "c_slider", "link_slider"):
             obj = getattr(self, attr, None)
             if obj:
