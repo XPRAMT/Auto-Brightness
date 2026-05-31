@@ -449,15 +449,21 @@ class DDCWorker(QtCore.QRunnable):
 # Monitor Wrapper
 # =========================
 class MonitorWrapper:
-    def __init__(self, monitor, index):
+    def __init__(self, monitor=None, index=0, name="", b_range=None, c_range=None):
         self.monitor = monitor
         self.lock = threading.Lock()
         self.index = index
-        self.brightness_range = [0, 100]
-        self.contrast_range = [0, 100]
-        self.supported = False
-        self.brightness_supported = False
-        self.contrast_supported = False
+        self.brightness_range = list(b_range or [0, 100])
+        self.contrast_range = list(c_range or [0, 100])
+        self.supported = monitor is not None
+        self.brightness_supported = monitor is not None
+        self.contrast_supported = monitor is not None
+        self.available = monitor is not None
+        self.name = name or f"Display {index + 1}"
+
+        if monitor is None:
+            return
+
         caps = None
         try:
             with monitor:
@@ -471,22 +477,29 @@ class MonitorWrapper:
                     self.contrast_supported = 0x12 in supported_vcp
 
                 try:
-                    brightness = int(monitor.get_luminance())
+                    int(monitor.get_luminance())
                     self.brightness_supported = True
                 except Exception:
-                    brightness = None
+                    pass
                 try:
-                    contrast = int(monitor.get_contrast())
+                    int(monitor.get_contrast())
                     self.contrast_supported = True
                 except Exception:
-                    contrast = None
+                    pass
 
                 self.supported = self.brightness_supported or self.contrast_supported
+                self.available = self.supported
         except Exception:
             pass
-        self.name = get_monitor_display_name(monitor, index, caps)
+        if caps:
+            self.name = get_monitor_display_name(monitor, index, caps)
+
+    def set_available(self, available):
+        self.available = available
 
     def read_current_levels(self):
+        if not self.available or self.monitor is None:
+            return None, None
         brightness = None
         contrast = None
         try:
@@ -640,8 +653,24 @@ class MonitorWidget(QtWidgets.QGroupBox):
         self.debounce_timer.start(100)
 
     def apply_values(self):
+        if not self.monitor.available:
+            return
         worker = DDCWorker(self.monitor.monitor, self.monitor.lock, self.pending_brightness, self.pending_contrast)
         self.threadpool.start(worker)
+
+    def set_available(self, available):
+        """灰階/恢復顯示，可用時啟用滑桿，不可用時鎖定"""
+        alpha = 1.0 if available else 0.4
+        style = self.styleSheet()
+        self.setStyleSheet(f"QGroupBox{{color: rgba(0,0,0,{alpha})}}")
+        for attr in ("b_slider", "c_slider", "link_slider"):
+            obj = getattr(self, attr, None)
+            if obj:
+                obj.slider.setEnabled(available)
+        if available:
+            self.setTitle(self.monitor.name)
+        else:
+            self.setTitle(f"{self.monitor.name} (不可用)")
 
 
 class MonitorRangeWidget(QtWidgets.QGroupBox):
@@ -1324,8 +1353,13 @@ class MainWindow(QtWidgets.QWidget):
 
         wrappers = [MonitorWrapper(m, i) for i, m in enumerate(get_monitors())]
         self.monitor_wrappers = [wrapper for wrapper in wrappers if wrapper.supported]
-        self._prev_monitor_names = sorted(w.name for w in self.monitor_wrappers)
+        self._known_monitor_names = sorted(w.name for w in self.monitor_wrappers)
         self._prev_raw_monitor_count = len(list(get_monitors()))
+
+        # 無支援螢幕時，從設定檔恢復已知螢幕（保持 UI 顯示但灰階）
+        if not self.monitor_wrappers:
+            self._restore_known_monitors_from_settings()
+
         self.monitor_widgets = []
         self.monitor_range_widgets = []
         self.shortcut_rows = []
@@ -1336,7 +1370,7 @@ class MainWindow(QtWidgets.QWidget):
         self.save_timer.setSingleShot(True)
         self.save_timer.timeout.connect(self.save_settings)
 
-        # 定時偵測螢幕熱插拔（每 10 秒輕量檢查一次，避免 DDC 通訊塞住 UI）
+        # 定時偵測螢幕熱插拔（每 10 秒輕量檢查一次）
         self._monitor_watch_timer = QtCore.QTimer()
         self._monitor_watch_timer.timeout.connect(self._check_monitors_changed)
         self._monitor_watch_timer.start(10000)
@@ -1361,8 +1395,99 @@ class MainWindow(QtWidgets.QWidget):
         self.load_settings()
         self.show_main_page()
 
+    def _restore_known_monitors_from_settings(self):
+        """從設定檔恢復已知螢幕名稱，建立不可用的 MonitorWrapper 佔位"""
+        try:
+            with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            known_names = saved.get("known_monitor_names", [])
+            monitors_data = saved.get("monitors", [])
+            for i, name in enumerate(known_names):
+                b_range = [0, 100]
+                c_range = [0, 100]
+                if i < len(monitors_data):
+                    b_range = list(monitors_data[i].get("b_range", [0, 100]))
+                    c_range = list(monitors_data[i].get("c_range", [0, 100]))
+                w = MonitorWrapper(monitor=None, index=i, name=name,
+                                   b_range=b_range, c_range=c_range)
+                w.available = False
+                w.supported = False
+                self.monitor_wrappers.append(w)
+            self._known_monitor_names = known_names
+        except Exception:
+            pass
+
+    def _update_monitor_availability(self):
+        """重新偵測螢幕，更新現有 wrappers 的 available 狀態，必要時新增/移除"""
+        try:
+            monitors = list(get_monitors())
+        except Exception as e:
+            print("Monitor detection error:", e)
+            return
+
+        # 建立名稱 → monitor 對照
+        new_wrappers = []
+        for i, m in enumerate(monitors):
+            try:
+                with m:
+                    caps = m.get_vcp_capabilities()
+                    name = get_monitor_display_name(m, i, caps)
+                    supported_vcp = {}
+                    if isinstance(caps, dict):
+                        supported_vcp = caps.get("vcp", {}) or caps.get("cmds", {})
+                    bs = 0x10 in supported_vcp if isinstance(supported_vcp, dict) else False
+                    cs = 0x12 in supported_vcp if isinstance(supported_vcp, dict) else False
+                    try:
+                        int(m.get_luminance())
+                        bs = True
+                    except Exception:
+                        pass
+                    try:
+                        int(m.get_contrast())
+                        cs = True
+                    except Exception:
+                        pass
+                    if bs or cs:
+                        new_wrappers.append((name, m, bs, cs))
+            except Exception:
+                continue
+
+        detected = {name for name, _, _, _ in new_wrappers}
+        current_names = {w.name for w in self.monitor_wrappers}
+
+        # 新增：完全新的螢幕
+        for name, mon, bs, cs in new_wrappers:
+            if name not in current_names:
+                w = MonitorWrapper(mon, len(self.monitor_wrappers))
+                w.available = True
+                self.monitor_wrappers.append(w)
+                print(f"Monitor added: {name}")
+
+        # 更新：現有螢幕的可用/不可用狀態
+        for w in self.monitor_wrappers:
+            if w.name in detected:
+                if not w.available:
+                    print(f"Monitor became available: {w.name}")
+                w.available = True
+            else:
+                if w.available:
+                    print(f"Monitor became unavailable: {w.name}")
+                w.available = False
+
+        self._known_monitor_names = sorted(w.name for w in self.monitor_wrappers)
+        self._prev_raw_monitor_count = len(monitors)
+
+        # 更新所有 widget 的灰階狀態
+        for w in self.monitor_widgets:
+            wrapper = next((x for x in self.monitor_wrappers if x.name == w.monitor.name), None)
+            if wrapper:
+                w.set_available(wrapper.available)
+
+        self.sync_ui_with_current_monitor_levels()
+        self.refresh_tray_display()
+
     def _check_monitors_changed(self):
-        """輕量檢查螢幕數量是否變化，避免每 10 秒做完整 DDC 通訊"""
+        """輕量檢查螢幕數量是否變化，變化時更新可用狀態"""
         if self._loading_settings:
             return
         try:
@@ -1371,78 +1496,11 @@ class MainWindow(QtWidgets.QWidget):
             return
         if current_count != self._prev_raw_monitor_count:
             print(f"Monitor raw count changed: {self._prev_raw_monitor_count} → {current_count}")
-            self._prev_raw_monitor_count = current_count
-            self._rebuild_monitor_ui()
+            self._update_monitor_availability()
 
     def _rebuild_monitor_ui(self):
-        """螢幕熱插拔時安全重建UI，避免當機"""
-        try:
-            monitors = list(get_monitors())
-            wrappers = [MonitorWrapper(m, i) for i, m in enumerate(monitors)]
-            wrappers = [w for w in wrappers if w.supported]
-        except Exception as e:
-            print("Monitor detection error:", e)
-            return
-
-        new_names = sorted(w.name for w in wrappers)
-        if new_names == self._prev_monitor_names:
-            return
-
-        # 避免暫時性 DDC 通訊失敗導致誤判為無螢幕
-        if not new_names and self._prev_monitor_names:
-            print(f"Monitor detection transient: {self._prev_monitor_names} → [] (skipped)")
-            return
-
-        print(f"Monitor change: {self._prev_monitor_names} → {new_names}")
-
-        # 重建前先讀取已儲存的螢幕設定，套用到新 wrappers
-        saved_ranges = {}
-        try:
-            with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
-                saved = json.load(f)
-                for i, item in enumerate(saved.get("monitors", [])):
-                    saved_ranges[i] = (
-                        list(item.get("b_range", [0, 100])),
-                        list(item.get("c_range", [0, 100])),
-                    )
-        except Exception:
-            pass
-        for i, w in enumerate(wrappers):
-            if i in saved_ranges:
-                w.brightness_range, w.contrast_range = saved_ranges[i]
-
-        # 釋放舊 widget（自動斷開 Qt 訊號連線）
-        for w in self.monitor_widgets:
-            w.deleteLater()
-        for rw in self.monitor_range_widgets:
-            rw.deleteLater()
-
-        self.monitor_wrappers = wrappers
-        self.monitor_widgets = []
-        self.monitor_range_widgets = []
-
-        # 重建主頁面與設定頁
-        old_main = self.main_page
-        old_settings = self.settings_page
-
-        self.main_page = self.build_main_page()
-        self.settings_page = self.build_settings_page()
-        self.settings_page.setMinimumWidth(600)
-
-        self.stack.removeWidget(old_main)
-        self.stack.removeWidget(old_settings)
-        self.stack.insertWidget(0, self.main_page)
-        self.stack.insertWidget(1, self.settings_page)
-        old_main.deleteLater()
-        old_settings.deleteLater()
-
-        self.stack.setCurrentWidget(self.main_page)
-
-        # 重新同步狀態
-        self.sync_ui_with_current_monitor_levels()
-        self._update_analyzer_levels()
-        self.refresh_tray_display()
-        self._prev_monitor_names = new_names
+        """螢幕熱插拔時安全重建UI（保留 wrapper，只更新可用性）"""
+        self._update_monitor_availability()
 
     def build_main_page(self):
         page = QtWidgets.QWidget()
@@ -1456,6 +1514,9 @@ class MainWindow(QtWidgets.QWidget):
         self.main_auto_adjust_checkbox.toggled.connect(self.on_auto_adjust_toggled)
         top_bar.addWidget(self.main_auto_adjust_checkbox)
         top_bar.addStretch()
+        refresh_button = QtWidgets.QPushButton("重新偵測")
+        refresh_button.clicked.connect(self.refresh_monitors)
+        top_bar.addWidget(refresh_button)
         settings_button = QtWidgets.QPushButton("設定")
         settings_button.clicked.connect(self.show_settings_page)
         top_bar.addWidget(settings_button)
@@ -1483,6 +1544,7 @@ class MainWindow(QtWidgets.QWidget):
         for wrapper in self.monitor_wrappers:
             monitor_widget = MonitorWidget(wrapper, self.threadpool)
             monitor_widget.value_changed.connect(self.on_monitor_link_changed)
+            monitor_widget.set_available(wrapper.available)
             self.monitor_widgets.append(monitor_widget)
             layout.addWidget(monitor_widget)
 
@@ -1706,6 +1768,12 @@ class MainWindow(QtWidgets.QWidget):
         self.show()
         self.raise_()
         self.activateWindow()
+
+    def refresh_monitors(self):
+        """重新偵測螢幕按鈕：更新可用狀態，保留所有已知螢幕"""
+        self._update_monitor_availability()
+        self._update_analyzer_levels()
+        self.trigger_save()
 
     def show_settings_page(self):
         self.stack.setCurrentWidget(self.settings_page)
@@ -2227,6 +2295,7 @@ class MainWindow(QtWidgets.QWidget):
 
     def save_settings(self):
         data = {
+            "known_monitor_names": self._known_monitor_names,
             "global_link": self.global_link_value,
             "step": self.get_step_value(),
             "auto_start": self.auto_start_enabled,
@@ -2334,7 +2403,7 @@ class MainWindow(QtWidgets.QWidget):
             self.auto_start_enabled = bool(saved_auto_start)
             self.set_startup_enabled(self.auto_start_enabled)
 
-            for wrapper, monitor_widget, range_widget, data_item in zip(self.monitor_wrappers, self.monitor_widgets, self.monitor_range_widgets, monitors_data):
+            for wrapper, monitor_widget, range_widget, data_item in zip(self.monitor_wrappers, self.monitor_widgets, self.monitor_range_widgets, monitors_data[:len(self.monitor_wrappers)]):
                 b_range = data_item.get("b_range", wrapper.brightness_range)
                 c_range = data_item.get("c_range", wrapper.contrast_range)
                 wrapper.brightness_range = list(b_range)
