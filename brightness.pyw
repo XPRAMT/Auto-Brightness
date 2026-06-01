@@ -1915,13 +1915,18 @@ class MainWindow(QtWidgets.QWidget):
         top_bar.addWidget(back_button)
         layout.addLayout(top_bar)
 
-        scroll = QtWidgets.QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll_container = QtWidgets.QWidget()
-        scroll_layout = QtWidgets.QVBoxLayout()
-        scroll_layout.setContentsMargins(0, 0, 0, 0)
-        scroll_layout.setSpacing(8)
+        # Tab widget: General / Monitors / Network
+        tabs = QtWidgets.QTabWidget()
 
+        # --- General Tab ---
+        gen_scroll = QtWidgets.QScrollArea()
+        gen_scroll.setWidgetResizable(True)
+        gen_container = QtWidgets.QWidget()
+        gen_layout = QtWidgets.QVBoxLayout()
+        gen_layout.setContentsMargins(0, 0, 0, 0)
+        gen_layout.setSpacing(8)
+
+        # 全局設定 (Step, autostart)
         global_group = QtWidgets.QGroupBox("全局設定")
         global_grid = QtWidgets.QGridLayout()
         global_grid.setContentsMargins(6, 6, 6, 6)
@@ -1930,7 +1935,6 @@ class MainWindow(QtWidgets.QWidget):
         self.step_combo = QtWidgets.QComboBox()
         STEP_OPTIONS = ["1", "2", "2.5", "4", "5","10"]
         self.step_combo.addItems(STEP_OPTIONS)
-        # 找出最接近預設值的選項
         default_idx = 0
         for i, s in enumerate(STEP_OPTIONS):
             if abs(float(s) - self.step_value) < 0.01:
@@ -1949,31 +1953,9 @@ class MainWindow(QtWidgets.QWidget):
         global_grid.addWidget(self.step_combo, 0, 1)
         global_grid.addWidget(self.autostart_checkbox, 1, 0, 1, 2)
         global_group.setLayout(global_grid)
-        scroll_layout.addWidget(global_group)
+        gen_layout.addWidget(global_group)
 
-        # ---- 網路功能 ----
-        net_group = QtWidgets.QGroupBox("網路功能 (DDC over LAN)")
-        net_grid = QtWidgets.QGridLayout()
-        net_grid.setContentsMargins(6, 6, 6, 6)
-        net_grid.setSpacing(6)
-
-        self.net_server_checkbox = QtWidgets.QCheckBox("啟用伺服器 (分享本機螢幕給區域網路)")
-        self.net_server_checkbox.setChecked(self._network_server_enabled)
-        self.net_server_checkbox.toggled.connect(self._on_net_server_toggled)
-
-        self.net_client_checkbox = QtWidgets.QCheckBox("啟用用戶端 (發現並控制區域網路其他螢幕)")
-        self.net_client_checkbox.setChecked(self._network_client_enabled)
-        self.net_client_checkbox.toggled.connect(self._on_net_client_toggled)
-
-        self.net_servers_label = QtWidgets.QLabel("已發現伺服器: 0")
-        self.net_servers_label.setWordWrap(True)
-
-        net_grid.addWidget(self.net_server_checkbox, 0, 0, 1, 2)
-        net_grid.addWidget(self.net_client_checkbox, 1, 0, 1, 2)
-        net_grid.addWidget(self.net_servers_label, 2, 0, 1, 2)
-        net_group.setLayout(net_grid)
-        scroll_layout.addWidget(net_group)
-
+        # 滾輪快捷鍵 + 鍵盤快捷鍵放 General
         wheel_group = QtWidgets.QGroupBox("滾輪快捷鍵")
         wheel_grid = QtWidgets.QGridLayout()
         wheel_grid.setContentsMargins(6, 6, 6, 6)
@@ -1994,6 +1976,7 @@ class MainWindow(QtWidgets.QWidget):
         wheel_grid.addWidget(QtWidgets.QLabel("+"), 0, 2)
         wheel_grid.addWidget(self.shortcut_key2_combo, 0, 3)
         wheel_group.setLayout(wheel_grid)
+        gen_layout.addWidget(wheel_group)
 
         shortcut_group = QtWidgets.QGroupBox("鍵盤快捷鍵")
         shortcut_layout = QtWidgets.QVBoxLayout()
@@ -2015,8 +1998,22 @@ class MainWindow(QtWidgets.QWidget):
         add_shortcut_button.clicked.connect(self.add_shortcut_row)
         shortcut_layout.addWidget(add_shortcut_button)
         shortcut_group.setLayout(shortcut_layout)
+        gen_layout.addWidget(shortcut_group)
 
-        # ---- 畫面自動調整 ----
+        gen_layout.addStretch()
+        gen_container.setLayout(gen_layout)
+        gen_scroll.setWidget(gen_container)
+        tabs.addTab(gen_scroll, "General")
+
+        # --- Monitors Tab ---
+        mon_scroll = QtWidgets.QScrollArea()
+        mon_scroll.setWidgetResizable(True)
+        mon_container = QtWidgets.QWidget()
+        mon_layout = QtWidgets.QVBoxLayout()
+        mon_layout.setContentsMargins(0, 0, 0, 0)
+        mon_layout.setSpacing(8)
+
+        # 畫面自動調整
         auto_group = QtWidgets.QGroupBox("畫面自動調整")
         auto_grid = QtWidgets.QGridLayout()
         auto_grid.setContentsMargins(6, 6, 6, 6)
@@ -2107,10 +2104,10 @@ class MainWindow(QtWidgets.QWidget):
         auto_grid.addWidget(self.auto_adjust_weight_spin, 4, 1)
         auto_grid.addWidget(self.auto_adjust_info_label, 5, 0, 1, 4)
         auto_group.setLayout(auto_grid)
-        scroll_layout.addWidget(auto_group)
+        mon_layout.addWidget(auto_group)
 
         if not self.monitor_wrappers:
-            scroll_layout.addWidget(QtWidgets.QLabel("未偵測到可控制的螢幕"))
+            mon_layout.addWidget(QtWidgets.QLabel("未偵測到可控制的螢幕"))
 
         for wrapper, monitor_widget in zip(self.monitor_wrappers, self.monitor_widgets):
             range_widget = MonitorRangeWidget(wrapper)
@@ -2118,16 +2115,48 @@ class MainWindow(QtWidgets.QWidget):
             range_widget.ranges_changed.connect(lambda _b, _c: self.trigger_save())
             range_widget.ranges_changed.connect(lambda _b, _c: self._update_analyzer_levels())
             self.monitor_range_widgets.append(range_widget)
-            scroll_layout.addWidget(range_widget)
+            mon_layout.addWidget(range_widget)
 
-        # ---- 快捷鍵區域放在最下面 ----
-        scroll_layout.addWidget(wheel_group)
-        scroll_layout.addWidget(shortcut_group)
+        mon_layout.addStretch()
+        mon_container.setLayout(mon_layout)
+        mon_scroll.setWidget(mon_container)
+        tabs.addTab(mon_scroll, "Monitors")
 
-        scroll_layout.addStretch()
-        scroll_container.setLayout(scroll_layout)
-        scroll.setWidget(scroll_container)
-        layout.addWidget(scroll)
+        # --- Network Tab ---
+        net_scroll = QtWidgets.QScrollArea()
+        net_scroll.setWidgetResizable(True)
+        net_container = QtWidgets.QWidget()
+        net_layout = QtWidgets.QVBoxLayout()
+        net_layout.setContentsMargins(0, 0, 0, 0)
+        net_layout.setSpacing(8)
+
+        net_group = QtWidgets.QGroupBox("網路功能 (DDC over LAN)")
+        net_grid = QtWidgets.QGridLayout()
+        net_grid.setContentsMargins(6, 6, 6, 6)
+        net_grid.setSpacing(6)
+
+        self.net_server_checkbox = QtWidgets.QCheckBox("啟用伺服器 (分享本機螢幕給區域網路)")
+        self.net_server_checkbox.setChecked(self._network_server_enabled)
+        self.net_server_checkbox.toggled.connect(self._on_net_server_toggled)
+
+        self.net_client_checkbox = QtWidgets.QCheckBox("啟用用戶端 (發現並控制區域網路其他螢幕)")
+        self.net_client_checkbox.setChecked(self._network_client_enabled)
+        self.net_client_checkbox.toggled.connect(self._on_net_client_toggled)
+
+        self.net_servers_label = QtWidgets.QLabel("已發現伺服器: 0")
+        self.net_servers_label.setWordWrap(True)
+
+        net_grid.addWidget(self.net_server_checkbox, 0, 0, 1, 2)
+        net_grid.addWidget(self.net_client_checkbox, 1, 0, 1, 2)
+        net_grid.addWidget(self.net_servers_label, 2, 0, 1, 2)
+        net_group.setLayout(net_grid)
+        net_layout.addWidget(net_group)
+        net_layout.addStretch()
+        net_container.setLayout(net_layout)
+        net_scroll.setWidget(net_container)
+        tabs.addTab(net_scroll, "Network")
+
+        layout.addWidget(tabs)
         page.setLayout(layout)
         return page
 
