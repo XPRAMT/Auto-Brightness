@@ -3,6 +3,7 @@ import json
 import threading
 import ctypes
 import os
+import time
 from ctypes import wintypes
 
 # 避免 Windows 上 Qt 輸出 DPI awareness 的無害警告
@@ -46,15 +47,7 @@ except ImportError:
 # PowerShell 範例：$env:BRIGHTNESS_VS_SCRIPT='C:\path\to\source.vpy'
 VAPOURSYNTH_SCRIPT_PATH = os.environ.get("BRIGHTNESS_VS_SCRIPT", "").strip()
 
-# UDP IPC：test.vpy 每幀把亮度值 (float32) 發到此 port
-_vs_udp_raw = os.environ.get("BRIGHTNESS_VS_UDP_PORT", "").strip()
-if _vs_udp_raw == "":
-    VS_UDP_PORT = None
-else:
-    try:
-        VS_UDP_PORT = int(_vs_udp_raw)
-    except Exception:
-        VS_UDP_PORT = None
+# 先前支援透過 UDP 傳輸每幀亮度的機制已移除，改為透過 TCP（NetworkMonitorServer）以固定頻率廣播亮度。
 
 SETTINGS_FILE = "settings.json"
 SETTINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), SETTINGS_FILE)
@@ -328,90 +321,42 @@ class GlobalHotkeyWheelHook(QtCore.QObject):
     def start(self):
         if sys.platform != "win32" or self.running:
             return
+
         self.running = True
-        self.thread = threading.Thread(target=self._run_hook_loop, daemon=True)
-        self.thread.start()
 
-    def stop(self):
-        if not self.running:
-            return
-        self.running = False
-        if self.thread_id:
-            self.user32.PostThreadMessageW(self.thread_id, 0x0012, 0, 0)  # WM_QUIT
-        if self.thread:
-            self.thread.join(timeout=1.0)
-
-    def _run_hook_loop(self):
-        self.thread_id = self.kernel32.GetCurrentThreadId()
-
+        # 定義 Windows hook callback
         HOOKPROC = ctypes.WINFUNCTYPE(self.LRESULT, ctypes.c_int, self.WPARAM_T, self.LPARAM_T)
 
         def keyboard_proc(nCode, wParam, lParam):
-            if nCode >= 0:
-                kbd = ctypes.cast(lParam, ctypes.POINTER(self.KBDLLHOOKSTRUCT)).contents
-                vk = kbd.vkCode
-                msg = int(wParam)
-
-                if msg in (self.WM_KEYDOWN, self.WM_SYSKEYDOWN):
+            if nCode >= 0 and wParam in (self.WM_KEYDOWN, self.WM_SYSKEYDOWN):
+                try:
+                    k = ctypes.cast(lParam, ctypes.POINTER(self.KBDLLHOOKSTRUCT)).contents
+                    vk = k.vkCode
                     match = self._match_level_shortcut(vk)
-                    if match is not None:
+                    if match:
                         sc_type, value = match
-                        if sc_type == "+Step":
-                            self.step_requested.emit(1)
-                        elif sc_type == "-Step":
-                            self.step_requested.emit(-1)
-                        elif sc_type == "切換自動亮度":
-                            self.toggle_auto_requested.emit()
-                        else:
-                            self.level_requested.emit(value)
+                        self.level_requested.emit(value)
                         return 1
-
+                except Exception:
+                    pass
             return self.user32.CallNextHookEx(0, nCode, wParam, lParam)
 
         def mouse_proc(nCode, wParam, lParam):
-            if nCode >= 0:
-                msg = int(wParam)
-
-                # 檢查滑鼠按鍵是否匹配 level shortcuts
-                mouse_vk = {
-                    self.WM_LBUTTONDOWN: 0x01,   # VK_LBUTTON
-                    self.WM_RBUTTONDOWN: 0x02,   # VK_RBUTTON
-                    self.WM_MBUTTONDOWN: 0x04,   # VK_MBUTTON
-                }.get(msg)
-                if mouse_vk is None and msg == self.WM_XBUTTONDOWN:
-                    ms = ctypes.cast(lParam, ctypes.POINTER(self.MSLLHOOKSTRUCT)).contents
-                    xbtn = (ms.mouseData >> 16) & 0xFFFF
-                    mouse_vk = {0x0001: 0x05, 0x0002: 0x06}.get(xbtn)  # XBUTTON1→0x05, XBUTTON2→0x06
-
-                if mouse_vk is not None:
-                    match = self._match_level_shortcut(mouse_vk)
-                    if match is not None:
-                        sc_type, value = match
-                        if sc_type == "+Step":
-                            self.step_requested.emit(1)
-                        elif sc_type == "-Step":
-                            self.step_requested.emit(-1)
-                        elif sc_type == "切換自動亮度":
-                            self.toggle_auto_requested.emit()
-                        else:
-                            self.level_requested.emit(value)
-                        return 1
-
-                # 原有的滾輪處理
-                if msg == self.WM_MOUSEWHEEL:
+            if nCode >= 0 and wParam == self.WM_MOUSEWHEEL:
+                try:
                     ms = ctypes.cast(lParam, ctypes.POINTER(self.MSLLHOOKSTRUCT)).contents
                     high_word = (ms.mouseData >> 16) & 0xFFFF
                     delta = ctypes.c_short(high_word).value
-
                     key1_pressed = self._is_modifier_pressed(self.trigger_key1)
                     key2_pressed = self._is_modifier_pressed(self.trigger_key2)
-
                     if key1_pressed and key2_pressed:
                         wheel_steps = int(delta / 120) if delta != 0 else 0
                         if wheel_steps == 0:
                             wheel_steps = 1 if delta > 0 else -1
                         self.step_requested.emit(wheel_steps)
                         return 1
+                except Exception:
+                    pass
             return self.user32.CallNextHookEx(0, nCode, wParam, lParam)
 
         self._keyboard_proc = HOOKPROC(keyboard_proc)
@@ -431,10 +376,6 @@ class GlobalHotkeyWheelHook(QtCore.QObject):
         if self.mouse_hook:
             self.user32.UnhookWindowsHookEx(self.mouse_hook)
             self.mouse_hook = None
-
-        self.thread_id = 0
-        self.alt_down = False
-        self.win_down = False
 
 # =========================
 # Worker Thread
@@ -921,70 +862,7 @@ class KeyCaptureButton(QtWidgets.QPushButton):
 # =========================
 # Screen Auto Brightness Analyzer
 # =========================
-class _UdpLuminanceServer:
-    """
-    在背景執行緒監聽 UDP，接收 test.vpy 每幀送來的亮度值（4-byte float）。
-    每次 get_average_and_reset() 返回自上次呼叫以來所有樣本的平均值並清空緩衝。
-    若該區間內沒有收到任何封包則返回 None（可回退到 DXGI）。
-    """
-    _instance: "_UdpLuminanceServer | None" = None
-    _lock = threading.Lock()
-    _init_failed = False
-
-    def __init__(self, port: int = VS_UDP_PORT):
-        import socket, struct
-        self._struct = struct
-        self._samples: list = []          # 區間內累積的所有樣本
-        self._data_lock = threading.Lock()
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._sock.settimeout(1.0)
-        self._sock.bind(("127.0.0.1", port))
-        self._thread = threading.Thread(target=self._run, daemon=True, name="UdpLuminance")
-        self._thread.start()
-        print(f"[UdpLuminance] 監聽 127.0.0.1:{port}")
-
-    def _run(self):
-        while True:
-            try:
-                data, _ = self._sock.recvfrom(16)
-                if len(data) >= 4:
-                    val = self._struct.unpack("f", data[:4])[0]
-                    with self._data_lock:
-                        self._samples.append(float(val))
-            except TimeoutError:
-                pass  # settimeout 超時是正常的，繼續等待下一幀
-            except OSError:
-                break  # socket 真正關閉（程式退出）才結束執行緒
-            except Exception:
-                pass
-
-    def get_average_and_reset(self) -> float | None:
-        """返回自上次呼叫以來的樣本平均值，並清空列表。無資料則返回 None。"""
-        with self._data_lock:
-            if not self._samples:
-                return None
-            avg = sum(self._samples) / len(self._samples)
-            self._samples = []
-            return avg
-
-    @classmethod
-    def instance(cls) -> "_UdpLuminanceServer":
-        with cls._lock:
-            # 若未指定環境變數則不啟動 UDP 功能
-            if VS_UDP_PORT is None:
-                return None
-            if cls._instance is not None:
-                return cls._instance
-            if cls._init_failed:
-                return None
-            try:
-                cls._instance = cls(VS_UDP_PORT)
-                return cls._instance
-            except Exception as e:
-                cls._init_failed = True
-                print(f"[UdpLuminance] 啟動失敗: {e}")
-                return None
+# UDP luminance server 已移除；本程式改以 TCP 廣播亮度樣本 (NetworkMonitorServer.broadcast_luminance)
 
 
 class _VapourSynthCapture:
@@ -1066,9 +944,7 @@ class _CaptureThread(QtCore.QThread):
         super().__init__(parent)
         self.use_dxgi = HAS_DXGI and HAS_NUMPY
         self.use_vapoursynth = HAS_VAPOURSYNTH and bool(VAPOURSYNTH_SCRIPT_PATH)
-        # 啟動 UDP 監聽（僅在 VS_UDP_PORT 被啟用時建立 singleton）
-        udp_srv = _UdpLuminanceServer.instance()
-        # instance() 已內部處理失敗與去重，回傳 None 表示不可用
+        # UDP 已移除；改由 TCP server 在捕捉到亮度時廣播。
 
     @classmethod
     def _get_dxgi_camera(cls):
@@ -1144,15 +1020,7 @@ class _CaptureThread(QtCore.QThread):
 
         # 優先使用 UDP 區間平均（涵蓋自上次截圖以來的所有幀）
         # 即使目前在 DXGI 模式，只要 VPY 重新開始發送資料就會自動切回 VPY
-        udp_srv = _UdpLuminanceServer.instance()
-        if udp_srv is not None:
-            try:
-                udp_avg = udp_srv.get_average_and_reset()
-                if udp_avg is not None:
-                    result = udp_avg
-                    source = "VPY"
-            except Exception:
-                pass
+        # 取消 UDP 路徑：改由本程式依序呼叫 VS/DXGI 擷取亮度
 
         # UDP 沒有資料時，嘗試走 VapourSynth 腳本管線
         if result is None and self.use_vapoursynth:
@@ -1277,6 +1145,17 @@ class ScreenAnalyzer(QtCore.QObject):
 
         self.luminance_updated.emit(lum)
 
+        # 廣播亮度給已連線的 TCP clients（若 server 已啟用）
+        try:
+            parent = self.parent()
+            if parent and getattr(parent, "_network_server_enabled", False) and getattr(parent, "_net_server", None):
+                try:
+                    parent._net_server.broadcast_luminance(lum, source)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
         # 使用者指定公式（可調權重）：
         # 當前亮度 = (平均 + 背光*權重) / (2 + 權重 - 1) = (平均 + 背光*權重) / (1 + 權重)
         # 這裡以可調係數泛化：
@@ -1354,6 +1233,8 @@ class NetworkMonitorServer:
         self._server_thread = None
         self._sock = None
         self._zeroconf = None
+        self._clients: list[socket.socket] = []
+        self._clients_lock = threading.Lock()
 
     def start(self):
         if self._running:
@@ -1434,10 +1315,17 @@ class NetworkMonitorServer:
     def _handle_client(self, client, addr):
         import socket
         try:
+            # 註冊為可接收廣播的 client
+            with self._clients_lock:
+                self._clients.append(client)
             with client:
                 buf = b""
                 while self._running:
-                    data = client.recv(4096)
+                    try:
+                        data = client.recv(4096)
+                    except socket.timeout:
+                        # timeout 用於讓循環可以中斷並維護連線清單
+                        continue
                     if not data:
                         break
                     buf += data
@@ -1447,11 +1335,40 @@ class NetworkMonitorServer:
                         if not line:
                             continue
                         response = self._process_request(line)
-                        client.sendall((json.dumps(response) + "\n").encode())
+                        try:
+                            client.sendall((json.dumps(response) + "\n").encode())
+                        except Exception:
+                            # 無法回應則終止連線
+                            raise
         except (socket.timeout, ConnectionResetError, OSError):
             pass
         except Exception as e:
             print(f"NetServer client error: {e}")
+        finally:
+            # 移除 client
+            try:
+                with self._clients_lock:
+                    if client in self._clients:
+                        self._clients.remove(client)
+            except Exception:
+                pass
+
+    def broadcast_luminance(self, value: float, source: str = "—"):
+        """向所有已連線 client 廣播亮度事件（JSON line）。"""
+        payload = {"event": "luminance", "value": float(value), "source": source, "ts": time.time()}
+        data = (json.dumps(payload) + "\n").encode()
+        with self._clients_lock:
+            clients = list(self._clients)
+        for c in clients:
+            try:
+                c.sendall(data)
+            except Exception:
+                try:
+                    with self._clients_lock:
+                        if c in self._clients:
+                            self._clients.remove(c)
+                except Exception:
+                    pass
 
     def _process_request(self, line):
         try:
@@ -2176,10 +2093,7 @@ class MainWindow(QtWidgets.QWidget):
         net_grid.addWidget(self.net_server_checkbox, 0, 0, 1, 2)
         net_grid.addWidget(self.net_client_checkbox, 1, 0, 1, 2)
         net_grid.addWidget(self.net_servers_label, 2, 0, 1, 2)
-        # 允許 UDP（新增防火牆規則）按鈕，會以 UAC 提升執行 PowerShell
-        self.allow_udp_button = QtWidgets.QPushButton("允許 UDP（新增防火牆規則）")
-        self.allow_udp_button.clicked.connect(self._on_allow_udp_firewall)
-        net_grid.addWidget(self.allow_udp_button, 3, 0, 1, 2)
+        # 已移除 UDP 防火牆按鈕（改為透過 TCP 廣播亮度）
         net_group.setLayout(net_grid)
         net_layout.addWidget(net_group)
         net_layout.addStretch()
@@ -2221,31 +2135,7 @@ class MainWindow(QtWidgets.QWidget):
             self._clear_remote_wrappers()
         self.trigger_save()
 
-    def _on_allow_udp_firewall(self):
-        """透過 UAC 提升執行 PowerShell，新增允許 UDP 的防火牆規則。"""
-        if sys.platform != "win32":
-            QtWidgets.QMessageBox.warning(self, "不支援", "此功能僅在 Windows 平台可用。")
-            return
-        try:
-            ps_cmd = (
-                f'New-NetFirewallRule -DisplayName "Allow Brightness UDP {VS_UDP_PORT}" '
-                f'-Direction Inbound -Action Allow -Protocol UDP -LocalPort {VS_UDP_PORT} '
-                f'-Program "{sys.executable}" -Profile Any'
-            )
-            # 使用 & { ... } 確保 PowerShell 正確解析複雜命令
-            args = f'-NoProfile -ExecutionPolicy Bypass -Command "& {{ {ps_cmd} }}"'
-
-            result = ctypes.windll.shell32.ShellExecuteW(None, "runas", "powershell.exe", args, None, 1)
-            try:
-                ok = int(result) > 32
-            except Exception:
-                ok = False
-            if ok:
-                QtWidgets.QMessageBox.information(self, "已啟動", "已呼叫 UAC，請在出現的系統視窗中允許操作。")
-            else:
-                QtWidgets.QMessageBox.critical(self, "啟動失敗", f"無法啟動提升程序 (ShellExecuteW 返回 {result})")
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "錯誤", f"無法啟動提升程序: {e}")
+    # UDP 防火牆按鈕與 UAC 提升相關功能已移除（改用 TCP 廣播）。
 
     def _on_remote_monitors_updated(self, monitors):
         if hasattr(self, "net_servers_label"):
