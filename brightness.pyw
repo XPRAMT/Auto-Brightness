@@ -321,42 +321,88 @@ class GlobalHotkeyWheelHook(QtCore.QObject):
     def start(self):
         if sys.platform != "win32" or self.running:
             return
-
         self.running = True
+        self.thread = threading.Thread(target=self._run_hook_loop, daemon=True)
+        self.thread.start()
 
-        # 定義 Windows hook callback
+    def stop(self):
+        if not self.running:
+            return
+        self.running = False
+        if self.thread_id:
+            self.user32.PostThreadMessageW(self.thread_id, 0x0012, 0, 0)  # WM_QUIT
+        if self.thread:
+            self.thread.join(timeout=1.0)
+
+    def _run_hook_loop(self):
+        self.thread_id = self.kernel32.GetCurrentThreadId()
+
         HOOKPROC = ctypes.WINFUNCTYPE(self.LRESULT, ctypes.c_int, self.WPARAM_T, self.LPARAM_T)
 
         def keyboard_proc(nCode, wParam, lParam):
-            if nCode >= 0 and wParam in (self.WM_KEYDOWN, self.WM_SYSKEYDOWN):
-                try:
-                    k = ctypes.cast(lParam, ctypes.POINTER(self.KBDLLHOOKSTRUCT)).contents
-                    vk = k.vkCode
+            if nCode >= 0:
+                kbd = ctypes.cast(lParam, ctypes.POINTER(self.KBDLLHOOKSTRUCT)).contents
+                vk = kbd.vkCode
+                msg = int(wParam)
+
+                if msg in (self.WM_KEYDOWN, self.WM_SYSKEYDOWN):
                     match = self._match_level_shortcut(vk)
-                    if match:
+                    if match is not None:
                         sc_type, value = match
-                        self.level_requested.emit(value)
+                        if sc_type == "+Step":
+                            self.step_requested.emit(1)
+                        elif sc_type == "-Step":
+                            self.step_requested.emit(-1)
+                        elif sc_type == "切換自動亮度":
+                            self.toggle_auto_requested.emit()
+                        else:
+                            self.level_requested.emit(value)
                         return 1
-                except Exception:
-                    pass
+
             return self.user32.CallNextHookEx(0, nCode, wParam, lParam)
 
         def mouse_proc(nCode, wParam, lParam):
-            if nCode >= 0 and wParam == self.WM_MOUSEWHEEL:
-                try:
+            if nCode >= 0:
+                msg = int(wParam)
+
+                mouse_vk = {
+                    self.WM_LBUTTONDOWN: 0x01,   # VK_LBUTTON
+                    self.WM_RBUTTONDOWN: 0x02,   # VK_RBUTTON
+                    self.WM_MBUTTONDOWN: 0x04,   # VK_MBUTTON
+                }.get(msg)
+                if mouse_vk is None and msg == self.WM_XBUTTONDOWN:
+                    ms = ctypes.cast(lParam, ctypes.POINTER(self.MSLLHOOKSTRUCT)).contents
+                    xbtn = (ms.mouseData >> 16) & 0xFFFF
+                    mouse_vk = {0x0001: 0x05, 0x0002: 0x06}.get(xbtn)
+
+                if mouse_vk is not None:
+                    match = self._match_level_shortcut(mouse_vk)
+                    if match is not None:
+                        sc_type, value = match
+                        if sc_type == "+Step":
+                            self.step_requested.emit(1)
+                        elif sc_type == "-Step":
+                            self.step_requested.emit(-1)
+                        elif sc_type == "切換自動亮度":
+                            self.toggle_auto_requested.emit()
+                        else:
+                            self.level_requested.emit(value)
+                        return 1
+
+                if msg == self.WM_MOUSEWHEEL:
                     ms = ctypes.cast(lParam, ctypes.POINTER(self.MSLLHOOKSTRUCT)).contents
                     high_word = (ms.mouseData >> 16) & 0xFFFF
                     delta = ctypes.c_short(high_word).value
+
                     key1_pressed = self._is_modifier_pressed(self.trigger_key1)
                     key2_pressed = self._is_modifier_pressed(self.trigger_key2)
+
                     if key1_pressed and key2_pressed:
                         wheel_steps = int(delta / 120) if delta != 0 else 0
                         if wheel_steps == 0:
                             wheel_steps = 1 if delta > 0 else -1
                         self.step_requested.emit(wheel_steps)
                         return 1
-                except Exception:
-                    pass
             return self.user32.CallNextHookEx(0, nCode, wParam, lParam)
 
         self._keyboard_proc = HOOKPROC(keyboard_proc)
@@ -376,6 +422,10 @@ class GlobalHotkeyWheelHook(QtCore.QObject):
         if self.mouse_hook:
             self.user32.UnhookWindowsHookEx(self.mouse_hook)
             self.mouse_hook = None
+
+        self.thread_id = 0
+        self.alt_down = False
+        self.win_down = False
 
 # =========================
 # Worker Thread
