@@ -47,7 +47,14 @@ except ImportError:
 VAPOURSYNTH_SCRIPT_PATH = os.environ.get("BRIGHTNESS_VS_SCRIPT", "").strip()
 
 # UDP IPC：test.vpy 每幀把亮度值 (float32) 發到此 port
-VS_UDP_PORT = int(os.environ.get("BRIGHTNESS_VS_UDP_PORT", "57321"))
+_vs_udp_raw = os.environ.get("BRIGHTNESS_VS_UDP_PORT", "").strip()
+if _vs_udp_raw == "":
+    VS_UDP_PORT = None
+else:
+    try:
+        VS_UDP_PORT = int(_vs_udp_raw)
+    except Exception:
+        VS_UDP_PORT = None
 
 SETTINGS_FILE = "settings.json"
 SETTINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), SETTINGS_FILE)
@@ -964,12 +971,15 @@ class _UdpLuminanceServer:
     @classmethod
     def instance(cls) -> "_UdpLuminanceServer":
         with cls._lock:
+            # 若未指定環境變數則不啟動 UDP 功能
+            if VS_UDP_PORT is None:
+                return None
             if cls._instance is not None:
                 return cls._instance
             if cls._init_failed:
                 return None
             try:
-                cls._instance = cls()
+                cls._instance = cls(VS_UDP_PORT)
                 return cls._instance
             except Exception as e:
                 cls._init_failed = True
@@ -1056,11 +1066,9 @@ class _CaptureThread(QtCore.QThread):
         super().__init__(parent)
         self.use_dxgi = HAS_DXGI and HAS_NUMPY
         self.use_vapoursynth = HAS_VAPOURSYNTH and bool(VAPOURSYNTH_SCRIPT_PATH)
-        # 啟動 UDP 監聽（僅第一次會真正建立，之後共用 singleton）
-        try:
-            _UdpLuminanceServer.instance()
-        except Exception as e:
-            print(f"[UdpLuminance] 啟動失敗: {e}")
+        # 啟動 UDP 監聽（僅在 VS_UDP_PORT 被啟用時建立 singleton）
+        udp_srv = _UdpLuminanceServer.instance()
+        # instance() 已內部處理失敗與去重，回傳 None 表示不可用
 
     @classmethod
     def _get_dxgi_camera(cls):
@@ -1136,13 +1144,15 @@ class _CaptureThread(QtCore.QThread):
 
         # 優先使用 UDP 區間平均（涵蓋自上次截圖以來的所有幀）
         # 即使目前在 DXGI 模式，只要 VPY 重新開始發送資料就會自動切回 VPY
-        try:
-            udp_avg = _UdpLuminanceServer.instance().get_average_and_reset()
-            if udp_avg is not None:
-                result = udp_avg
-                source = "VPY"
-        except Exception:
-            pass
+        udp_srv = _UdpLuminanceServer.instance()
+        if udp_srv is not None:
+            try:
+                udp_avg = udp_srv.get_average_and_reset()
+                if udp_avg is not None:
+                    result = udp_avg
+                    source = "VPY"
+            except Exception:
+                pass
 
         # UDP 沒有資料時，嘗試走 VapourSynth 腳本管線
         if result is None and self.use_vapoursynth:
