@@ -1089,7 +1089,7 @@ class _CaptureThread(QtCore.QThread):
 
 
 class ScreenAnalyzer(QtCore.QObject):
-    adjust_requested = QtCore.pyqtSignal(float)  # 每 tick 後新的實際背光百分比
+    adjust_requested = QtCore.pyqtSignal(float)  # 每 tick 建議調整的百分比（可正可負）
     luminance_updated = QtCore.pyqtSignal(float)  # 即時畫面亮度 0-100
     luminance_source_updated = QtCore.pyqtSignal(str)  # 亮度來源："VPY" / "VS" / "DXGI" / "—"
 
@@ -1261,7 +1261,7 @@ class ScreenAnalyzer(QtCore.QObject):
             self._adjust_timer.stop()
 
         self._current_ddc = int(round(self._current_ddc_float))
-        self.adjust_requested.emit(self._current_ddc_float)
+        self.adjust_requested.emit(delta_percent)
 
 
 # =========================
@@ -2466,16 +2466,21 @@ class MainWindow(QtWidgets.QWidget):
         )
         self.screen_analyzer.total_levels = max(1, total)
 
-    def on_screen_adjust_requested(self, backlight_percent):
+    def on_screen_adjust_requested(self, delta_percent):
         if not self.monitor_wrappers or not self.monitor_widgets:
             return
         if len(self.monitor_wrappers) != len(self.monitor_widgets):
             return
 
         try:
-            backlight_percent = max(0.0, min(100.0, float(backlight_percent)))
+            delta_percent = float(delta_percent)
         except (TypeError, ValueError):
             return
+        if abs(delta_percent) <= 1e-9:
+            return
+
+        sign = 1 if delta_percent > 0 else -1
+        abs_percent = abs(delta_percent)
 
         link_values = []
         for wrapper, widget in zip(self.monitor_wrappers, self.monitor_widgets):
@@ -2488,7 +2493,22 @@ class MainWindow(QtWidgets.QWidget):
                 if total_levels <= 0:
                     continue
 
-                new_units = max(0.0, min(float(total_levels), (backlight_percent / 100.0) * total_levels))
+                level_step = int(round(total_levels * (abs_percent / 100.0)))
+                if level_step <= 0:
+                    level_step = 1
+
+                brightness = int(widget.b_slider.slider.value())
+                contrast = int(widget.c_slider.slider.value())
+                brightness = max(b_min, min(b_max, brightness))
+                contrast = max(c_min, min(c_max, contrast))
+
+                # 先走對比，再走亮度（與 Link 滑桿同邏輯）
+                if brightness <= b_min:
+                    current_units = max(0, min(c_range, contrast - c_min))
+                else:
+                    current_units = c_range + max(0, min(b_range, brightness - b_min))
+
+                new_units = max(0, min(total_levels, current_units + sign * level_step))
 
                 if new_units <= c_range:
                     new_contrast = c_min + new_units
@@ -2514,7 +2534,7 @@ class MainWindow(QtWidgets.QWidget):
                 pass
 
         if link_values:
-            self.global_link_value = int(round(backlight_percent))
+            self.global_link_value = int(round(sum(link_values) / len(link_values)))
             self.screen_analyzer.set_current_ddc(self.global_link_value)
             self._update_auto_adjust_info()
 
