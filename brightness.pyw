@@ -1486,6 +1486,7 @@ class NetworkMonitorClient(QtCore.QObject):
         self._discovered_servers = {}  # name -> {"info": ServiceInfo, "monitors": []}
         self._browser = None
         self._zeroconf = None
+        self._refresh_timer = None
 
     def start(self):
         if self._running:
@@ -2216,14 +2217,23 @@ class MainWindow(QtWidgets.QWidget):
             QtWidgets.QMessageBox.warning(self, "不支援", "此功能僅在 Windows 平台可用。")
             return
         try:
-            cmd = (
+            ps_cmd = (
                 f'New-NetFirewallRule -DisplayName "Allow Brightness UDP {VS_UDP_PORT}" '
                 f'-Direction Inbound -Action Allow -Protocol UDP -LocalPort {VS_UDP_PORT} '
                 f'-Program "{sys.executable}" -Profile Any'
             )
-            args = f'-NoProfile -ExecutionPolicy Bypass -Command "{cmd}"'
-            ctypes.windll.shell32.ShellExecuteW(None, "runas", "powershell.exe", args, None, 1)
-            QtWidgets.QMessageBox.information(self, "已啟動", "已呼叫 UAC，請在出現的系統視窗中允許操作。")
+            # 使用 & { ... } 確保 PowerShell 正確解析複雜命令
+            args = f'-NoProfile -ExecutionPolicy Bypass -Command "& {{ {ps_cmd} }}"'
+
+            result = ctypes.windll.shell32.ShellExecuteW(None, "runas", "powershell.exe", args, None, 1)
+            try:
+                ok = int(result) > 32
+            except Exception:
+                ok = False
+            if ok:
+                QtWidgets.QMessageBox.information(self, "已啟動", "已呼叫 UAC，請在出現的系統視窗中允許操作。")
+            else:
+                QtWidgets.QMessageBox.critical(self, "啟動失敗", f"無法啟動提升程序 (ShellExecuteW 返回 {result})")
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "錯誤", f"無法啟動提升程序: {e}")
 
