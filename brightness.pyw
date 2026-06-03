@@ -11,6 +11,13 @@ os.environ.setdefault("QT_LOGGING_RULES", "qt.qpa.window=false")
 from PyQt6 import QtWidgets, QtCore, QtGui
 from monitorcontrol import get_monitors
 
+# zeroconf 用於 mDNS
+try:
+    from zeroconf import Zeroconf, ServiceInfo
+except Exception:
+    Zeroconf = None
+    ServiceInfo = None
+
 try:
     import winreg
 except ImportError:
@@ -915,6 +922,7 @@ class _UdpLuminanceServer:
     """
     _instance: "_UdpLuminanceServer | None" = None
     _lock = threading.Lock()
+    _init_failed = False
 
     def __init__(self, port: int = VS_UDP_PORT):
         import socket, struct
@@ -956,9 +964,17 @@ class _UdpLuminanceServer:
     @classmethod
     def instance(cls) -> "_UdpLuminanceServer":
         with cls._lock:
-            if cls._instance is None:
+            if cls._instance is not None:
+                return cls._instance
+            if cls._init_failed:
+                return None
+            try:
                 cls._instance = cls()
-            return cls._instance
+                return cls._instance
+            except Exception as e:
+                cls._init_failed = True
+                print(f"[UdpLuminance] 啟動失敗: {e}")
+                return None
 
 
 class _VapourSynthCapture:
