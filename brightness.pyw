@@ -2165,6 +2165,10 @@ class MainWindow(QtWidgets.QWidget):
         net_grid.addWidget(self.net_server_checkbox, 0, 0, 1, 2)
         net_grid.addWidget(self.net_client_checkbox, 1, 0, 1, 2)
         net_grid.addWidget(self.net_servers_label, 2, 0, 1, 2)
+        # 允許 UDP（新增防火牆規則）按鈕，會以 UAC 提升執行 PowerShell
+        self.allow_udp_button = QtWidgets.QPushButton("允許 UDP（新增防火牆規則）")
+        self.allow_udp_button.clicked.connect(self._on_allow_udp_firewall)
+        net_grid.addWidget(self.allow_udp_button, 3, 0, 1, 2)
         net_group.setLayout(net_grid)
         net_layout.addWidget(net_group)
         net_layout.addStretch()
@@ -2205,6 +2209,23 @@ class MainWindow(QtWidgets.QWidget):
             self._net_client.stop()
             self._clear_remote_wrappers()
         self.trigger_save()
+
+    def _on_allow_udp_firewall(self):
+        """透過 UAC 提升執行 PowerShell，新增允許 UDP 的防火牆規則。"""
+        if sys.platform != "win32":
+            QtWidgets.QMessageBox.warning(self, "不支援", "此功能僅在 Windows 平台可用。")
+            return
+        try:
+            cmd = (
+                f'New-NetFirewallRule -DisplayName "Allow Brightness UDP {VS_UDP_PORT}" '
+                f'-Direction Inbound -Action Allow -Protocol UDP -LocalPort {VS_UDP_PORT} '
+                f'-Program "{sys.executable}" -Profile Any'
+            )
+            args = f'-NoProfile -ExecutionPolicy Bypass -Command "{cmd}"'
+            ctypes.windll.shell32.ShellExecuteW(None, "runas", "powershell.exe", args, None, 1)
+            QtWidgets.QMessageBox.information(self, "已啟動", "已呼叫 UAC，請在出現的系統視窗中允許操作。")
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "錯誤", f"無法啟動提升程序: {e}")
 
     def _on_remote_monitors_updated(self, monitors):
         if hasattr(self, "net_servers_label"):
