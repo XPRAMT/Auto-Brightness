@@ -572,6 +572,10 @@ class MonitorWidget(QtWidgets.QGroupBox):
         layout.addWidget(self.b_slider.widget)
         layout.addWidget(self.c_slider.widget)
         layout.addWidget(self.link_slider.widget)
+        self.auto_info_label = QtWidgets.QLabel("畫面亮度: -- | 背光: -- | 當前: -- | 來源: --")
+        self.auto_info_label.setWordWrap(True)
+        self.auto_info_label.setStyleSheet("color: gray; font-size: 10px;")
+        layout.addWidget(self.auto_info_label)
 
         self.setLayout(layout)
         self.set_ranges(self.monitor.brightness_range, self.monitor.contrast_range)
@@ -683,6 +687,9 @@ class MonitorWidget(QtWidgets.QGroupBox):
             self.setTitle(self.monitor.name)
         else:
             self.setTitle(f"{self.monitor.name} (不可用)")
+
+    def set_auto_info(self, text):
+        self.auto_info_label.setText(text)
 
 
 class MonitorRangeWidget(QtWidgets.QGroupBox):
@@ -983,7 +990,7 @@ class _VapourSynthCapture:
 class _CaptureThread(QtCore.QThread):
     result_ready = QtCore.pyqtSignal(float, str)  # (亮度 0-100, 來源: "VPY"/"VS"/"DXGI")
 
-    _dxgi_camera = None
+    _dxgi_cameras = {}
     _dxgi_lock = threading.Lock()
     _dxgi_disabled = False
     _vs_capture = None
@@ -997,19 +1004,22 @@ class _CaptureThread(QtCore.QThread):
         # UDP 已移除；改由 TCP server 在捕捉到亮度時廣播。
 
     @classmethod
-    def _get_dxgi_camera(cls):
+    def _get_dxgi_camera(cls, output_idx=0):
         if not HAS_DXGI or cls._dxgi_disabled:
             return None
         with cls._dxgi_lock:
-            if cls._dxgi_camera is None:
-                cls._dxgi_camera = dxcam.create(output_color="RGB")
-            return cls._dxgi_camera
+            if output_idx not in cls._dxgi_cameras:
+                cls._dxgi_cameras[output_idx] = dxcam.create(output_idx=output_idx, output_color="RGB")
+            return cls._dxgi_cameras[output_idx]
 
     @classmethod
-    def _disable_dxgi(cls):
+    def _disable_dxgi(cls, output_idx=None):
         with cls._dxgi_lock:
-            cls._dxgi_disabled = True
-            cls._dxgi_camera = None
+            if output_idx is None:
+                cls._dxgi_disabled = True
+                cls._dxgi_cameras = {}
+            else:
+                cls._dxgi_cameras.pop(output_idx, None)
 
     @classmethod
     def _get_vapoursynth_capture(cls):
@@ -1042,7 +1052,8 @@ class _CaptureThread(QtCore.QThread):
     def _capture_dxgi(self):
         """使用 DXGI 方式截圖（高效）"""
         try:
-            camera = self._get_dxgi_camera()
+            output_idx = int(getattr(self.parent(), "output_idx", 0) or 0)
+            camera = self._get_dxgi_camera(output_idx)
             if camera is None:
                 return None
 
@@ -1060,7 +1071,7 @@ class _CaptureThread(QtCore.QThread):
             return avg / 255.0 * 100.0
         except Exception as e:
             print(f"DXGI 截圖錯誤: {e}")
-            self._disable_dxgi()
+            self._disable_dxgi(output_idx)
             self.use_dxgi = False
             return None
 
@@ -1093,8 +1104,9 @@ class ScreenAnalyzer(QtCore.QObject):
     luminance_updated = QtCore.pyqtSignal(float)  # 即時畫面亮度 0-100
     luminance_source_updated = QtCore.pyqtSignal(str)  # 亮度來源："VPY" / "VS" / "DXGI" / "—"
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, output_idx=0):
         super().__init__(parent)
+        self.output_idx = int(output_idx)
         self.enabled = False
         self._last_source = "—"
         self.target = 50        # 目標畫面亮度 0-100
@@ -1659,19 +1671,9 @@ class MainWindow(QtWidgets.QWidget):
         self.auto_adjust_step_percent = 0.5
         self.auto_adjust_resource_saving_enabled = True
         self.auto_adjust_resource_saving_idle_seconds = 5.0
-        self.screen_analyzer = ScreenAnalyzer(self)
-        self.screen_analyzer.set_capture_interval_seconds(self.auto_adjust_capture_interval)
-        self.screen_analyzer.set_adjust_step_percent(self.auto_adjust_step_percent)
-        self.screen_analyzer.set_resource_saving(
-            self.auto_adjust_resource_saving_enabled,
-            self.auto_adjust_resource_saving_idle_seconds,
-        )
-        self.screen_analyzer.adjust_requested.connect(self.on_screen_adjust_requested)
-        self.screen_analyzer.luminance_updated.connect(self.on_luminance_updated)
-        self.screen_analyzer.luminance_source_updated.connect(self._on_luminance_source_updated)
-        self.screen_analyzer.start()
-        self._last_avg_luminance = None
-        self._last_luminance_source = "—"
+        self.screen_analyzers = []
+        self.screen_analyzer = None
+        self._monitor_auto_states = []
         self.current_effective_brightness = None
 
         # 網路功能
@@ -1693,6 +1695,8 @@ class MainWindow(QtWidgets.QWidget):
             if not w.supported:
                 w.available = False
             self.monitor_wrappers.append(w)
+
+        self._init_screen_analyzers()
         self._known_monitor_names = sorted(w.name for w in self.monitor_wrappers)
         self._prev_raw_monitor_count = len(list(get_monitors()))
 
@@ -1825,6 +1829,54 @@ class MainWindow(QtWidgets.QWidget):
 
         self.sync_ui_with_current_monitor_levels()
         self.refresh_tray_display()
+        self._init_screen_analyzers()
+
+    def _configure_screen_analyzer(self, analyzer):
+        analyzer.enabled = self.auto_adjust_enabled
+        analyzer.target = self.auto_adjust_target
+        analyzer.threshold = self.auto_adjust_threshold
+        analyzer.weight = self.auto_adjust_weight
+        analyzer.set_capture_interval_seconds(self.auto_adjust_capture_interval)
+        analyzer.set_adjust_step_percent(self.auto_adjust_step_percent)
+        analyzer.set_resource_saving(
+            self.auto_adjust_resource_saving_enabled,
+            self.auto_adjust_resource_saving_idle_seconds,
+        )
+
+    def _init_screen_analyzers(self):
+        for analyzer in getattr(self, "screen_analyzers", []):
+            if analyzer is not None:
+                analyzer.stop()
+
+        self.screen_analyzers = []
+        self._monitor_auto_states = []
+        for idx, wrapper in enumerate(self.monitor_wrappers):
+            self._monitor_auto_states.append({"avg": None, "source": "—", "current": None})
+            if isinstance(wrapper, RemoteMonitorWrapper):
+                self.screen_analyzers.append(None)
+                continue
+
+            analyzer = ScreenAnalyzer(self, output_idx=idx)
+            self._configure_screen_analyzer(analyzer)
+            analyzer.adjust_requested.connect(lambda delta, i=idx: self.on_screen_adjust_requested(i, delta))
+            analyzer.luminance_updated.connect(lambda lum, i=idx: self.on_luminance_updated(i, lum))
+            analyzer.luminance_source_updated.connect(lambda source, i=idx: self._on_luminance_source_updated(i, source))
+            analyzer.start()
+            self.screen_analyzers.append(analyzer)
+
+        self.screen_analyzer = next((a for a in self.screen_analyzers if a is not None), None)
+        self._sync_screen_analyzer_enabled()
+
+    def _for_each_screen_analyzer(self, callback):
+        for analyzer in getattr(self, "screen_analyzers", []):
+            if analyzer is not None:
+                callback(analyzer)
+
+    def _sync_screen_analyzer_enabled(self):
+        for idx, analyzer in enumerate(getattr(self, "screen_analyzers", [])):
+            if analyzer is not None:
+                wrapper = self.monitor_wrappers[idx] if idx < len(self.monitor_wrappers) else None
+                analyzer.enabled = self.auto_adjust_enabled and bool(getattr(wrapper, "available", False))
 
     def _check_monitors_changed(self):
         """輕量檢查螢幕數量是否變化，變化時更新可用狀態"""
@@ -1898,11 +1950,6 @@ class MainWindow(QtWidgets.QWidget):
             monitor_widget.set_available(wrapper.available)
             self.monitor_widgets.append(monitor_widget)
             layout.addWidget(monitor_widget)
-
-        self.main_auto_adjust_info_label = QtWidgets.QLabel("畫面亮度: -- | 背光: -- | 來源: --")
-        self.main_auto_adjust_info_label.setWordWrap(True)
-        self.main_auto_adjust_info_label.setStyleSheet("color: gray; font-size: 10px;")
-        layout.addWidget(self.main_auto_adjust_info_label)
 
         layout.addStretch()
         page.setLayout(layout)
@@ -2089,11 +2136,6 @@ class MainWindow(QtWidgets.QWidget):
         self.auto_adjust_resource_saving_idle_spin.setToolTip("畫面亮度差異為 0 持續多久後，開始倍增截圖間隔")
         self.auto_adjust_resource_saving_idle_spin.valueChanged.connect(self.on_auto_adjust_settings_changed)
 
-        self.auto_adjust_info_label = QtWidgets.QLabel(
-            "畫面平均亮度: -- | 背光亮度: -- | 當前亮度: -- | 目標亮度: --"
-        )
-        self.auto_adjust_info_label.setWordWrap(True)
-
         auto_grid.addWidget(self.auto_adjust_checkbox, 0, 0, 1, 4)
         auto_grid.addWidget(QtWidgets.QLabel("目標亮度"), 1, 0)
         auto_grid.addWidget(self.auto_adjust_target_spin, 1, 1)
@@ -2108,7 +2150,6 @@ class MainWindow(QtWidgets.QWidget):
         auto_grid.addWidget(self.auto_adjust_resource_saving_idle_spin, 3, 3)
         auto_grid.addWidget(QtWidgets.QLabel("背光權重"), 4, 0)
         auto_grid.addWidget(self.auto_adjust_weight_spin, 4, 1)
-        auto_grid.addWidget(self.auto_adjust_info_label, 5, 0, 1, 4)
         auto_group.setLayout(auto_grid)
         mon_layout.addWidget(auto_group)
 
@@ -2241,12 +2282,11 @@ class MainWindow(QtWidgets.QWidget):
         layout = self.main_page.layout()
         if layout is None:
             return
-        # 在 auto info label 之前插入遠端 widget
-        info_idx = -1
+        insert_idx = max(0, layout.count() - 1)
         for i in range(layout.count()):
             item = layout.itemAt(i)
-            if item and item.widget() is self.main_auto_adjust_info_label:
-                info_idx = i
+            if item and item.spacerItem() is not None:
+                insert_idx = i
                 break
         # 移除所有現有遠端 widget（避免重複）
         for w in self._remote_widgets:
@@ -2254,10 +2294,8 @@ class MainWindow(QtWidgets.QWidget):
                 layout.removeWidget(w)
         # 重新插入
         for w in self._remote_widgets:
-            if info_idx >= 0:
-                layout.insertWidget(info_idx, w)
-            else:
-                layout.addWidget(w)
+            layout.insertWidget(insert_idx, w)
+            insert_idx += 1
 
     def _on_remote_monitor_link_changed(self, percent):
         """遠端螢幕聯動滑桿變更 → 透過網路發送 set 指令"""
@@ -2381,7 +2419,9 @@ class MainWindow(QtWidgets.QWidget):
                 pass
 
         self.global_link_value = int(round(sum(link_values) / len(link_values))) if link_values else 0
-        self.screen_analyzer.set_current_ddc(self.global_link_value)
+        for idx, link_value in enumerate(link_values):
+            if idx < len(self.screen_analyzers) and self.screen_analyzers[idx] is not None:
+                self.screen_analyzers[idx].set_current_ddc(link_value)
         self._update_auto_adjust_info()
         self._sync_main_global_link_controls()
         self.refresh_tray_display()
@@ -2402,8 +2442,8 @@ class MainWindow(QtWidgets.QWidget):
 
     def on_auto_adjust_toggled(self, checked):
         self.auto_adjust_enabled = bool(checked)
-        self.screen_analyzer.enabled = self.auto_adjust_enabled
-        self.screen_analyzer.reset_dynamic_capture_interval()
+        self._sync_screen_analyzer_enabled()
+        self._for_each_screen_analyzer(lambda analyzer: analyzer.reset_dynamic_capture_interval())
         # 同步主介面與設定頁的 checkbox
         for cb in [
             getattr(self, "auto_adjust_checkbox", None),
@@ -2425,15 +2465,8 @@ class MainWindow(QtWidgets.QWidget):
         self.auto_adjust_step_percent = float(self.auto_adjust_step_percent_spin.value())
         self.auto_adjust_resource_saving_enabled = bool(self.auto_adjust_resource_saving_checkbox.isChecked())
         self.auto_adjust_resource_saving_idle_seconds = float(self.auto_adjust_resource_saving_idle_spin.value())
-        self.screen_analyzer.target = self.auto_adjust_target
-        self.screen_analyzer.threshold = self.auto_adjust_threshold
-        self.screen_analyzer.weight = self.auto_adjust_weight
-        self.screen_analyzer.set_capture_interval_seconds(self.auto_adjust_capture_interval)
-        self.screen_analyzer.set_adjust_step_percent(self.auto_adjust_step_percent)
-        self.screen_analyzer.set_resource_saving(
-            self.auto_adjust_resource_saving_enabled,
-            self.auto_adjust_resource_saving_idle_seconds,
-        )
+        self._for_each_screen_analyzer(self._configure_screen_analyzer)
+        self._sync_screen_analyzer_enabled()
         if hasattr(self, "auto_target_slider"):
             self.auto_target_slider.blockSignals(True)
             self.auto_target_slider.setValue(self.auto_adjust_target)
@@ -2460,7 +2493,7 @@ class MainWindow(QtWidgets.QWidget):
         value = max(0, min(100, self.snap_to_step(value)))
         value = int(round(value))
         self.auto_adjust_target = value
-        self.screen_analyzer.target = value
+        self._for_each_screen_analyzer(lambda analyzer: setattr(analyzer, "target", value))
         if hasattr(self, "auto_adjust_target_spin"):
             self.auto_adjust_target_spin.blockSignals(True)
             self.auto_adjust_target_spin.setValue(value)
@@ -2488,12 +2521,14 @@ class MainWindow(QtWidgets.QWidget):
             (w.contrast_range[1] - w.contrast_range[0])
             for w in self.monitor_wrappers
         )
-        self.screen_analyzer.total_levels = max(1, total)
+        self._for_each_screen_analyzer(lambda analyzer: setattr(analyzer, "total_levels", max(1, total)))
 
-    def on_screen_adjust_requested(self, delta_percent):
+    def on_screen_adjust_requested(self, monitor_index, delta_percent):
         if not self.monitor_wrappers or not self.monitor_widgets:
             return
         if len(self.monitor_wrappers) != len(self.monitor_widgets):
+            return
+        if monitor_index < 0 or monitor_index >= len(self.monitor_widgets):
             return
 
         try:
@@ -2506,100 +2541,101 @@ class MainWindow(QtWidgets.QWidget):
         sign = 1 if delta_percent > 0 else -1
         abs_percent = abs(delta_percent)
 
+        wrapper = self.monitor_wrappers[monitor_index]
+        widget = self.monitor_widgets[monitor_index]
+        if not wrapper.available or isinstance(wrapper, RemoteMonitorWrapper):
+            return
+        try:
+            b_min, b_max = wrapper.brightness_range
+            c_min, c_max = wrapper.contrast_range
+            b_range = max(0, b_max - b_min)
+            c_range = max(0, c_max - c_min)
+            total_levels = b_range + c_range
+            if total_levels <= 0:
+                return
+
+            level_step = int(round(total_levels * (abs_percent / 100.0)))
+            if level_step <= 0:
+                level_step = 1
+
+            brightness = int(widget.b_slider.slider.value())
+            contrast = int(widget.c_slider.slider.value())
+            brightness = max(b_min, min(b_max, brightness))
+            contrast = max(c_min, min(c_max, contrast))
+
+            if brightness <= b_min:
+                current_units = max(0, min(c_range, contrast - c_min))
+            else:
+                current_units = c_range + max(0, min(b_range, brightness - b_min))
+
+            new_units = max(0, min(total_levels, current_units + sign * level_step))
+
+            if new_units <= c_range:
+                new_contrast = c_min + new_units
+                new_brightness = b_min
+            else:
+                new_contrast = c_max
+                new_brightness = b_min + (new_units - c_range)
+
+            link_value = int(round((new_units / total_levels) * 100))
+            widget.link_slider.slider.blockSignals(True)
+            widget.link_slider.slider.setValue(link_value)
+            widget.link_slider.slider.blockSignals(False)
+            widget.link_slider.value_label.setText(str(link_value))
+
+            widget.pending_brightness = int(round(new_brightness))
+            widget.pending_contrast = int(round(new_contrast))
+            widget.sync_sliders(widget.pending_brightness, widget.pending_contrast)
+            widget.restart()
+        except RuntimeError:
+            return
+
         link_values = []
-        for wrapper, widget in zip(self.monitor_wrappers, self.monitor_widgets):
+        for widget in self.monitor_widgets:
             try:
-                b_min, b_max = wrapper.brightness_range
-                c_min, c_max = wrapper.contrast_range
-                b_range = max(0, b_max - b_min)
-                c_range = max(0, c_max - c_min)
-                total_levels = b_range + c_range
-                if total_levels <= 0:
-                    continue
-
-                level_step = int(round(total_levels * (abs_percent / 100.0)))
-                if level_step <= 0:
-                    level_step = 1
-
-                brightness = int(widget.b_slider.slider.value())
-                contrast = int(widget.c_slider.slider.value())
-                brightness = max(b_min, min(b_max, brightness))
-                contrast = max(c_min, min(c_max, contrast))
-
-                # 先走對比，再走亮度（與 Link 滑桿同邏輯）
-                if brightness <= b_min:
-                    current_units = max(0, min(c_range, contrast - c_min))
-                else:
-                    current_units = c_range + max(0, min(b_range, brightness - b_min))
-
-                new_units = max(0, min(total_levels, current_units + sign * level_step))
-
-                if new_units <= c_range:
-                    new_contrast = c_min + new_units
-                    new_brightness = b_min
-                else:
-                    new_contrast = c_max
-                    new_brightness = b_min + (new_units - c_range)
-
-                link_value = int(round((new_units / total_levels) * 100))
-                widget.link_slider.slider.blockSignals(True)
-                widget.link_slider.slider.setValue(link_value)
-                widget.link_slider.slider.blockSignals(False)
-                widget.link_slider.value_label.setText(str(link_value))
-
-                widget.pending_brightness = int(round(new_brightness))
-                widget.pending_contrast = int(round(new_contrast))
-                widget.sync_sliders(widget.pending_brightness, widget.pending_contrast)
-                widget.restart()
-
-                link_values.append(link_value)
+                link_values.append(int(widget.link_slider.slider.value()))
             except RuntimeError:
-                # widget 已被刪除（熱插拔），跳過
                 pass
-
         if link_values:
             self.global_link_value = int(round(sum(link_values) / len(link_values)))
-            self.screen_analyzer.set_current_ddc(self.global_link_value)
-            self._update_auto_adjust_info()
+            if monitor_index < len(self.screen_analyzers) and self.screen_analyzers[monitor_index] is not None:
+                self.screen_analyzers[monitor_index].set_current_ddc(link_value)
+            self._update_auto_adjust_info(monitor_index)
             self._sync_main_global_link_controls()
 
-    def on_luminance_updated(self, lum):
-        self._last_avg_luminance = float(lum)
-        self._update_auto_adjust_info()
+    def on_luminance_updated(self, monitor_index, lum):
+        if 0 <= monitor_index < len(self._monitor_auto_states):
+            self._monitor_auto_states[monitor_index]["avg"] = float(lum)
+        self._update_auto_adjust_info(monitor_index)
 
-    def _on_luminance_source_updated(self, source: str):
-        self._last_luminance_source = source
-        self._update_auto_adjust_info()
+    def _on_luminance_source_updated(self, monitor_index, source: str):
+        if 0 <= monitor_index < len(self._monitor_auto_states):
+            self._monitor_auto_states[monitor_index]["source"] = source
+        self._update_auto_adjust_info(monitor_index)
 
-    def _update_auto_adjust_info(self):
-        avg = getattr(self, "_last_avg_luminance", None)
-        source = getattr(self, "_last_luminance_source", "—")
-        backlight = float(self.global_link_value)
+    def _update_auto_adjust_info(self, monitor_index=None):
+        indexes = range(len(self.monitor_widgets)) if monitor_index is None else [monitor_index]
         target = float(self.auto_adjust_target)
         weight = float(self.auto_adjust_weight)
-        if avg is None:
-            self.current_effective_brightness = None
-            detail_text = (
-                f"畫面亮度: -- | 背光: {backlight:.1f}% | "
-                f"當前: -- | 目標: {target:.1f}% | 權重: {weight:.2f} | 來源: {source}"
-            )
-            short_text = f"畫面亮度: -- | 背光: {backlight:.1f}% | 來源: {source}"
-        else:
-            c = get_dynamic_content_coeff(avg)
-            current = (avg * c + backlight * weight) / (c + weight)
-            self.current_effective_brightness = current
-            detail_text = (
-                f"畫面亮度: {avg:.1f}% | "
-                f"背光: {backlight:.1f}% | "
-                f"當前: {current:.1f}% | "
-                f"目標: {target:.1f}% | "
-                f"權重: {weight:.2f} | 來源: {source}"
-            )
-            short_text = f"畫面亮度: {avg:.1f}% | 背光: {backlight:.1f}% | 當前: {current:.1f}% | 來源: {source}"
-        if hasattr(self, "auto_adjust_info_label"):
-            self.auto_adjust_info_label.setText(detail_text)
-        if hasattr(self, "main_auto_adjust_info_label"):
-            self.main_auto_adjust_info_label.setText(short_text)
+        for idx in indexes:
+            if idx < 0 or idx >= len(self.monitor_widgets):
+                continue
+            state = self._monitor_auto_states[idx] if idx < len(self._monitor_auto_states) else {"avg": None, "source": "—", "current": None}
+            avg = state.get("avg")
+            source = state.get("source", "—")
+            backlight = float(self.monitor_widgets[idx].link_slider.slider.value())
+            if avg is None:
+                state["current"] = None
+                text = f"畫面亮度: -- | 背光: {backlight:.1f}% | 當前: -- | 目標: {target:.1f}% | 權重: {weight:.2f} | 來源: {source}"
+            else:
+                c = get_dynamic_content_coeff(avg)
+                current = (avg * c + backlight * weight) / (c + weight)
+                state["current"] = current
+                text = f"畫面亮度: {avg:.1f}% | 背光: {backlight:.1f}% | 當前: {current:.1f}% | 目標: {target:.1f}% | 權重: {weight:.2f} | 來源: {source}"
+            self.monitor_widgets[idx].set_auto_info(text)
+
+        currents = [state.get("current") for state in self._monitor_auto_states if state.get("current") is not None]
+        self.current_effective_brightness = sum(currents) / len(currents) if currents else None
         self.refresh_tray_display()
 
     def on_step_changed(self, text):
@@ -2788,7 +2824,9 @@ class MainWindow(QtWidgets.QWidget):
                 pass
         if link_values:
             self.global_link_value = int(round(sum(link_values) / len(link_values)))
-            self.screen_analyzer.set_current_ddc(self.global_link_value)
+            for idx, link_value in enumerate(link_values):
+                if idx < len(self.screen_analyzers) and self.screen_analyzers[idx] is not None:
+                    self.screen_analyzers[idx].set_current_ddc(link_value)
             self._update_auto_adjust_info()
             self._sync_main_global_link_controls()
         self.trigger_save()
@@ -2802,7 +2840,7 @@ class MainWindow(QtWidgets.QWidget):
 
         self._updating_global_link = True
         self.global_link_value = value
-        self.screen_analyzer.set_current_ddc(value)
+        self._for_each_screen_analyzer(lambda analyzer: analyzer.set_current_ddc(value))
         self._update_auto_adjust_info()
         self._sync_main_global_link_controls()
         try:
@@ -2836,7 +2874,7 @@ class MainWindow(QtWidgets.QWidget):
         self.save_settings()
         if self.global_hook is not None:
             self.global_hook.stop()
-        self.screen_analyzer.stop()
+        self._for_each_screen_analyzer(lambda analyzer: analyzer.stop())
         self._net_server.stop()
         self._net_client.stop()
         self._is_quitting = True
@@ -3016,16 +3054,9 @@ class MainWindow(QtWidgets.QWidget):
             self.auto_adjust_step_percent_spin.blockSignals(False)
             self.auto_adjust_resource_saving_checkbox.blockSignals(False)
             self.auto_adjust_resource_saving_idle_spin.blockSignals(False)
-            self.screen_analyzer.enabled = self.auto_adjust_enabled
             self.set_auto_adjust_target(self.auto_adjust_target, trigger_save=False)
-            self.screen_analyzer.threshold = self.auto_adjust_threshold
-            self.screen_analyzer.weight = self.auto_adjust_weight
-            self.screen_analyzer.set_capture_interval_seconds(self.auto_adjust_capture_interval)
-            self.screen_analyzer.set_adjust_step_percent(self.auto_adjust_step_percent)
-            self.screen_analyzer.set_resource_saving(
-                self.auto_adjust_resource_saving_enabled,
-                self.auto_adjust_resource_saving_idle_seconds,
-            )
+            self._for_each_screen_analyzer(self._configure_screen_analyzer)
+            self._sync_screen_analyzer_enabled()
 
             # 啟動時：未勾選自動調整則只讀取當前螢幕值更新 UI，不主動寫入 DDC。
             if self.auto_adjust_enabled:
