@@ -572,7 +572,7 @@ class MonitorWidget(QtWidgets.QGroupBox):
         layout.addWidget(self.b_slider.widget)
         layout.addWidget(self.c_slider.widget)
         layout.addWidget(self.link_slider.widget)
-        self.auto_info_label = QtWidgets.QLabel("畫面亮度: -- | 背光: -- | 當前: -- | 來源: --")
+        self.auto_info_label = QtWidgets.QLabel("畫面亮度: -- | 背光亮度: -- | 加權亮度: -- | 目標亮度: -- | 權重: -- | 來源: --")
         self.auto_info_label.setWordWrap(True)
         self.auto_info_label.setStyleSheet("color: gray; font-size: 10px;")
         layout.addWidget(self.auto_info_label)
@@ -1120,6 +1120,7 @@ class ScreenAnalyzer(QtCore.QObject):
         self._current_capture_interval_seconds = 1.0
         self._no_change_elapsed_seconds = 0.0
         self._last_captured_luminance = None
+        self._last_luminance = None
         self._current_ddc = 50
         self._current_ddc_float = 50.0
         self._desired_ddc = 50.0
@@ -1184,6 +1185,7 @@ class ScreenAnalyzer(QtCore.QObject):
 
     def _on_captured(self, lum, source="—"):
         lum = float(lum)
+        self._last_luminance = lum
         self._last_source = source
         self.luminance_source_updated.emit(source)
 
@@ -1252,6 +1254,15 @@ class ScreenAnalyzer(QtCore.QObject):
         if not self.enabled or self._direction == 0:
             self._adjust_timer.stop()
             return
+
+        if self._last_luminance is not None:
+            w = max(0.01, float(self.weight))
+            c = get_dynamic_content_coeff(self._last_luminance)
+            effective = (self._last_luminance * c + self._current_ddc_float * w) / (c + w)
+            if abs(self.target - effective) <= self.threshold:
+                self._direction = 0
+                self._adjust_timer.stop()
+                return
 
         remaining = self._desired_ddc - self._current_ddc_float
         if abs(remaining) <= 1e-6:
@@ -2084,12 +2095,6 @@ class MainWindow(QtWidgets.QWidget):
         self.auto_adjust_checkbox.setChecked(self.auto_adjust_enabled)
         self.auto_adjust_checkbox.toggled.connect(self.on_auto_adjust_toggled)
 
-        self.auto_adjust_target_spin = QtWidgets.QSpinBox()
-        self.auto_adjust_target_spin.setRange(0, 100)
-        self.auto_adjust_target_spin.setValue(self.auto_adjust_target)
-        self.auto_adjust_target_spin.setSuffix(" %")
-        self.auto_adjust_target_spin.valueChanged.connect(self.on_auto_adjust_settings_changed)
-
         self.auto_adjust_threshold_spin = QtWidgets.QSpinBox()
         self.auto_adjust_threshold_spin.setRange(1, 50)
         self.auto_adjust_threshold_spin.setValue(self.auto_adjust_threshold)
@@ -2137,19 +2142,17 @@ class MainWindow(QtWidgets.QWidget):
         self.auto_adjust_resource_saving_idle_spin.valueChanged.connect(self.on_auto_adjust_settings_changed)
 
         auto_grid.addWidget(self.auto_adjust_checkbox, 0, 0, 1, 4)
-        auto_grid.addWidget(QtWidgets.QLabel("目標亮度"), 1, 0)
-        auto_grid.addWidget(self.auto_adjust_target_spin, 1, 1)
-        auto_grid.addWidget(QtWidgets.QLabel("截圖間隔"), 1, 2)
-        auto_grid.addWidget(self.auto_adjust_capture_interval_spin, 1, 3)
-        auto_grid.addWidget(QtWidgets.QLabel("反應門檻"), 2, 0)
-        auto_grid.addWidget(self.auto_adjust_threshold_spin, 2, 1)
-        auto_grid.addWidget(QtWidgets.QLabel("調整級距"), 2, 2)
-        auto_grid.addWidget(self.auto_adjust_step_percent_spin, 2, 3)
+        auto_grid.addWidget(QtWidgets.QLabel("截圖間隔"), 1, 0)
+        auto_grid.addWidget(self.auto_adjust_capture_interval_spin, 1, 1)
+        auto_grid.addWidget(QtWidgets.QLabel("反應門檻"), 1, 2)
+        auto_grid.addWidget(self.auto_adjust_threshold_spin, 1, 3)
+        auto_grid.addWidget(QtWidgets.QLabel("調整級距"), 2, 0)
+        auto_grid.addWidget(self.auto_adjust_step_percent_spin, 2, 1)
+        auto_grid.addWidget(QtWidgets.QLabel("背光權重"), 2, 2)
+        auto_grid.addWidget(self.auto_adjust_weight_spin, 2, 3)
         auto_grid.addWidget(self.auto_adjust_resource_saving_checkbox, 3, 0, 1, 2)
         auto_grid.addWidget(QtWidgets.QLabel("靜止門檻"), 3, 2)
         auto_grid.addWidget(self.auto_adjust_resource_saving_idle_spin, 3, 3)
-        auto_grid.addWidget(QtWidgets.QLabel("背光權重"), 4, 0)
-        auto_grid.addWidget(self.auto_adjust_weight_spin, 4, 1)
         auto_group.setLayout(auto_grid)
         mon_layout.addWidget(auto_group)
 
@@ -2458,7 +2461,6 @@ class MainWindow(QtWidgets.QWidget):
         self.trigger_save()
 
     def on_auto_adjust_settings_changed(self):
-        self.auto_adjust_target = int(self.auto_adjust_target_spin.value())
         self.auto_adjust_threshold = int(self.auto_adjust_threshold_spin.value())
         self.auto_adjust_weight = float(self.auto_adjust_weight_spin.value())
         self.auto_adjust_capture_interval = float(self.auto_adjust_capture_interval_spin.value())
@@ -2494,10 +2496,6 @@ class MainWindow(QtWidgets.QWidget):
         value = int(round(value))
         self.auto_adjust_target = value
         self._for_each_screen_analyzer(lambda analyzer: setattr(analyzer, "target", value))
-        if hasattr(self, "auto_adjust_target_spin"):
-            self.auto_adjust_target_spin.blockSignals(True)
-            self.auto_adjust_target_spin.setValue(value)
-            self.auto_adjust_target_spin.blockSignals(False)
         if hasattr(self, "auto_target_slider"):
             self.auto_target_slider.blockSignals(True)
             self.auto_target_slider.setValue(value)
@@ -2626,12 +2624,12 @@ class MainWindow(QtWidgets.QWidget):
             backlight = float(self.monitor_widgets[idx].link_slider.slider.value())
             if avg is None:
                 state["current"] = None
-                text = f"畫面亮度: -- | 背光: {backlight:.1f}% | 當前: -- | 目標: {target:.1f}% | 權重: {weight:.2f} | 來源: {source}"
+                text = f"畫面亮度: -- | 背光亮度: {backlight:.1f}% | 加權亮度: -- | 目標亮度: {target:.1f}% | 權重: {weight:.2f} | 來源: {source}"
             else:
                 c = get_dynamic_content_coeff(avg)
                 current = (avg * c + backlight * weight) / (c + weight)
                 state["current"] = current
-                text = f"畫面亮度: {avg:.1f}% | 背光: {backlight:.1f}% | 當前: {current:.1f}% | 目標: {target:.1f}% | 權重: {weight:.2f} | 來源: {source}"
+                text = f"畫面亮度: {avg:.1f}% | 背光亮度: {backlight:.1f}% | 加權亮度: {current:.1f}% | 目標亮度: {target:.1f}% | 權重: {weight:.2f} | 來源: {source}"
             self.monitor_widgets[idx].set_auto_info(text)
 
         currents = [state.get("current") for state in self._monitor_auto_states if state.get("current") is not None]
@@ -3027,7 +3025,6 @@ class MainWindow(QtWidgets.QWidget):
             self.auto_adjust_checkbox.blockSignals(True)
             if hasattr(self, "main_auto_adjust_checkbox"):
                 self.main_auto_adjust_checkbox.blockSignals(True)
-            self.auto_adjust_target_spin.blockSignals(True)
             self.auto_adjust_threshold_spin.blockSignals(True)
             self.auto_adjust_weight_spin.blockSignals(True)
             self.auto_adjust_capture_interval_spin.blockSignals(True)
@@ -3037,7 +3034,6 @@ class MainWindow(QtWidgets.QWidget):
             self.auto_adjust_checkbox.setChecked(self.auto_adjust_enabled)
             if hasattr(self, "main_auto_adjust_checkbox"):
                 self.main_auto_adjust_checkbox.setChecked(self.auto_adjust_enabled)
-            self.auto_adjust_target_spin.setValue(self.auto_adjust_target)
             self.auto_adjust_threshold_spin.setValue(self.auto_adjust_threshold)
             self.auto_adjust_weight_spin.setValue(self.auto_adjust_weight)
             self.auto_adjust_capture_interval_spin.setValue(self.auto_adjust_capture_interval)
@@ -3047,7 +3043,6 @@ class MainWindow(QtWidgets.QWidget):
             self.auto_adjust_checkbox.blockSignals(False)
             if hasattr(self, "main_auto_adjust_checkbox"):
                 self.main_auto_adjust_checkbox.blockSignals(False)
-            self.auto_adjust_target_spin.blockSignals(False)
             self.auto_adjust_threshold_spin.blockSignals(False)
             self.auto_adjust_weight_spin.blockSignals(False)
             self.auto_adjust_capture_interval_spin.blockSignals(False)
