@@ -1247,21 +1247,22 @@ class ScreenAnalyzer(QtCore.QObject):
             self._adjust_timer.stop()
             return
 
-        # 每 tick 依使用者設定百分比前進；接近目標時避免超調
+        # 每 tick 只提出一個調整量；實際背光狀態由 MainWindow 套用後回寫。
         step = min(abs(remaining), self.adjust_step_percent)
         delta_percent = step if remaining > 0 else -step
-        self._current_ddc_float = max(0.0, min(100.0, self._current_ddc_float + delta_percent))
+        next_ddc_float = max(0.0, min(100.0, self._current_ddc_float + delta_percent))
+        delta_percent = next_ddc_float - self._current_ddc_float
 
-        # 達到目標即停止
-        if (self._direction > 0 and self._current_ddc_float >= self._desired_ddc) or (
-            self._direction < 0 and self._current_ddc_float <= self._desired_ddc
-        ):
-            self._current_ddc_float = self._desired_ddc
+        if abs(delta_percent) <= 1e-9:
             self._direction = 0
             self._adjust_timer.stop()
+            return
 
-        self._current_ddc = int(round(self._current_ddc_float))
         self.adjust_requested.emit(delta_percent)
+
+        if abs(self._desired_ddc - self._current_ddc_float) <= 1e-6:
+            self._direction = 0
+            self._adjust_timer.stop()
 
 
 # =========================
@@ -1671,7 +1672,7 @@ class MainWindow(QtWidgets.QWidget):
         self.screen_analyzer.start()
         self._last_avg_luminance = None
         self._last_luminance_source = "—"
-        self.current_effective_brightness = 0.0
+        self.current_effective_brightness = None
 
         # 網路功能
         self._network_server_enabled = False
@@ -2553,7 +2554,7 @@ class MainWindow(QtWidgets.QWidget):
         target = float(self.auto_adjust_target)
         weight = float(self.auto_adjust_weight)
         if avg is None:
-            self.current_effective_brightness = backlight
+            self.current_effective_brightness = None
             detail_text = (
                 f"畫面亮度: -- | 背光: {backlight:.1f}% | "
                 f"當前: -- | 目標: {target:.1f}% | 權重: {weight:.2f} | 來源: {source}"
@@ -2709,9 +2710,11 @@ class MainWindow(QtWidgets.QWidget):
         target = float(self.auto_adjust_target) if self.auto_adjust_enabled else None
         self.tray.setIcon(self.create_tray_icon(current, target))
         if self.auto_adjust_enabled:
+            effective = getattr(self, "current_effective_brightness", None)
+            effective_text = "--" if effective is None else f"{float(effective):.1f}%"
             self.tray.setToolTip(
                 f"背光亮度: {self.global_link_value:.1f}%\n"
-                f"當前亮度: {self.current_effective_brightness:.1f}%\n"
+                f"當前亮度: {effective_text}\n"
                 f"目標亮度: {self.auto_adjust_target:.1f}%"
             )
         else:
