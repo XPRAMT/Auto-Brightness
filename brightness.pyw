@@ -2421,10 +2421,7 @@ class MainWindow(QtWidgets.QWidget):
                 # widget 已被刪除，跳過
                 pass
 
-        self.global_link_value = int(round(sum(link_values) / len(link_values))) if link_values else 0
-        for idx, link_value in enumerate(link_values):
-            if idx < len(self.screen_analyzers) and self.screen_analyzers[idx] is not None:
-                self.screen_analyzers[idx].set_current_ddc(link_value)
+        self._sync_global_link_from_available_monitors()
         self._update_auto_adjust_info()
         self._sync_main_global_link_controls()
         self.refresh_tray_display()
@@ -2490,6 +2487,27 @@ class MainWindow(QtWidgets.QWidget):
             self.main_global_link_slider.setValue(value)
             self.main_global_link_slider.blockSignals(False)
             self.main_global_link_value_label.setText(str(value))
+
+    def _available_link_values(self):
+        values = []
+        for idx, (wrapper, widget) in enumerate(zip(self.monitor_wrappers, self.monitor_widgets)):
+            if not getattr(wrapper, "available", False):
+                continue
+            try:
+                values.append((idx, int(widget.link_slider.slider.value())))
+            except RuntimeError:
+                pass
+        return values
+
+    def _sync_global_link_from_available_monitors(self):
+        values = self._available_link_values()
+        if not values:
+            return
+        self.global_link_value = int(round(sum(value for _idx, value in values) / len(values)))
+        for idx, value in values:
+            if idx < len(self.screen_analyzers) and self.screen_analyzers[idx] is not None:
+                self.screen_analyzers[idx].set_current_ddc(value)
+        self._sync_main_global_link_controls()
 
     def set_auto_adjust_target(self, value, trigger_save=True):
         value = max(0, min(100, self.snap_to_step(value)))
@@ -2588,18 +2606,10 @@ class MainWindow(QtWidgets.QWidget):
         except RuntimeError:
             return
 
-        link_values = []
-        for widget in self.monitor_widgets:
-            try:
-                link_values.append(int(widget.link_slider.slider.value()))
-            except RuntimeError:
-                pass
-        if link_values:
-            self.global_link_value = int(round(sum(link_values) / len(link_values)))
-            if monitor_index < len(self.screen_analyzers) and self.screen_analyzers[monitor_index] is not None:
-                self.screen_analyzers[monitor_index].set_current_ddc(link_value)
-            self._update_auto_adjust_info(monitor_index)
-            self._sync_main_global_link_controls()
+        self._sync_global_link_from_available_monitors()
+        if monitor_index < len(self.screen_analyzers) and self.screen_analyzers[monitor_index] is not None:
+            self.screen_analyzers[monitor_index].set_current_ddc(link_value)
+        self._update_auto_adjust_info(monitor_index)
 
     def on_luminance_updated(self, monitor_index, lum):
         if 0 <= monitor_index < len(self._monitor_auto_states):
@@ -2814,19 +2824,8 @@ class MainWindow(QtWidgets.QWidget):
     def on_monitor_link_changed(self, value):
         if self._updating_global_link:
             return
-        link_values = []
-        for widget in self.monitor_widgets:
-            try:
-                link_values.append(int(widget.link_slider.slider.value()))
-            except RuntimeError:
-                pass
-        if link_values:
-            self.global_link_value = int(round(sum(link_values) / len(link_values)))
-            for idx, link_value in enumerate(link_values):
-                if idx < len(self.screen_analyzers) and self.screen_analyzers[idx] is not None:
-                    self.screen_analyzers[idx].set_current_ddc(link_value)
-            self._update_auto_adjust_info()
-            self._sync_main_global_link_controls()
+        self._sync_global_link_from_available_monitors()
+        self._update_auto_adjust_info()
         self.trigger_save()
 
     def update_global_link(self, value):
@@ -2837,12 +2836,10 @@ class MainWindow(QtWidgets.QWidget):
         value = int(self.snap_to_step(value))
 
         self._updating_global_link = True
-        self.global_link_value = value
-        self._for_each_screen_analyzer(lambda analyzer: analyzer.set_current_ddc(value))
-        self._update_auto_adjust_info()
-        self._sync_main_global_link_controls()
         try:
-            for w in self.monitor_widgets:
+            for wrapper, w in zip(self.monitor_wrappers, self.monitor_widgets):
+                if not getattr(wrapper, "available", False):
+                    continue
                 try:
                     w.link_slider.slider.blockSignals(True)
                     w.link_slider.slider.setValue(value)
@@ -2852,6 +2849,8 @@ class MainWindow(QtWidgets.QWidget):
                 except RuntimeError:
                     # widget 已被刪除（熱插拔後），跳過
                     pass
+            self._sync_global_link_from_available_monitors()
+            self._update_auto_adjust_info()
         finally:
             self._updating_global_link = False
 
