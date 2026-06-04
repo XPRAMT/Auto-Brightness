@@ -563,7 +563,7 @@ class MonitorWidget(QtWidgets.QGroupBox):
         # ===== Sliders =====
         self.b_slider = self.create_slider("Brightness")
         self.c_slider = self.create_slider("Contrast")
-        self.link_slider = self.create_slider("Link")
+        self.link_slider = self.create_slider("Link Value")
 
         self.b_slider.slider.valueChanged.connect(self.on_brightness)
         self.c_slider.slider.valueChanged.connect(self.on_contrast)
@@ -1863,7 +1863,7 @@ class MainWindow(QtWidgets.QWidget):
         layout.addLayout(top_bar)
 
         self.auto_target_group = QtWidgets.QGroupBox("自動調整目標亮度")
-        auto_target_layout = QtWidgets.QHBoxLayout()
+        auto_target_layout = QtWidgets.QGridLayout()
         auto_target_layout.setContentsMargins(6, 6, 6, 6)
         auto_target_layout.setSpacing(6)
         self.auto_target_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
@@ -1872,9 +1872,20 @@ class MainWindow(QtWidgets.QWidget):
         self.auto_target_value_label = QtWidgets.QLabel(str(self.auto_adjust_target))
         self.auto_target_value_label.setMinimumWidth(30)
         self.auto_target_slider.valueChanged.connect(self.on_main_target_slider_changed)
-        auto_target_layout.addWidget(QtWidgets.QLabel("Target"))
-        auto_target_layout.addWidget(self.auto_target_slider)
-        auto_target_layout.addWidget(self.auto_target_value_label)
+
+        self.main_global_link_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.main_global_link_slider.setRange(0, 100)
+        self.main_global_link_slider.setValue(int(self.global_link_value))
+        self.main_global_link_value_label = QtWidgets.QLabel(str(int(self.global_link_value)))
+        self.main_global_link_value_label.setMinimumWidth(30)
+        self.main_global_link_slider.valueChanged.connect(self.on_main_global_link_slider_changed)
+
+        auto_target_layout.addWidget(QtWidgets.QLabel("Target"), 0, 0)
+        auto_target_layout.addWidget(self.auto_target_slider, 0, 1)
+        auto_target_layout.addWidget(self.auto_target_value_label, 0, 2)
+        auto_target_layout.addWidget(QtWidgets.QLabel("Global Link"), 1, 0)
+        auto_target_layout.addWidget(self.main_global_link_slider, 1, 1)
+        auto_target_layout.addWidget(self.main_global_link_value_label, 1, 2)
         self.auto_target_group.setLayout(auto_target_layout)
         layout.addWidget(self.auto_target_group)
 
@@ -2372,6 +2383,7 @@ class MainWindow(QtWidgets.QWidget):
         self.global_link_value = int(round(sum(link_values) / len(link_values))) if link_values else 0
         self.screen_analyzer.set_current_ddc(self.global_link_value)
         self._update_auto_adjust_info()
+        self._sync_main_global_link_controls()
         self.refresh_tray_display()
 
     def init_global_hook(self):
@@ -2432,6 +2444,17 @@ class MainWindow(QtWidgets.QWidget):
 
     def on_main_target_slider_changed(self, value):
         self.set_auto_adjust_target(value)
+
+    def on_main_global_link_slider_changed(self, value):
+        self.set_global_link(value)
+
+    def _sync_main_global_link_controls(self):
+        if hasattr(self, "main_global_link_slider"):
+            value = int(round(self.global_link_value))
+            self.main_global_link_slider.blockSignals(True)
+            self.main_global_link_slider.setValue(value)
+            self.main_global_link_slider.blockSignals(False)
+            self.main_global_link_value_label.setText(str(value))
 
     def set_auto_adjust_target(self, value, trigger_save=True):
         value = max(0, min(100, self.snap_to_step(value)))
@@ -2538,6 +2561,7 @@ class MainWindow(QtWidgets.QWidget):
             self.global_link_value = int(round(sum(link_values) / len(link_values)))
             self.screen_analyzer.set_current_ddc(self.global_link_value)
             self._update_auto_adjust_info()
+            self._sync_main_global_link_controls()
 
     def on_luminance_updated(self, lum):
         self._last_avg_luminance = float(lum)
@@ -2756,7 +2780,17 @@ class MainWindow(QtWidgets.QWidget):
     def on_monitor_link_changed(self, value):
         if self._updating_global_link:
             return
-        self.update_global_link(value)
+        link_values = []
+        for widget in self.monitor_widgets:
+            try:
+                link_values.append(int(widget.link_slider.slider.value()))
+            except RuntimeError:
+                pass
+        if link_values:
+            self.global_link_value = int(round(sum(link_values) / len(link_values)))
+            self.screen_analyzer.set_current_ddc(self.global_link_value)
+            self._update_auto_adjust_info()
+            self._sync_main_global_link_controls()
         self.trigger_save()
 
     def update_global_link(self, value):
@@ -2770,6 +2804,7 @@ class MainWindow(QtWidgets.QWidget):
         self.global_link_value = value
         self.screen_analyzer.set_current_ddc(value)
         self._update_auto_adjust_info()
+        self._sync_main_global_link_controls()
         try:
             for w in self.monitor_widgets:
                 try:
