@@ -1767,7 +1767,7 @@ class NetworkMonitorServer:
         elif cmd == "set_state":
             if self._set_app_state_callback is None:
                 return {"ok": False}
-            ok = bool(self._set_app_state_callback(req.get("global_link"), req.get("auto_target")))
+            ok = bool(self._set_app_state_callback(req.get("global_link"), req.get("auto_target"), req.get("auto_enabled")))
             response = {"ok": ok, "_broadcast_monitors": ok}
             response.update(self._state_payload())
             return response
@@ -1905,6 +1905,8 @@ class NetworkMonitorClient(QtCore.QObject):
             state["global_link"] = message.get("global_link")
         if "auto_target" in message:
             state["auto_target"] = message.get("auto_target")
+        if "auto_enabled" in message:
+            state["auto_enabled"] = message.get("auto_enabled")
         if state:
             entry["state"] = state
         info = entry["info"]
@@ -2012,7 +2014,7 @@ class NetworkMonitorClient(QtCore.QObject):
             print(f"Remote set error: {e}")
         return False
 
-    def remote_set_state(self, server_name, global_link=None, auto_target=None):
+    def remote_set_state(self, server_name, global_link=None, auto_target=None, auto_enabled=None):
         entry = self._discovered_servers.get(server_name)
         if not entry:
             return False
@@ -2028,6 +2030,8 @@ class NetworkMonitorClient(QtCore.QObject):
                     req["global_link"] = int(global_link)
                 if auto_target is not None:
                     req["auto_target"] = int(auto_target)
+                if auto_enabled is not None:
+                    req["auto_enabled"] = bool(auto_enabled)
                 s.sendall(json.dumps(req).encode() + b"\n")
                 buf = b""
                 while True:
@@ -2094,7 +2098,7 @@ class RemoteMonitorWrapper:
 # =========================
 class MainWindow(QtWidgets.QWidget):
     remote_set_applied = QtCore.pyqtSignal(str, object, object)
-    remote_state_applied = QtCore.pyqtSignal(object, object)
+    remote_state_applied = QtCore.pyqtSignal(object, object, object)
     HOTKEY_OPTIONS = MODIFIER_ORDER
     HOTKEY_OPTIONAL_OPTIONS = SHORTCUT_MODIFIER_OPTIONS
     STARTUP_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -2110,6 +2114,7 @@ class MainWindow(QtWidgets.QWidget):
         self._applying_remote_network_state = False
         self._pending_network_global_link = None
         self._pending_network_auto_target = None
+        self._pending_network_auto_enabled = None
         self.global_link_value = 0
         self.step_value = 5.0
         self.shortcut_key1 = "Alt"
@@ -2122,6 +2127,7 @@ class MainWindow(QtWidgets.QWidget):
         # 網路功能
         self._network_server_enabled = False
         self._network_client_enabled = False
+        self._network_mode = "disabled"
         self._remote_wrappers = []
         self._remote_widgets = []
         self._remote_monitor_data = []
@@ -2145,6 +2151,7 @@ class MainWindow(QtWidgets.QWidget):
         # 網路功能
         self._network_server_enabled = False
         self._network_client_enabled = False
+        self._network_mode = "disabled"
         self._net_server = NetworkMonitorServer(
             get_monitor_wrappers=lambda: self.monitor_wrappers,
             set_monitor_callback=self._remote_set_monitor,
@@ -2706,20 +2713,17 @@ class MainWindow(QtWidgets.QWidget):
         net_grid.setContentsMargins(6, 6, 6, 6)
         net_grid.setSpacing(6)
 
-        self.net_server_checkbox = QtWidgets.QCheckBox("啟用伺服器 (分享本機螢幕給區域網路)")
-        self.net_server_checkbox.setChecked(self._network_server_enabled)
-        self.net_server_checkbox.toggled.connect(self._on_net_server_toggled)
-
-        self.net_client_checkbox = QtWidgets.QCheckBox("啟用用戶端 (發現並控制區域網路其他螢幕)")
-        self.net_client_checkbox.setChecked(self._network_client_enabled)
-        self.net_client_checkbox.toggled.connect(self._on_net_client_toggled)
+        self.net_mode_combo = QtWidgets.QComboBox()
+        self.net_mode_combo.addItems(["停用", "啟用伺服器", "啟用用戶端"])
+        self.net_mode_combo.setCurrentIndex({"disabled": 0, "server": 1, "client": 2}.get(self._network_mode, 0))
+        self.net_mode_combo.currentIndexChanged.connect(self._on_net_mode_changed)
 
         self.net_servers_label = QtWidgets.QLabel("已發現伺服器: 0")
         self.net_servers_label.setWordWrap(True)
 
-        net_grid.addWidget(self.net_server_checkbox, 0, 0, 1, 2)
-        net_grid.addWidget(self.net_client_checkbox, 1, 0, 1, 2)
-        net_grid.addWidget(self.net_servers_label, 2, 0, 1, 2)
+        net_grid.addWidget(QtWidgets.QLabel("模式"), 0, 0)
+        net_grid.addWidget(self.net_mode_combo, 0, 1)
+        net_grid.addWidget(self.net_servers_label, 1, 0, 1, 2)
         # 已移除 UDP 防火牆按鈕（改為透過 TCP 廣播亮度）
         net_group.setLayout(net_grid)
         net_layout.addWidget(net_group)
@@ -2745,22 +2749,52 @@ class MainWindow(QtWidgets.QWidget):
         self.trigger_save()
 
     # ---- 網路功能 ----
-    def _on_net_server_toggled(self, enabled):
-        self._network_server_enabled = enabled
-        if enabled:
-            self._net_server.start()
-        else:
-            self._net_server.stop()
-        self.trigger_save()
+    def _sync_network_flags_from_mode(self):
+        self._network_server_enabled = self._network_mode == "server"
+        self._network_client_enabled = self._network_mode == "client"
 
-    def _on_net_client_toggled(self, enabled):
-        self._network_client_enabled = enabled
-        if enabled:
-            self._net_client.start()
-        else:
+    def _set_network_mode(self, mode, trigger_save=True):
+        if mode not in ("disabled", "server", "client"):
+            mode = "disabled"
+        if mode == getattr(self, "_network_mode", "disabled"):
+            self._sync_network_mode_controls()
+            return
+
+        self._network_mode = mode
+        self._sync_network_flags_from_mode()
+
+        if mode == "server":
             self._net_client.stop()
             self._clear_remote_wrappers()
-        self.trigger_save()
+            self._net_server.start()
+        elif mode == "client":
+            self._net_server.stop()
+            self._net_client.start()
+        else:
+            self._net_server.stop()
+            self._net_client.stop()
+            self._clear_remote_wrappers()
+
+        self._sync_network_mode_controls()
+        if trigger_save:
+            self.trigger_save()
+
+    def _sync_network_mode_controls(self):
+        if hasattr(self, "net_mode_combo"):
+            index = {"disabled": 0, "server": 1, "client": 2}.get(self._network_mode, 0)
+            self.net_mode_combo.blockSignals(True)
+            self.net_mode_combo.setCurrentIndex(index)
+            self.net_mode_combo.blockSignals(False)
+
+    def _on_net_mode_changed(self, index):
+        mode = {0: "disabled", 1: "server", 2: "client"}.get(int(index), "disabled")
+        self._set_network_mode(mode)
+
+    def _on_net_server_toggled(self, enabled):
+        self._set_network_mode("server" if enabled else "disabled")
+
+    def _on_net_client_toggled(self, enabled):
+        self._set_network_mode("client" if enabled else "disabled")
 
     # UDP 防火牆按鈕與 UAC 提升相關功能已移除（改用 TCP 廣播）。
 
@@ -2853,16 +2887,19 @@ class MainWindow(QtWidgets.QWidget):
         return {
             "global_link": int(round(self._pending_network_global_link if self._pending_network_global_link is not None else self.global_link_value)),
             "auto_target": int(round(self._pending_network_auto_target if self._pending_network_auto_target is not None else self.auto_adjust_target)),
+            "auto_enabled": bool(self._pending_network_auto_enabled if self._pending_network_auto_enabled is not None else self.auto_adjust_enabled),
         }
 
-    def _remote_set_app_state(self, global_link, auto_target):
-        if global_link is None and auto_target is None:
+    def _remote_set_app_state(self, global_link, auto_target, auto_enabled):
+        if global_link is None and auto_target is None and auto_enabled is None:
             return False
         if global_link is not None:
             self._pending_network_global_link = int(global_link)
         if auto_target is not None:
             self._pending_network_auto_target = int(auto_target)
-        self.remote_state_applied.emit(global_link, auto_target)
+        if auto_enabled is not None:
+            self._pending_network_auto_enabled = bool(auto_enabled)
+        self.remote_state_applied.emit(global_link, auto_target, auto_enabled)
         return True
 
     def _on_remote_state_updated(self, state):
@@ -2870,24 +2907,30 @@ class MainWindow(QtWidgets.QWidget):
             return
         global_link = state.get("global_link")
         auto_target = state.get("auto_target")
-        if global_link is None and auto_target is None:
+        auto_enabled = state.get("auto_enabled")
+        if global_link is None and auto_target is None and auto_enabled is None:
             return
         if (
             (global_link is None or int(global_link) == int(round(self.global_link_value)))
             and (auto_target is None or int(auto_target) == int(round(self.auto_adjust_target)))
+            and (auto_enabled is None or bool(auto_enabled) == bool(self.auto_adjust_enabled))
         ):
             return
-        self._on_remote_state_applied(global_link, auto_target)
+        self._on_remote_state_applied(global_link, auto_target, auto_enabled)
 
-    def _on_remote_state_applied(self, global_link, auto_target):
+    def _on_remote_state_applied(self, global_link, auto_target, auto_enabled):
         if self._applying_remote_network_state:
             return
         self._applying_remote_network_state = True
         try:
+            if auto_enabled is not None and bool(auto_enabled) != bool(self.auto_adjust_enabled):
+                self.on_auto_adjust_toggled(bool(auto_enabled))
             if auto_target is not None and int(auto_target) != int(round(self.auto_adjust_target)):
                 self.set_auto_adjust_target(int(auto_target), trigger_save=False)
             if global_link is not None and int(global_link) != int(round(self.global_link_value)):
                 self.update_global_link(int(global_link))
+            if auto_enabled is not None:
+                self._pending_network_auto_enabled = None
             if auto_target is not None:
                 self._pending_network_auto_target = None
             if global_link is not None:
@@ -2896,11 +2939,11 @@ class MainWindow(QtWidgets.QWidget):
         finally:
             self._applying_remote_network_state = False
 
-    def _sync_app_state_to_remote_servers(self, global_link=None, auto_target=None):
+    def _sync_app_state_to_remote_servers(self, global_link=None, auto_target=None, auto_enabled=None):
         if self._applying_remote_network_state or not self._network_client_enabled:
             return
         for server_name in list(getattr(self._net_client, "_discovered_servers", {}).keys()):
-            self._net_client.remote_set_state(server_name, global_link=global_link, auto_target=auto_target)
+            self._net_client.remote_set_state(server_name, global_link=global_link, auto_target=auto_target, auto_enabled=auto_enabled)
 
     def _on_remote_set_applied(self, name, brightness, contrast):
         for wrapper, widget in zip(self.monitor_wrappers, self.monitor_widgets):
@@ -3152,6 +3195,8 @@ class MainWindow(QtWidgets.QWidget):
         self.update_auto_adjust_controls_visibility()
         self.refresh_tray_display()
         self.trigger_save()
+        self._broadcast_monitor_state_if_server_enabled()
+        self._sync_app_state_to_remote_servers(auto_enabled=self.auto_adjust_enabled)
 
     def on_auto_adjust_settings_changed(self):
         self.auto_adjust_threshold = int(self.auto_adjust_threshold_spin.value())
@@ -3606,6 +3651,7 @@ class MainWindow(QtWidgets.QWidget):
                 "resource_saving_idle_seconds": self.auto_adjust_resource_saving_idle_seconds,
             },
             "network": {
+                "mode": self._network_mode,
                 "server_enabled": self._network_server_enabled,
                 "client_enabled": self._network_client_enabled,
             },
@@ -3653,8 +3699,16 @@ class MainWindow(QtWidgets.QWidget):
             net_data = data.get("network", {}) if isinstance(data, dict) else {}
 
             # 載入網路功能設定（先存值，等 UI 建立後再啟動 server/client）
-            self._network_server_enabled = bool(net_data.get("server_enabled", False))
-            self._network_client_enabled = bool(net_data.get("client_enabled", False))
+            loaded_network_mode = net_data.get("mode") if isinstance(net_data, dict) else None
+            if loaded_network_mode not in ("disabled", "server", "client"):
+                if bool(net_data.get("server_enabled", False)):
+                    loaded_network_mode = "server"
+                elif bool(net_data.get("client_enabled", False)):
+                    loaded_network_mode = "client"
+                else:
+                    loaded_network_mode = "disabled"
+            self._network_mode = loaded_network_mode
+            self._sync_network_flags_from_mode()
 
             # 先決定是否啟用自動調整，避免啟動流程誤下發 DDC 指令
             self.auto_adjust_enabled = bool(auto_adjust_data.get("enabled", False))
@@ -3777,15 +3831,11 @@ class MainWindow(QtWidgets.QWidget):
         finally:
             self._loading_settings = False
 
-        # 啟動網路功能（需在 load_settings 完成後，確保 UI checkbox 已存在）
-        if self._network_server_enabled:
-            self._net_server.start()
-            if hasattr(self, "net_server_checkbox"):
-                self.net_server_checkbox.setChecked(True)
-        if self._network_client_enabled:
-            self._net_client.start()
-            if hasattr(self, "net_client_checkbox"):
-                self.net_client_checkbox.setChecked(True)
+        # 啟動網路功能（需在 load_settings 完成後，確保 UI 控制項已存在）
+        loaded_network_mode = self._network_mode
+        self._network_mode = "disabled"
+        self._sync_network_flags_from_mode()
+        self._set_network_mode(loaded_network_mode, trigger_save=False)
 
 
 # =========================
