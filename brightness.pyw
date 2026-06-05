@@ -77,6 +77,7 @@ SHORTCUT_KEY_OPTIONS = (
     + [chr(code) for code in range(ord("A"), ord("Z") + 1)]
     + [f"F{i}" for i in range(1, 13)]
     + ["Left", "Up", "Right", "Down", "PageUp", "PageDown", "Home", "End"]
+    + ["音量靜音", "音量降低", "音量提高", "媒體上一首", "媒體下一首", "媒體播放", "媒體暫停", "媒體停止"]
     + ["滑鼠左鍵", "滑鼠右鍵", "滑鼠中鍵", "滑鼠上一頁", "滑鼠下一頁"]
 )
 SHORTCUT_TYPE_OPTIONS = ["絕對值", "+Step", "-Step", "切換自動亮度"]
@@ -94,6 +95,14 @@ KEY_NAME_TO_VK = {
     "PageDown": 0x22,
     "Home": 0x24,
     "End": 0x23,
+    "音量靜音": 0xAD,   # VK_VOLUME_MUTE
+    "音量降低": 0xAE,   # VK_VOLUME_DOWN
+    "音量提高": 0xAF,   # VK_VOLUME_UP
+    "媒體上一首": 0xB1, # VK_MEDIA_PREV_TRACK
+    "媒體下一首": 0xB0, # VK_MEDIA_NEXT_TRACK
+    "媒體播放": 0xB3,   # VK_MEDIA_PLAY_PAUSE
+    "媒體暫停": 0xB3,   # VK_MEDIA_PLAY_PAUSE
+    "媒體停止": 0xB2,   # VK_MEDIA_STOP
     "滑鼠左鍵": 0x01,   # VK_LBUTTON
     "滑鼠右鍵": 0x02,   # VK_RBUTTON
     "滑鼠中鍵": 0x04,   # VK_MBUTTON
@@ -310,6 +319,19 @@ def qt_key_event_to_name(event):
     }
     if key in arrow_map:
         return arrow_map[key]
+
+    media_map = {
+        QtCore.Qt.Key.Key_VolumeMute: "音量靜音",
+        QtCore.Qt.Key.Key_VolumeDown: "音量降低",
+        QtCore.Qt.Key.Key_VolumeUp: "音量提高",
+        QtCore.Qt.Key.Key_MediaPrevious: "媒體上一首",
+        QtCore.Qt.Key.Key_MediaNext: "媒體下一首",
+        QtCore.Qt.Key.Key_MediaPlay: "媒體播放",
+        QtCore.Qt.Key.Key_MediaPause: "媒體暫停",
+        QtCore.Qt.Key.Key_MediaStop: "媒體停止",
+    }
+    if key in media_map:
+        return media_map[key]
 
     return None
 
