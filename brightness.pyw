@@ -82,6 +82,10 @@ SHORTCUT_KEY_OPTIONS = (
 )
 SHORTCUT_TYPE_OPTIONS = ["絕對值", "+Step", "-Step", "切換自動亮度"]
 KEY_NAME_TO_VK = {
+    "Alt": 0x12,
+    "Ctrl": 0x11,
+    "Shift": 0x10,
+    "Win": 0x5B,
     **{str(i): 0x30 + i for i in range(10)},
     **{chr(code): code for code in range(ord("A"), ord("Z") + 1)},
     **{f"F{i}": 0x6F + i for i in range(1, 13)},
@@ -285,9 +289,18 @@ def _wmi_get_brightness():
         return None
 
 
-def qt_key_event_to_name(event):
+def qt_key_event_to_name(event, allow_modifiers=False):
     key = event.key()
     modifiers = event.modifiers()
+
+    modifier_map = {
+        QtCore.Qt.Key.Key_Control: "Ctrl",
+        QtCore.Qt.Key.Key_Shift: "Shift",
+        QtCore.Qt.Key.Key_Alt: "Alt",
+        QtCore.Qt.Key.Key_Meta: "Win",
+    }
+    if key in modifier_map:
+        return modifier_map[key] if allow_modifiers else None
 
     if key in (QtCore.Qt.Key.Key_Control, QtCore.Qt.Key.Key_Shift, QtCore.Qt.Key.Key_Alt, QtCore.Qt.Key.Key_Meta):
         return None
@@ -408,8 +421,7 @@ class GlobalHotkeyWheelHook(QtCore.QObject):
         self.user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
         self.user32.GetAsyncKeyState.restype = ctypes.c_short
 
-        self.trigger_key1 = "Alt"
-        self.trigger_key2 = "Win"
+        self.trigger_keys = ["Alt", "Win", "None"]
         self.level_shortcuts = []
 
         self.alt_down = False
@@ -423,9 +435,13 @@ class GlobalHotkeyWheelHook(QtCore.QObject):
         self._keyboard_proc = None
         self._mouse_proc = None
 
-    def set_trigger_shortcut(self, key1, key2):
-        self.trigger_key1 = key1
-        self.trigger_key2 = key2
+    def set_trigger_shortcut(self, *keys):
+        normalized = []
+        for key in keys:
+            key_name = key if key in KEY_NAME_TO_VK else "None"
+            if key_name != "None" and key_name not in normalized:
+                normalized.append(key_name)
+        self.trigger_keys = (normalized + ["None", "None", "None"])[:3]
 
     def set_level_shortcuts(self, shortcuts):
         normalized_shortcuts = []
@@ -459,6 +475,16 @@ class GlobalHotkeyWheelHook(QtCore.QObject):
         if key_name == "Win":
             return bool(self.user32.GetAsyncKeyState(self.VK_LWIN) & 0x8000) or bool(self.user32.GetAsyncKeyState(self.VK_RWIN) & 0x8000)
         return False
+
+    def _is_key_pressed(self, key_name):
+        if key_name in (None, "", "None"):
+            return True
+        if key_name == "Win":
+            return bool(self.user32.GetAsyncKeyState(self.VK_LWIN) & 0x8000) or bool(self.user32.GetAsyncKeyState(self.VK_RWIN) & 0x8000)
+        vk = KEY_NAME_TO_VK.get(key_name)
+        if vk is None:
+            return False
+        return bool(self.user32.GetAsyncKeyState(vk) & 0x8000)
 
     def _get_pressed_modifiers(self):
         return tuple(modifier for modifier in MODIFIER_ORDER if self._is_modifier_pressed(modifier))
@@ -546,10 +572,10 @@ class GlobalHotkeyWheelHook(QtCore.QObject):
                     high_word = (ms.mouseData >> 16) & 0xFFFF
                     delta = ctypes.c_short(high_word).value
 
-                    key1_pressed = self._is_modifier_pressed(self.trigger_key1)
-                    key2_pressed = self._is_modifier_pressed(self.trigger_key2)
+                    active_trigger_keys = [key_name for key_name in self.trigger_keys if key_name not in (None, "", "None")]
+                    trigger_keys_pressed = bool(active_trigger_keys) and all(self._is_key_pressed(key_name) for key_name in active_trigger_keys)
 
-                    if key1_pressed and key2_pressed:
+                    if trigger_keys_pressed:
                         wheel_steps = int(delta / 120) if delta != 0 else 0
                         if wheel_steps == 0:
                             wheel_steps = 1 if delta > 0 else -1
@@ -1095,8 +1121,10 @@ class ShortcutConfigRow(QtWidgets.QWidget):
 class KeyCaptureButton(QtWidgets.QPushButton):
     key_changed = QtCore.pyqtSignal(str)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, allow_none=False, allow_modifiers=False):
         super().__init__(parent)
+        self.allow_none = bool(allow_none)
+        self.allow_modifiers = bool(allow_modifiers)
         self.key_name = "NumPad0"
         self.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
         self.clicked.connect(self.begin_capture)
@@ -1109,13 +1137,18 @@ class KeyCaptureButton(QtWidgets.QPushButton):
         self.setFocus(QtCore.Qt.FocusReason.MouseFocusReason)
 
     def set_key_name(self, key_name):
-        self.key_name = key_name if key_name in KEY_NAME_TO_VK else "NumPad0"
+        if key_name in KEY_NAME_TO_VK:
+            self.key_name = key_name
+        elif key_name == "None" and self.allow_none:
+            self.key_name = "None"
+        else:
+            self.key_name = "None" if self.allow_none else "NumPad0"
         self._capture_mode = False
         self.update_text()
         self.key_changed.emit(self.key_name)
 
     def update_text(self):
-        self.setText(self.key_name)
+        self.setText("None" if self.key_name == "None" else self.key_name)
 
     def keyPressEvent(self, event):
         if not self._capture_mode:
@@ -1127,7 +1160,7 @@ class KeyCaptureButton(QtWidgets.QPushButton):
             event.accept()
             return
 
-        key_name = qt_key_event_to_name(event)
+        key_name = qt_key_event_to_name(event, allow_modifiers=self.allow_modifiers)
         if key_name is not None:
             self.set_key_name(key_name)
 
@@ -1151,8 +1184,11 @@ class KeyCaptureButton(QtWidgets.QPushButton):
 
     def focusOutEvent(self, event):
         if self._capture_mode:
-            self._capture_mode = False
-            self.update_text()
+            if self.allow_none:
+                self.set_key_name("None")
+            else:
+                self._capture_mode = False
+                self.update_text()
         super().focusOutEvent(event)
 
 
@@ -2139,6 +2175,7 @@ class MainWindow(QtWidgets.QWidget):
         self.step_value = 5.0
         self.shortcut_key1 = "Alt"
         self.shortcut_key2 = "Win"
+        self.shortcut_key3 = "None"
         self.auto_start_enabled = False
         self.level_shortcuts = [dict(item) for item in DEFAULT_LEVEL_SHORTCUTS]
         self.global_hook = None
@@ -2573,20 +2610,22 @@ class MainWindow(QtWidgets.QWidget):
         wheel_grid.setContentsMargins(6, 6, 6, 6)
         wheel_grid.setSpacing(6)
 
-        self.shortcut_key1_combo = QtWidgets.QComboBox()
-        self.shortcut_key1_combo.addItems(self.HOTKEY_OPTIONS)
-        self.shortcut_key1_combo.setCurrentText(self.shortcut_key1)
-        self.shortcut_key1_combo.currentTextChanged.connect(self.on_shortcut_changed)
-
-        self.shortcut_key2_combo = QtWidgets.QComboBox()
-        self.shortcut_key2_combo.addItems(self.HOTKEY_OPTIONAL_OPTIONS)
-        self.shortcut_key2_combo.setCurrentText(self.shortcut_key2)
-        self.shortcut_key2_combo.currentTextChanged.connect(self.on_shortcut_changed)
+        self.shortcut_key1_button = KeyCaptureButton(allow_none=True, allow_modifiers=True)
+        self.shortcut_key2_button = KeyCaptureButton(allow_none=True, allow_modifiers=True)
+        self.shortcut_key3_button = KeyCaptureButton(allow_none=True, allow_modifiers=True)
+        self.shortcut_key1_button.set_key_name(self.shortcut_key1)
+        self.shortcut_key2_button.set_key_name(self.shortcut_key2)
+        self.shortcut_key3_button.set_key_name(self.shortcut_key3)
+        self.shortcut_key1_button.key_changed.connect(self.on_shortcut_changed)
+        self.shortcut_key2_button.key_changed.connect(self.on_shortcut_changed)
+        self.shortcut_key3_button.key_changed.connect(self.on_shortcut_changed)
 
         wheel_grid.addWidget(QtWidgets.QLabel("觸發鍵"), 0, 0)
-        wheel_grid.addWidget(self.shortcut_key1_combo, 0, 1)
+        wheel_grid.addWidget(self.shortcut_key1_button, 0, 1)
         wheel_grid.addWidget(QtWidgets.QLabel("+"), 0, 2)
-        wheel_grid.addWidget(self.shortcut_key2_combo, 0, 3)
+        wheel_grid.addWidget(self.shortcut_key2_button, 0, 3)
+        wheel_grid.addWidget(QtWidgets.QLabel("+"), 0, 4)
+        wheel_grid.addWidget(self.shortcut_key3_button, 0, 5)
         wheel_group.setLayout(wheel_grid)
         gen_layout.addWidget(wheel_group)
 
@@ -3430,14 +3469,15 @@ class MainWindow(QtWidgets.QWidget):
         self.trigger_save()
 
     def on_shortcut_changed(self, _):
-        self.shortcut_key1 = self.shortcut_key1_combo.currentText()
-        self.shortcut_key2 = self.shortcut_key2_combo.currentText()
+        self.shortcut_key1 = self.shortcut_key1_button.key_name
+        self.shortcut_key2 = self.shortcut_key2_button.key_name
+        self.shortcut_key3 = self.shortcut_key3_button.key_name
         self.apply_shortcut_to_hook()
         self.trigger_save()
 
     def apply_shortcut_to_hook(self):
         if self.global_hook is not None:
-            self.global_hook.set_trigger_shortcut(self.shortcut_key1, self.shortcut_key2)
+            self.global_hook.set_trigger_shortcut(self.shortcut_key1, self.shortcut_key2, self.shortcut_key3)
 
     def add_shortcut_row(self, shortcut=None):
         row = ShortcutConfigRow(shortcut)
@@ -3682,8 +3722,10 @@ class MainWindow(QtWidgets.QWidget):
             "step": self.get_step_value(),
             "auto_start": self.auto_start_enabled,
             "shortcut": {
+                "keys": [self.shortcut_key1, self.shortcut_key2, self.shortcut_key3],
                 "key1": self.shortcut_key1,
                 "key2": self.shortcut_key2,
+                "key3": self.shortcut_key3,
             },
             "level_shortcuts": self.level_shortcuts,
             "auto_adjust": {
@@ -3738,8 +3780,17 @@ class MainWindow(QtWidgets.QWidget):
             saved_auto_start = data.get("auto_start", self.is_startup_enabled()) if isinstance(data, dict) else self.is_startup_enabled()
             shortcut = data.get("shortcut", {}) if isinstance(data, dict) else {}
             saved_level_shortcuts = data.get("level_shortcuts", [dict(item) for item in DEFAULT_LEVEL_SHORTCUTS]) if isinstance(data, dict) else [dict(item) for item in DEFAULT_LEVEL_SHORTCUTS]
-            saved_key1 = shortcut.get("key1", "Alt") if isinstance(shortcut, dict) else "Alt"
-            saved_key2 = shortcut.get("key2", "Win") if isinstance(shortcut, dict) else "Win"
+            saved_trigger_keys = shortcut.get("keys") if isinstance(shortcut, dict) else None
+            if isinstance(saved_trigger_keys, list):
+                saved_trigger_keys = list(saved_trigger_keys[:3])
+            else:
+                saved_trigger_keys = [
+                    shortcut.get("key1", "Alt") if isinstance(shortcut, dict) else "Alt",
+                    shortcut.get("key2", "Win") if isinstance(shortcut, dict) else "Win",
+                    shortcut.get("key3", "None") if isinstance(shortcut, dict) else "None",
+                ]
+            while len(saved_trigger_keys) < 3:
+                saved_trigger_keys.append("None")
             monitors_data = data.get("monitors", data) if isinstance(data, dict) else data
             auto_adjust_data = data.get("auto_adjust", {}) if isinstance(data, dict) else {}
             net_data = data.get("network", {}) if isinstance(data, dict) else {}
@@ -3772,20 +3823,20 @@ class MainWindow(QtWidgets.QWidget):
             self.step_combo.blockSignals(False)
             self.step_value = float(self.step_combo.currentText())
 
-            if saved_key1 not in self.HOTKEY_OPTIONS:
-                saved_key1 = "Alt"
-            if saved_key2 not in self.HOTKEY_OPTIONAL_OPTIONS:
-                saved_key2 = "Win"
+            saved_trigger_keys = [
+                key if key in KEY_NAME_TO_VK or key == "None" else "None"
+                for key in saved_trigger_keys
+            ]
 
-            self.shortcut_key1_combo.blockSignals(True)
-            self.shortcut_key2_combo.blockSignals(True)
-            self.shortcut_key1_combo.setCurrentText(saved_key1)
-            self.shortcut_key2_combo.setCurrentText(saved_key2)
-            self.shortcut_key1_combo.blockSignals(False)
-            self.shortcut_key2_combo.blockSignals(False)
+            for button, key in zip(
+                [self.shortcut_key1_button, self.shortcut_key2_button, self.shortcut_key3_button],
+                saved_trigger_keys,
+            ):
+                button.blockSignals(True)
+                button.set_key_name(key)
+                button.blockSignals(False)
 
-            self.shortcut_key1 = saved_key1
-            self.shortcut_key2 = saved_key2
+            self.shortcut_key1, self.shortcut_key2, self.shortcut_key3 = saved_trigger_keys
             self.apply_shortcut_to_hook()
 
             self.clear_shortcut_rows()
