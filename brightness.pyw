@@ -500,9 +500,16 @@ class GlobalHotkeyWheelHook(QtCore.QObject):
     def _key_name_matches_vk(self, key_name, vk):
         return int(vk) in KEY_NAME_TO_VKS.get(key_name, ())
 
-    def _active_keys_pressed(self, keys):
+    def _active_keys_pressed(self, keys, current_vk=None):
         active_keys = [key_name for key_name in keys if key_name not in (None, "", "None")]
-        return bool(active_keys) and all(self._is_key_pressed(key_name) for key_name in active_keys)
+        if not active_keys:
+            return False
+        for key_name in active_keys:
+            if current_vk is not None and self._key_name_matches_vk(key_name, current_vk):
+                continue
+            if not self._is_key_pressed(key_name):
+                return False
+        return True
 
     def _get_pressed_modifiers(self):
         return tuple(modifier for modifier in MODIFIER_ORDER if self._is_modifier_pressed(modifier))
@@ -512,7 +519,7 @@ class GlobalHotkeyWheelHook(QtCore.QObject):
             keys = shortcut["keys"]
             if not any(self._key_name_matches_vk(key_name, vk) for key_name in keys):
                 continue
-            if self._active_keys_pressed(keys):
+            if self._active_keys_pressed(keys, current_vk=vk):
                 return shortcut["type"], shortcut["value"]
         return None
 
@@ -605,6 +612,10 @@ class GlobalHotkeyWheelHook(QtCore.QObject):
 
         self.keyboard_hook = self.user32.SetWindowsHookExW(self.WH_KEYBOARD_LL, self._keyboard_proc, None, 0)
         self.mouse_hook = self.user32.SetWindowsHookExW(self.WH_MOUSE_LL, self._mouse_proc, None, 0)
+        if not self.keyboard_hook:
+            print(f"Keyboard hook install failed: {ctypes.get_last_error()}")
+        if not self.mouse_hook:
+            print(f"Mouse hook install failed: {ctypes.get_last_error()}")
 
         msg = wintypes.MSG()
         while self.running and self.user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
