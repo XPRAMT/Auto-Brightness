@@ -1901,8 +1901,6 @@ class NetworkMonitorClient(QtCore.QObject):
         monitors = message.get("monitors", [])
         entry["monitors"] = monitors if isinstance(monitors, list) else []
         state = {}
-        if "global_link" in message:
-            state["global_link"] = message.get("global_link")
         if "auto_target" in message:
             state["auto_target"] = message.get("auto_target")
         if "auto_enabled" in message:
@@ -2017,7 +2015,7 @@ class NetworkMonitorClient(QtCore.QObject):
             print(f"Remote set error: {e}")
         return False
 
-    def remote_set_state(self, server_name, global_link=None, auto_target=None, auto_enabled=None):
+    def remote_set_state(self, server_name, auto_target=None, auto_enabled=None):
         entry = self._discovered_servers.get(server_name)
         if not entry:
             return False
@@ -2029,8 +2027,6 @@ class NetworkMonitorClient(QtCore.QObject):
                 s.settimeout(3.0)
                 s.connect((info.parsed_addresses()[0], info.port))
                 req = {"cmd": "set_state"}
-                if global_link is not None:
-                    req["global_link"] = int(global_link)
                 if auto_target is not None:
                     req["auto_target"] = int(auto_target)
                 if auto_enabled is not None:
@@ -2115,7 +2111,6 @@ class MainWindow(QtWidgets.QWidget):
         self._is_quitting = False
         self._updating_global_link = False
         self._applying_remote_network_state = False
-        self._pending_network_global_link = None
         self._pending_network_auto_target = None
         self._pending_network_auto_enabled = None
         self.global_link_value = 0
@@ -2888,16 +2883,13 @@ class MainWindow(QtWidgets.QWidget):
 
     def _network_app_state_snapshot(self):
         return {
-            "global_link": int(round(self._pending_network_global_link if self._pending_network_global_link is not None else self.global_link_value)),
             "auto_target": int(round(self._pending_network_auto_target if self._pending_network_auto_target is not None else self.auto_adjust_target)),
             "auto_enabled": bool(self._pending_network_auto_enabled if self._pending_network_auto_enabled is not None else self.auto_adjust_enabled),
         }
 
     def _remote_set_app_state(self, global_link, auto_target, auto_enabled):
-        if global_link is None and auto_target is None and auto_enabled is None:
+        if auto_target is None and auto_enabled is None:
             return False
-        if global_link is not None:
-            self._pending_network_global_link = int(global_link)
         if auto_target is not None:
             self._pending_network_auto_target = int(auto_target)
         if auto_enabled is not None:
@@ -2908,18 +2900,16 @@ class MainWindow(QtWidgets.QWidget):
     def _on_remote_state_updated(self, state):
         if not isinstance(state, dict) or self._applying_remote_network_state:
             return
-        global_link = state.get("global_link")
         auto_target = state.get("auto_target")
         auto_enabled = state.get("auto_enabled")
-        if global_link is None and auto_target is None and auto_enabled is None:
+        if auto_target is None and auto_enabled is None:
             return
         if (
-            (global_link is None or int(global_link) == int(round(self.global_link_value)))
-            and (auto_target is None or int(auto_target) == int(round(self.auto_adjust_target)))
+            (auto_target is None or int(auto_target) == int(round(self.auto_adjust_target)))
             and (auto_enabled is None or bool(auto_enabled) == bool(self.auto_adjust_enabled))
         ):
             return
-        self._on_remote_state_applied(global_link, auto_target, auto_enabled)
+        self._on_remote_state_applied(None, auto_target, auto_enabled)
 
     def _on_remote_state_applied(self, global_link, auto_target, auto_enabled):
         if self._applying_remote_network_state:
@@ -2930,23 +2920,19 @@ class MainWindow(QtWidgets.QWidget):
                 self.on_auto_adjust_toggled(bool(auto_enabled))
             if auto_target is not None and int(auto_target) != int(round(self.auto_adjust_target)):
                 self.set_auto_adjust_target(int(auto_target), trigger_save=False)
-            if global_link is not None and int(global_link) != int(round(self.global_link_value)):
-                self.update_global_link(int(global_link))
             if auto_enabled is not None:
                 self._pending_network_auto_enabled = None
             if auto_target is not None:
                 self._pending_network_auto_target = None
-            if global_link is not None:
-                self._pending_network_global_link = None
             self.trigger_save()
         finally:
             self._applying_remote_network_state = False
 
-    def _sync_app_state_to_remote_servers(self, global_link=None, auto_target=None, auto_enabled=None):
+    def _sync_app_state_to_remote_servers(self, auto_target=None, auto_enabled=None):
         if self._applying_remote_network_state or not self._network_client_enabled:
             return
         for server_name in list(getattr(self._net_client, "_discovered_servers", {}).keys()):
-            self._net_client.remote_set_state(server_name, global_link=global_link, auto_target=auto_target, auto_enabled=auto_enabled)
+            self._net_client.remote_set_state(server_name, auto_target=auto_target, auto_enabled=auto_enabled)
 
     def _on_remote_set_applied(self, name, brightness, contrast):
         for wrapper, widget in zip(self.monitor_wrappers, self.monitor_widgets):
@@ -3599,7 +3585,6 @@ class MainWindow(QtWidgets.QWidget):
             self._sync_global_link_from_available_monitors()
             self._update_auto_adjust_info()
             self._broadcast_monitor_state_if_server_enabled()
-            self._sync_app_state_to_remote_servers(global_link=value)
         finally:
             self._updating_global_link = False
 
