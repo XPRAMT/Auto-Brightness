@@ -1531,10 +1531,19 @@ class NetworkMonitorServer:
     客戶端連線後可取得所有螢幕列表，並可下達亮度/對比設定指令。
     通訊協定為 JSON line-based (一行一個 JSON 物件)。
     """
-    def __init__(self, get_monitor_wrappers, set_monitor_callback, get_monitor_state_callback=None):
+    def __init__(
+        self,
+        get_monitor_wrappers,
+        set_monitor_callback,
+        get_monitor_state_callback=None,
+        get_app_state_callback=None,
+        set_app_state_callback=None,
+    ):
         self._get_wrappers = get_monitor_wrappers
         self._set_callback = set_monitor_callback
         self._get_monitor_state_callback = get_monitor_state_callback
+        self._get_app_state_callback = get_app_state_callback
+        self._set_app_state_callback = set_app_state_callback
         self._running = False
         self._server_thread = None
         self._sock = None
@@ -1704,7 +1713,25 @@ class NetworkMonitorServer:
 
     def broadcast_monitor_state(self):
         """向已訂閱 client 立即推送目前本機螢幕亮度狀態。"""
-        self._broadcast_payload({"event": "monitors", "monitors": self._monitor_snapshot(), "ts": time.time()})
+        payload = self._state_payload()
+        payload["event"] = "monitors"
+        payload["ts"] = time.time()
+        self._broadcast_payload(payload)
+
+    def _app_state_snapshot(self):
+        if self._get_app_state_callback is None:
+            return {}
+        try:
+            state = self._get_app_state_callback()
+            return state if isinstance(state, dict) else {}
+        except Exception as e:
+            print(f"App state snapshot error: {e}")
+            return {}
+
+    def _state_payload(self):
+        payload = {"monitors": self._monitor_snapshot()}
+        payload.update(self._app_state_snapshot())
+        return payload
 
     def _broadcast_payload(self, payload):
         data = (json.dumps(payload) + "\n").encode()
@@ -1728,15 +1755,26 @@ class NetworkMonitorServer:
             return {"error": "invalid json"}
         cmd = req.get("cmd", "")
         if cmd == "list":
-            return {"monitors": self._monitor_snapshot()}
+            return self._state_payload()
         elif cmd == "set":
             name = req.get("name", "")
             brightness = req.get("brightness")
             contrast = req.get("contrast")
             ok = bool(self._set_callback(name, brightness, contrast))
-            return {"ok": ok, "monitors": self._monitor_snapshot(), "_broadcast_monitors": ok}
+            response = {"ok": ok, "_broadcast_monitors": ok}
+            response.update(self._state_payload())
+            return response
+        elif cmd == "set_state":
+            if self._set_app_state_callback is None:
+                return {"ok": False}
+            ok = bool(self._set_app_state_callback(req.get("global_link"), req.get("auto_target")))
+            response = {"ok": ok, "_broadcast_monitors": ok}
+            response.update(self._state_payload())
+            return response
         elif cmd == "subscribe":
-            return {"ok": True, "monitors": self._monitor_snapshot()}
+            response = {"ok": True}
+            response.update(self._state_payload())
+            return response
         elif cmd == "ping":
             return {"pong": True}
         return {"error": "unknown cmd"}
@@ -1745,11 +1783,12 @@ class NetworkMonitorServer:
 class NetworkMonitorClient(QtCore.QObject):
     """mDNS 偵測網路上的 DDC server，提供遠端螢幕唯讀控制。"""
     remote_monitors_updated = QtCore.pyqtSignal(list)  # list of dict
+    remote_state_updated = QtCore.pyqtSignal(dict)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._running = False
-        self._discovered_servers = {}  # name -> {"info": ServiceInfo, "monitors": []}
+        self._discovered_servers = {}  # name -> {"info": ServiceInfo, "monitors": [], "state": {}}
         self._subscriptions = {}
         self._subscriptions_lock = threading.Lock()
         self._browser = None
@@ -1804,7 +1843,7 @@ class NetworkMonitorClient(QtCore.QObject):
                 return
         except Exception:
             pass
-        self._discovered_servers[name] = {"info": info, "monitors": []}
+        self._discovered_servers[name] = {"info": info, "monitors": [], "state": {}}
         self._query_server(name)
         self._start_subscription(name)
 
@@ -1861,10 +1900,21 @@ class NetworkMonitorClient(QtCore.QObject):
             return
         monitors = message.get("monitors", [])
         entry["monitors"] = monitors if isinstance(monitors, list) else []
+        state = {}
+        if "global_link" in message:
+            state["global_link"] = message.get("global_link")
+        if "auto_target" in message:
+            state["auto_target"] = message.get("auto_target")
+        if state:
+            entry["state"] = state
         info = entry["info"]
         hostname = info.properties.get(b"hostname", b"unknown").decode()
         print(f"Remote server {hostname}: {len(entry['monitors'])} monitors")
         self._emit_remote_monitors()
+        if state:
+            state["_remote_server"] = hostname
+            state["_remote_name"] = name
+            self.remote_state_updated.emit(state)
 
     def _start_subscription(self, name):
         with self._subscriptions_lock:
@@ -1962,6 +2012,40 @@ class NetworkMonitorClient(QtCore.QObject):
             print(f"Remote set error: {e}")
         return False
 
+    def remote_set_state(self, server_name, global_link=None, auto_target=None):
+        entry = self._discovered_servers.get(server_name)
+        if not entry:
+            return False
+        info = entry["info"]
+        if not info.parsed_addresses():
+            return False
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(3.0)
+                s.connect((info.parsed_addresses()[0], info.port))
+                req = {"cmd": "set_state"}
+                if global_link is not None:
+                    req["global_link"] = int(global_link)
+                if auto_target is not None:
+                    req["auto_target"] = int(auto_target)
+                s.sendall(json.dumps(req).encode() + b"\n")
+                buf = b""
+                while True:
+                    chunk = s.recv(4096)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    if b"\n" in buf:
+                        line, _ = buf.split(b"\n", 1)
+                        resp = json.loads(line)
+                        ok = bool(resp.get("ok"))
+                        if ok:
+                            self._handle_server_message(server_name, resp)
+                        return ok
+        except Exception as e:
+            print(f"Remote set state error: {e}")
+        return False
+
 
 class _ServiceListener:
     """Zeroconf service listener callback wrapper."""
@@ -2010,6 +2094,7 @@ class RemoteMonitorWrapper:
 # =========================
 class MainWindow(QtWidgets.QWidget):
     remote_set_applied = QtCore.pyqtSignal(str, object, object)
+    remote_state_applied = QtCore.pyqtSignal(object, object)
     HOTKEY_OPTIONS = MODIFIER_ORDER
     HOTKEY_OPTIONAL_OPTIONS = SHORTCUT_MODIFIER_OPTIONS
     STARTUP_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -2022,6 +2107,9 @@ class MainWindow(QtWidgets.QWidget):
         self.threadpool = QtCore.QThreadPool()
         self._is_quitting = False
         self._updating_global_link = False
+        self._applying_remote_network_state = False
+        self._pending_network_global_link = None
+        self._pending_network_auto_target = None
         self.global_link_value = 0
         self.step_value = 5.0
         self.shortcut_key1 = "Alt"
@@ -2061,10 +2149,14 @@ class MainWindow(QtWidgets.QWidget):
             get_monitor_wrappers=lambda: self.monitor_wrappers,
             set_monitor_callback=self._remote_set_monitor,
             get_monitor_state_callback=self._network_monitor_snapshot,
+            get_app_state_callback=self._network_app_state_snapshot,
+            set_app_state_callback=self._remote_set_app_state,
         )
         self._net_client = NetworkMonitorClient(self)
         self._net_client.remote_monitors_updated.connect(self._on_remote_monitors_updated)
+        self._net_client.remote_state_updated.connect(self._on_remote_state_updated)
         self.remote_set_applied.connect(self._on_remote_set_applied)
+        self.remote_state_applied.connect(self._on_remote_state_applied)
         self._remote_wrappers = []  # RemoteMonitorWrapper 列表
         self._remote_widgets = []   # 遠端螢幕的 MonitorWidget
         self._remote_monitor_data = []  # 原始資料（用於 remote_set）
@@ -2757,6 +2849,59 @@ class MainWindow(QtWidgets.QWidget):
             })
         return monitors
 
+    def _network_app_state_snapshot(self):
+        return {
+            "global_link": int(round(self._pending_network_global_link if self._pending_network_global_link is not None else self.global_link_value)),
+            "auto_target": int(round(self._pending_network_auto_target if self._pending_network_auto_target is not None else self.auto_adjust_target)),
+        }
+
+    def _remote_set_app_state(self, global_link, auto_target):
+        if global_link is None and auto_target is None:
+            return False
+        if global_link is not None:
+            self._pending_network_global_link = int(global_link)
+        if auto_target is not None:
+            self._pending_network_auto_target = int(auto_target)
+        self.remote_state_applied.emit(global_link, auto_target)
+        return True
+
+    def _on_remote_state_updated(self, state):
+        if not isinstance(state, dict) or self._applying_remote_network_state:
+            return
+        global_link = state.get("global_link")
+        auto_target = state.get("auto_target")
+        if global_link is None and auto_target is None:
+            return
+        if (
+            (global_link is None or int(global_link) == int(round(self.global_link_value)))
+            and (auto_target is None or int(auto_target) == int(round(self.auto_adjust_target)))
+        ):
+            return
+        self._on_remote_state_applied(global_link, auto_target)
+
+    def _on_remote_state_applied(self, global_link, auto_target):
+        if self._applying_remote_network_state:
+            return
+        self._applying_remote_network_state = True
+        try:
+            if auto_target is not None and int(auto_target) != int(round(self.auto_adjust_target)):
+                self.set_auto_adjust_target(int(auto_target), trigger_save=False)
+            if global_link is not None and int(global_link) != int(round(self.global_link_value)):
+                self.update_global_link(int(global_link))
+            if auto_target is not None:
+                self._pending_network_auto_target = None
+            if global_link is not None:
+                self._pending_network_global_link = None
+            self.trigger_save()
+        finally:
+            self._applying_remote_network_state = False
+
+    def _sync_app_state_to_remote_servers(self, global_link=None, auto_target=None):
+        if self._applying_remote_network_state or not self._network_client_enabled:
+            return
+        for server_name in list(getattr(self._net_client, "_discovered_servers", {}).keys()):
+            self._net_client.remote_set_state(server_name, global_link=global_link, auto_target=auto_target)
+
     def _on_remote_set_applied(self, name, brightness, contrast):
         for wrapper, widget in zip(self.monitor_wrappers, self.monitor_widgets):
             if wrapper.name != name:
@@ -3073,6 +3218,7 @@ class MainWindow(QtWidgets.QWidget):
         self._update_auto_adjust_info()
         if trigger_save:
             self.trigger_save()
+        self._sync_app_state_to_remote_servers(auto_target=value)
 
     def adjust_auto_adjust_target(self, delta):
         new_val = self.snap_to_step(self.auto_adjust_target + delta)
@@ -3405,6 +3551,7 @@ class MainWindow(QtWidgets.QWidget):
             self._sync_global_link_from_available_monitors()
             self._update_auto_adjust_info()
             self._broadcast_monitor_state_if_server_enabled()
+            self._sync_app_state_to_remote_servers(global_link=value)
         finally:
             self._updating_global_link = False
 
