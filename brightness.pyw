@@ -1911,7 +1911,10 @@ class NetworkMonitorClient(QtCore.QObject):
             entry["state"] = state
         info = entry["info"]
         hostname = info.properties.get(b"hostname", b"unknown").decode()
-        print(f"Remote server {hostname}: {len(entry['monitors'])} monitors")
+        monitor_count = len(entry["monitors"])
+        if entry.get("_last_monitor_count") != monitor_count:
+            print(f"Remote server {hostname}: {monitor_count} monitors")
+            entry["_last_monitor_count"] = monitor_count
         self._emit_remote_monitors()
         if state:
             state["_remote_server"] = hostname
