@@ -114,11 +114,11 @@ KEY_NAME_TO_VK = {
     "滑鼠下一頁": 0x06, # VK_XBUTTON2
 }
 DEFAULT_LEVEL_SHORTCUTS = [
-    {"modifiers": ["Ctrl"], "key": "NumPad0", "type": "絕對值", "value": 0},
-    {"modifiers": ["Ctrl"], "key": "NumPad1", "type": "絕對值", "value": 25},
-    {"modifiers": ["Ctrl"], "key": "NumPad2", "type": "絕對值", "value": 50},
-    {"modifiers": ["Ctrl"], "key": "NumPad3", "type": "絕對值", "value": 75},
-    {"modifiers": ["Ctrl"], "key": "NumPad.", "type": "絕對值", "value": 100},
+    {"keys": ["Ctrl", "NumPad0"], "type": "絕對值", "value": 0},
+    {"keys": ["Ctrl", "NumPad1"], "type": "絕對值", "value": 25},
+    {"keys": ["Ctrl", "NumPad2"], "type": "絕對值", "value": 50},
+    {"keys": ["Ctrl", "NumPad3"], "type": "絕對值", "value": 75},
+    {"keys": ["Ctrl", "NumPad."], "type": "絕對值", "value": 100},
 ]
 
 
@@ -446,17 +446,20 @@ class GlobalHotkeyWheelHook(QtCore.QObject):
     def set_level_shortcuts(self, shortcuts):
         normalized_shortcuts = []
         for shortcut in shortcuts:
-            key_name = shortcut.get("key")
-            vk = KEY_NAME_TO_VK.get(key_name)
-            if vk is None:
+            shortcut_keys = shortcut.get("keys")
+            if isinstance(shortcut_keys, list):
+                keys = [key for key in shortcut_keys[:3] if key in KEY_NAME_TO_VK]
+            else:
+                modifiers = normalize_modifiers(shortcut.get("modifiers", []))
+                key_name = shortcut.get("key")
+                keys = [key for key in modifiers + [key_name] if key in KEY_NAME_TO_VK]
+            if not keys:
                 continue
 
-            modifiers = tuple(normalize_modifiers(shortcut.get("modifiers", [])))
             sc_type = shortcut.get("type", "絕對值")
             value = int(max(0, min(100, shortcut.get("value", 0))))
             normalized_shortcuts.append({
-                "vk": vk,
-                "modifiers": modifiers,
+                "keys": tuple(keys[:3]),
                 "type": sc_type,
                 "value": value,
             })
@@ -490,9 +493,11 @@ class GlobalHotkeyWheelHook(QtCore.QObject):
         return tuple(modifier for modifier in MODIFIER_ORDER if self._is_modifier_pressed(modifier))
 
     def _match_level_shortcut(self, vk):
-        pressed_modifiers = self._get_pressed_modifiers()
         for shortcut in self.level_shortcuts:
-            if shortcut["vk"] == vk and shortcut["modifiers"] == pressed_modifiers:
+            keys = shortcut["keys"]
+            if vk not in [KEY_NAME_TO_VK.get(key_name) for key_name in keys]:
+                continue
+            if all(self._is_key_pressed(key_name) for key_name in keys):
                 return shortcut["type"], shortcut["value"]
         return None
 
@@ -1024,17 +1029,15 @@ class ShortcutConfigRow(QtWidgets.QWidget):
 
     def __init__(self, shortcut=None):
         super().__init__()
-        shortcut = shortcut or {"modifiers": ["Ctrl"], "key": "NumPad0", "type": "絕對值", "value": 0}
+        shortcut = shortcut or {"keys": ["Ctrl", "NumPad0", "None"], "type": "絕對值", "value": 0}
 
         layout = QtWidgets.QHBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(6)
 
-        self.mod1_combo = QtWidgets.QComboBox()
-        self.mod1_combo.addItems(SHORTCUT_MODIFIER_OPTIONS)
-        self.mod2_combo = QtWidgets.QComboBox()
-        self.mod2_combo.addItems(SHORTCUT_MODIFIER_OPTIONS)
-        self.key_button = KeyCaptureButton()
+        self.key1_button = KeyCaptureButton(allow_none=True, allow_modifiers=True)
+        self.key2_button = KeyCaptureButton(allow_none=True, allow_modifiers=True)
+        self.key3_button = KeyCaptureButton(allow_none=True, allow_modifiers=True)
         self.type_combo = QtWidgets.QComboBox()
         self.type_combo.addItems(SHORTCUT_TYPE_OPTIONS)
         self.value_label = QtWidgets.QLabel("亮度 %")
@@ -1045,20 +1048,20 @@ class ShortcutConfigRow(QtWidgets.QWidget):
         self.remove_button = QtWidgets.QPushButton("刪除")
 
         layout.addWidget(QtWidgets.QLabel("快捷鍵"))
-        layout.addWidget(self.mod1_combo)
+        layout.addWidget(self.key1_button)
         layout.addWidget(QtWidgets.QLabel("+"))
-        layout.addWidget(self.mod2_combo)
+        layout.addWidget(self.key2_button)
         layout.addWidget(QtWidgets.QLabel("+"))
-        layout.addWidget(self.key_button)
+        layout.addWidget(self.key3_button)
         layout.addWidget(self.type_combo)
         layout.addWidget(self.value_label)
         layout.addWidget(self.value_spin)
         layout.addWidget(self.remove_button)
         self.setLayout(layout)
 
-        self.mod1_combo.currentTextChanged.connect(self.changed)
-        self.mod2_combo.currentTextChanged.connect(self.changed)
-        self.key_button.key_changed.connect(self.changed)
+        self.key1_button.key_changed.connect(self.changed)
+        self.key2_button.key_changed.connect(self.changed)
+        self.key3_button.key_changed.connect(self.changed)
         self.type_combo.currentTextChanged.connect(self._on_type_changed)
         self.value_spin.valueChanged.connect(self.changed)
         self.remove_button.clicked.connect(lambda: self.remove_requested.emit(self))
@@ -1092,27 +1095,34 @@ class ShortcutConfigRow(QtWidgets.QWidget):
         self.changed.emit()
 
     def set_data(self, shortcut):
-        modifiers = normalize_modifiers(shortcut.get("modifiers", []))
-        key = shortcut.get("key", "NumPad0")
+        keys = shortcut.get("keys")
+        if isinstance(keys, list):
+            keys = list(keys[:3])
+        else:
+            modifiers = normalize_modifiers(shortcut.get("modifiers", []))
+            key = shortcut.get("key", "NumPad0")
+            keys = modifiers + [key]
+        while len(keys) < 3:
+            keys.append("None")
         sc_type = shortcut.get("type", "絕對值")
         value = int(max(0, min(100, shortcut.get("value", 0))))
 
-        mod1 = modifiers[0] if len(modifiers) >= 1 else "None"
-        mod2 = modifiers[1] if len(modifiers) >= 2 else "None"
-
-        self.mod1_combo.setCurrentText(mod1 if mod1 in SHORTCUT_MODIFIER_OPTIONS else "None")
-        self.mod2_combo.setCurrentText(mod2 if mod2 in SHORTCUT_MODIFIER_OPTIONS else "None")
-        self.key_button.set_key_name(key if key in KEY_NAME_TO_VK else "NumPad0")
+        for button, key in zip([self.key1_button, self.key2_button, self.key3_button], keys):
+            button.set_key_name(key if key in KEY_NAME_TO_VK or key == "None" else "None")
         self.type_combo.setCurrentText(sc_type if sc_type in SHORTCUT_TYPE_OPTIONS else "絕對值")
         self.value_spin.setValue(value)
         self._on_type_changed(self.type_combo.currentText())
 
     def get_data(self):
-        modifiers = normalize_modifiers([self.mod1_combo.currentText(), self.mod2_combo.currentText()])
+        keys = [
+            self.key1_button.key_name,
+            self.key2_button.key_name,
+            self.key3_button.key_name,
+        ]
+        keys = [key for key in keys if key in KEY_NAME_TO_VK]
         sc_type = self.type_combo.currentText()
         return {
-            "modifiers": modifiers,
-            "key": self.key_button.key_name,
+            "keys": keys,
             "type": sc_type,
             "value": int(self.value_spin.value()) if sc_type == "絕對值" else 0,
         }
@@ -2634,7 +2644,7 @@ class MainWindow(QtWidgets.QWidget):
         shortcut_layout.setContentsMargins(6, 6, 6, 6)
         shortcut_layout.setSpacing(6)
 
-        shortcut_hint = QtWidgets.QLabel("可任意新增或刪除快捷鍵。先選修飾鍵，再點主鍵按鈕後直接按下鍵盤主鍵。")
+        shortcut_hint = QtWidgets.QLabel("可任意新增或刪除快捷鍵。點擊按鍵欄位後直接按下要使用的按鍵，最多三個鍵。")
         shortcut_hint.setWordWrap(True)
         shortcut_layout.addWidget(shortcut_hint)
 
