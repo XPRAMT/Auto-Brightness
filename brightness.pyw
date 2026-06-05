@@ -161,8 +161,10 @@ def get_dxgi_display_targets():
         return []
 
     try:
-        factory = dxcam.DXFactory()
-        metadata = getattr(factory, "output_metadata", {}) or {}
+        factory = getattr(dxcam, "__factory", None)
+        if factory is None:
+            return []
+        metadata = dxcam.get_output_metadata()
         display_rects = get_windows_display_rects()
         targets = []
         for device_idx, outputs in enumerate(getattr(factory, "outputs", [])):
@@ -2043,67 +2045,100 @@ class MainWindow(QtWidgets.QWidget):
             print("Monitor detection error:", e)
             return
 
-        # 建立名稱 → monitor 對照
-        new_wrappers = []
+        # 建立名稱 → monitor 對照。重新偵測時必須更新既有 wrapper 的 monitor 物件，
+        # 不能只切 available，否則啟動時漏抓到的螢幕按「重新偵測」後仍是空殼。
+        detected_wrappers = {}
         for i, m in enumerate(monitors):
             try:
-                with m:
-                    caps = m.get_vcp_capabilities()
-                    name = get_monitor_display_name(m, i, caps)
-                    supported_vcp = {}
-                    if isinstance(caps, dict):
-                        supported_vcp = caps.get("vcp", {}) or caps.get("cmds", {})
-                    bs = 0x10 in supported_vcp if isinstance(supported_vcp, dict) else False
-                    cs = 0x12 in supported_vcp if isinstance(supported_vcp, dict) else False
-                    try:
-                        int(m.get_luminance())
-                        bs = True
-                    except Exception:
-                        pass
-                    try:
-                        int(m.get_contrast())
-                        cs = True
-                    except Exception:
-                        pass
-                    if bs or cs:
-                        new_wrappers.append((name, m, bs, cs))
+                wrapper = MonitorWrapper(m, i)
+                if wrapper.supported:
+                    detected_wrappers[wrapper.name] = wrapper
             except Exception:
                 continue
 
-        detected = {name for name, _, _, _ in new_wrappers}
-        current_names = {w.name for w in self.monitor_wrappers}
+        local_wrappers = [w for w in self.monitor_wrappers if not isinstance(w, RemoteMonitorWrapper)]
+        remote_wrappers = [w for w in self.monitor_wrappers if isinstance(w, RemoteMonitorWrapper)]
+        current_names = {w.name for w in local_wrappers}
 
         # 新增：完全新的螢幕
-        for name, mon, bs, cs in new_wrappers:
+        for name, detected in detected_wrappers.items():
             if name not in current_names:
-                w = MonitorWrapper(mon, len(self.monitor_wrappers))
+                w = detected
+                w.index = len(local_wrappers)
                 w.available = True
-                self.monitor_wrappers.append(w)
+                local_wrappers.append(w)
                 print(f"Monitor added: {name}")
 
         # 更新：現有螢幕的可用/不可用狀態
-        for w in self.monitor_wrappers:
-            if w.name in detected:
+        for idx, w in enumerate(local_wrappers):
+            detected = detected_wrappers.get(w.name)
+            if detected is not None:
                 if not w.available:
                     print(f"Monitor became available: {w.name}")
+                preserved_b_range = list(w.brightness_range)
+                preserved_c_range = list(w.contrast_range)
+                w.monitor = detected.monitor
+                w.lock = detected.lock
+                w.index = idx
+                w.supported = detected.supported
+                w.brightness_supported = detected.brightness_supported
+                w.contrast_supported = detected.contrast_supported
+                w.wmi_supported = detected.wmi_supported
+                if preserved_b_range:
+                    w.brightness_range = preserved_b_range
+                if preserved_c_range:
+                    w.contrast_range = preserved_c_range
                 w.available = True
             else:
                 if w.available:
                     print(f"Monitor became unavailable: {w.name}")
                 w.available = False
+                w.monitor = None
 
-        self._known_monitor_names = sorted(w.name for w in self.monitor_wrappers)
+        self.monitor_wrappers = local_wrappers + remote_wrappers
+        self._known_monitor_names = sorted(w.name for w in local_wrappers)
         self._prev_raw_monitor_count = len(monitors)
 
-        # 更新所有 widget 的灰階狀態
-        for w in self.monitor_widgets:
-            wrapper = next((x for x in self.monitor_wrappers if x.name == w.monitor.name), None)
-            if wrapper:
-                w.set_available(wrapper.available)
+        self._sync_local_monitor_widgets()
 
         self.sync_ui_with_current_monitor_levels()
         self.refresh_tray_display()
         self._init_screen_analyzers()
+
+    def _sync_local_monitor_widgets(self):
+        local_wrappers = [w for w in self.monitor_wrappers if not isinstance(w, RemoteMonitorWrapper)]
+        local_names = {w.name for w in local_wrappers}
+
+        for widget in list(self.monitor_widgets):
+            if widget.monitor.name not in local_names:
+                self.monitor_widgets.remove(widget)
+                widget.deleteLater()
+
+        for wrapper in local_wrappers:
+            widget = next((w for w in self.monitor_widgets if w.monitor.name == wrapper.name), None)
+            if widget is None:
+                widget = MonitorWidget(wrapper, self.threadpool)
+                widget.value_changed.connect(self.on_monitor_link_changed)
+                self.monitor_widgets.append(widget)
+                self._insert_monitor_widget(widget)
+            else:
+                widget.monitor = wrapper
+            widget.set_available(wrapper.available)
+            widget.set_ranges(wrapper.brightness_range, wrapper.contrast_range)
+
+    def _insert_monitor_widget(self, widget):
+        if not hasattr(self, "main_page") or not self.main_page:
+            return
+        layout = self.main_page.layout()
+        if layout is None:
+            return
+        insert_idx = layout.count()
+        for i in range(layout.count()):
+            item = layout.itemAt(i)
+            if item and item.spacerItem() is not None:
+                insert_idx = i
+                break
+        layout.insertWidget(insert_idx, widget)
 
     def _configure_screen_analyzer(self, analyzer):
         analyzer.enabled = self.auto_adjust_enabled
@@ -2138,11 +2173,12 @@ class MainWindow(QtWidgets.QWidget):
                 self.screen_analyzers.append(None)
                 continue
 
-            dxgi_target = dxgi_targets[idx] if idx < len(dxgi_targets) else {
-                "device_idx": 0,
-                "output_idx": idx,
-                "display_name": "",
-            }
+            if not dxgi_targets or idx >= len(dxgi_targets):
+                print(f"DXGI target missing for monitor {idx}: {wrapper.name}")
+                self.screen_analyzers.append(None)
+                continue
+
+            dxgi_target = dxgi_targets[idx]
             analyzer = ScreenAnalyzer(self, output_idx=idx, dxgi_target=dxgi_target)
             self._configure_screen_analyzer(analyzer)
             analyzer.adjust_requested.connect(lambda delta, i=idx: self.on_screen_adjust_requested(i, delta))
