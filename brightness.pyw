@@ -2014,6 +2014,19 @@ class MainWindow(QtWidgets.QWidget):
 
         self.load_settings()
         self.show_main_page()
+        QtCore.QTimer.singleShot(3000, self._retry_initial_monitor_detection_if_empty)
+
+    def _has_available_local_monitor(self):
+        return any(
+            getattr(wrapper, "available", False) and not isinstance(wrapper, RemoteMonitorWrapper)
+            for wrapper in self.monitor_wrappers
+        )
+
+    def _retry_initial_monitor_detection_if_empty(self):
+        if self._is_quitting or self._has_available_local_monitor():
+            return
+        print("No local DDC/WMI monitor detected at startup; retrying monitor detection")
+        self.refresh_monitors()
 
     def _restore_known_monitors_from_settings(self):
         """從設定檔恢復已知螢幕名稱，建立不可用的 MonitorWrapper 佔位"""
