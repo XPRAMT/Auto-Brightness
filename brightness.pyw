@@ -1531,9 +1531,10 @@ class NetworkMonitorServer:
     客戶端連線後可取得所有螢幕列表，並可下達亮度/對比設定指令。
     通訊協定為 JSON line-based (一行一個 JSON 物件)。
     """
-    def __init__(self, get_monitor_wrappers, set_monitor_callback):
+    def __init__(self, get_monitor_wrappers, set_monitor_callback, get_monitor_state_callback=None):
         self._get_wrappers = get_monitor_wrappers
         self._set_callback = set_monitor_callback
+        self._get_monitor_state_callback = get_monitor_state_callback
         self._running = False
         self._server_thread = None
         self._sock = None
@@ -1652,8 +1653,11 @@ class NetworkMonitorServer:
                         if not line:
                             continue
                         response = self._process_request(line)
+                        should_broadcast = bool(response.pop("_broadcast_monitors", False))
                         try:
                             client.sendall((json.dumps(response) + "\n").encode())
+                            if should_broadcast:
+                                self.broadcast_monitor_state()
                         except Exception:
                             # 無法回應則終止連線
                             raise
@@ -1673,6 +1677,36 @@ class NetworkMonitorServer:
     def broadcast_luminance(self, value: float, source: str = "—"):
         """向所有已連線 client 廣播亮度事件（JSON line）。"""
         payload = {"event": "luminance", "value": float(value), "source": source, "ts": time.time()}
+        self._broadcast_payload(payload)
+
+    def _monitor_snapshot(self):
+        if self._get_monitor_state_callback is not None:
+            try:
+                return self._get_monitor_state_callback()
+            except Exception as e:
+                print(f"Monitor state snapshot error: {e}")
+
+        monitors = []
+        for w in self._get_wrappers():
+            if isinstance(w, RemoteMonitorWrapper) or not w.available:
+                continue
+            b, c = w.read_current_levels()
+            monitors.append({
+                "name": w.name,
+                "brightness": b,
+                "contrast": c,
+                "brightness_range": w.brightness_range,
+                "contrast_range": w.contrast_range,
+                "brightness_supported": w.brightness_supported,
+                "contrast_supported": w.contrast_supported,
+            })
+        return monitors
+
+    def broadcast_monitor_state(self):
+        """向已訂閱 client 立即推送目前本機螢幕亮度狀態。"""
+        self._broadcast_payload({"event": "monitors", "monitors": self._monitor_snapshot(), "ts": time.time()})
+
+    def _broadcast_payload(self, payload):
         data = (json.dumps(payload) + "\n").encode()
         with self._clients_lock:
             clients = list(self._clients)
@@ -1694,27 +1728,15 @@ class NetworkMonitorServer:
             return {"error": "invalid json"}
         cmd = req.get("cmd", "")
         if cmd == "list":
-            monitors = []
-            for w in self._get_wrappers():
-                if not w.available:
-                    continue
-                b, c = w.read_current_levels()
-                monitors.append({
-                    "name": w.name,
-                    "brightness": b,
-                    "contrast": c,
-                    "brightness_range": w.brightness_range,
-                    "contrast_range": w.contrast_range,
-                    "brightness_supported": w.brightness_supported,
-                    "contrast_supported": w.contrast_supported,
-                })
-            return {"monitors": monitors}
+            return {"monitors": self._monitor_snapshot()}
         elif cmd == "set":
             name = req.get("name", "")
             brightness = req.get("brightness")
             contrast = req.get("contrast")
             ok = bool(self._set_callback(name, brightness, contrast))
-            return {"ok": ok}
+            return {"ok": ok, "monitors": self._monitor_snapshot(), "_broadcast_monitors": ok}
+        elif cmd == "subscribe":
+            return {"ok": True, "monitors": self._monitor_snapshot()}
         elif cmd == "ping":
             return {"pong": True}
         return {"error": "unknown cmd"}
@@ -1728,6 +1750,8 @@ class NetworkMonitorClient(QtCore.QObject):
         super().__init__(parent)
         self._running = False
         self._discovered_servers = {}  # name -> {"info": ServiceInfo, "monitors": []}
+        self._subscriptions = {}
+        self._subscriptions_lock = threading.Lock()
         self._browser = None
         self._zeroconf = None
         self._refresh_timer = None
@@ -1749,6 +1773,8 @@ class NetworkMonitorClient(QtCore.QObject):
 
     def stop(self):
         self._running = False
+        for name in list(self._subscriptions.keys()):
+            self._stop_subscription(name)
         if self._refresh_timer:
             self._refresh_timer.stop()
         if self._browser:
@@ -1767,6 +1793,7 @@ class NetworkMonitorClient(QtCore.QObject):
     def _on_service_changed(self, name, info=None, added=True):
         if not added:
             self._discovered_servers.pop(name, None)
+            self._stop_subscription(name)
             self._emit_remote_monitors()
             return
         if info is None:
@@ -1779,6 +1806,7 @@ class NetworkMonitorClient(QtCore.QObject):
             pass
         self._discovered_servers[name] = {"info": info, "monitors": []}
         self._query_server(name)
+        self._start_subscription(name)
 
     def _query_server(self, name):
         entry = self._discovered_servers.get(name)
@@ -1803,11 +1831,7 @@ class NetworkMonitorClient(QtCore.QObject):
                 if b"\n" in buf:
                     line, _ = buf.split(b"\n", 1)
                     resp = json.loads(line)
-                    monitors = resp.get("monitors", [])
-                    entry["monitors"] = monitors
-                    hostname = info.properties.get(b"hostname", b"unknown").decode()
-                    print(f"Remote server {hostname}: {len(monitors)} monitors")
-                    self._emit_remote_monitors()
+                    self._handle_server_message(name, resp)
                     break
             s.close()
         except Exception as e:
@@ -1826,6 +1850,82 @@ class NetworkMonitorClient(QtCore.QObject):
                 mon["_remote_name"] = srv_name
                 all_monitors.append(mon)
         self.remote_monitors_updated.emit(all_monitors)
+
+    def _handle_server_message(self, name, message):
+        if not isinstance(message, dict):
+            return
+        if "monitors" not in message:
+            return
+        entry = self._discovered_servers.get(name)
+        if not entry:
+            return
+        monitors = message.get("monitors", [])
+        entry["monitors"] = monitors if isinstance(monitors, list) else []
+        info = entry["info"]
+        hostname = info.properties.get(b"hostname", b"unknown").decode()
+        print(f"Remote server {hostname}: {len(entry['monitors'])} monitors")
+        self._emit_remote_monitors()
+
+    def _start_subscription(self, name):
+        with self._subscriptions_lock:
+            existing = self._subscriptions.get(name)
+            if existing and existing.get("running"):
+                return
+            state = {"running": True, "socket": None}
+            self._subscriptions[name] = state
+        thread = threading.Thread(target=self._subscription_loop, args=(name, state), daemon=True, name="NetClientSub")
+        state["thread"] = thread
+        thread.start()
+
+    def _stop_subscription(self, name):
+        with self._subscriptions_lock:
+            state = self._subscriptions.pop(name, None)
+        if not state:
+            return
+        state["running"] = False
+        sock = state.get("socket")
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+    def _subscription_loop(self, name, state):
+        while self._running and state.get("running"):
+            entry = self._discovered_servers.get(name)
+            if not entry:
+                break
+            info = entry["info"]
+            if not info.parsed_addresses():
+                time.sleep(1.0)
+                continue
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    state["socket"] = s
+                    s.settimeout(1.0)
+                    s.connect((info.parsed_addresses()[0], info.port))
+                    s.sendall(json.dumps({"cmd": "subscribe"}).encode() + b"\n")
+                    buf = b""
+                    while self._running and state.get("running"):
+                        try:
+                            chunk = s.recv(4096)
+                        except socket.timeout:
+                            continue
+                        if not chunk:
+                            break
+                        buf += chunk
+                        while b"\n" in buf:
+                            line, buf = buf.split(b"\n", 1)
+                            line = line.strip()
+                            if not line:
+                                continue
+                            self._handle_server_message(name, json.loads(line))
+            except Exception as e:
+                if self._running and state.get("running"):
+                    print(f"Subscribe {name} error: {e}")
+                    time.sleep(2.0)
+            finally:
+                state["socket"] = None
 
     def remote_set(self, server_name, monitor_name, brightness=None, contrast=None):
         entry = self._discovered_servers.get(server_name)
@@ -1856,7 +1956,7 @@ class NetworkMonitorClient(QtCore.QObject):
                         resp = json.loads(line)
                         ok = bool(resp.get("ok"))
                         if ok:
-                            self._query_server(server_name)
+                            self._handle_server_message(server_name, resp)
                         return ok
         except Exception as e:
             print(f"Remote set error: {e}")
@@ -1909,6 +2009,7 @@ class RemoteMonitorWrapper:
 # Main Window
 # =========================
 class MainWindow(QtWidgets.QWidget):
+    remote_set_applied = QtCore.pyqtSignal(str, object, object)
     HOTKEY_OPTIONS = MODIFIER_ORDER
     HOTKEY_OPTIONAL_OPTIONS = SHORTCUT_MODIFIER_OPTIONS
     STARTUP_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -1958,9 +2059,11 @@ class MainWindow(QtWidgets.QWidget):
         self._net_server = NetworkMonitorServer(
             get_monitor_wrappers=lambda: self.monitor_wrappers,
             set_monitor_callback=self._remote_set_monitor,
+            get_monitor_state_callback=self._network_monitor_snapshot,
         )
         self._net_client = NetworkMonitorClient(self)
         self._net_client.remote_monitors_updated.connect(self._on_remote_monitors_updated)
+        self.remote_set_applied.connect(self._on_remote_set_applied)
         self._remote_wrappers = []  # RemoteMonitorWrapper 列表
         self._remote_widgets = []   # 遠端螢幕的 MonitorWidget
         self._remote_monitor_data = []  # 原始資料（用於 remote_set）
@@ -2623,6 +2726,59 @@ class MainWindow(QtWidgets.QWidget):
         widget.link_slider.slider.blockSignals(False)
         widget.link_slider.value_label.setText(str(link_value))
 
+    def _broadcast_monitor_state_if_server_enabled(self):
+        if not self._network_server_enabled or not getattr(self, "_net_server", None):
+            return
+        try:
+            self._net_server.broadcast_monitor_state()
+        except Exception as e:
+            print(f"Broadcast monitor state error: {e}")
+
+    def _network_monitor_snapshot(self):
+        monitors = []
+        for wrapper, widget in zip(self.monitor_wrappers, self.monitor_widgets):
+            if isinstance(wrapper, RemoteMonitorWrapper) or not getattr(wrapper, "available", False):
+                continue
+            brightness = widget.pending_brightness
+            contrast = widget.pending_contrast
+            if brightness is None:
+                brightness = widget.b_slider.slider.value()
+            if contrast is None:
+                contrast = 0 if not getattr(wrapper, "contrast_supported", True) else widget.c_slider.slider.value()
+            monitors.append({
+                "name": wrapper.name,
+                "brightness": int(round(brightness)) if brightness is not None else None,
+                "contrast": int(round(contrast)) if contrast is not None else None,
+                "brightness_range": wrapper.brightness_range,
+                "contrast_range": wrapper.contrast_range,
+                "brightness_supported": wrapper.brightness_supported,
+                "contrast_supported": wrapper.contrast_supported,
+            })
+        return monitors
+
+    def _on_remote_set_applied(self, name, brightness, contrast):
+        for wrapper, widget in zip(self.monitor_wrappers, self.monitor_widgets):
+            if wrapper.name != name:
+                continue
+            b = widget.b_slider.slider.value() if brightness is None else int(brightness)
+            c = widget.c_slider.slider.value() if contrast is None else int(contrast)
+            if not getattr(wrapper, "contrast_supported", True):
+                c = 0
+            widget.pending_brightness = b
+            widget.pending_contrast = c
+            widget.sync_sliders(b, c)
+            link_value = self._link_value_from_levels(wrapper, b, c)
+            widget.link_slider.slider.blockSignals(True)
+            widget.link_slider.slider.setValue(link_value)
+            widget.link_slider.slider.blockSignals(False)
+            widget.link_slider.value_label.setText(str(link_value))
+            break
+        self._sync_global_link_from_available_monitors()
+        self._update_auto_adjust_info()
+        self.refresh_tray_display()
+        self.trigger_save()
+        self._broadcast_monitor_state_if_server_enabled()
+
     def _clear_remote_wrappers(self):
         for w in self._remote_wrappers:
             if w in self.monitor_wrappers:
@@ -2711,6 +2867,7 @@ class MainWindow(QtWidgets.QWidget):
                         return False
                 if contrast is not None:
                     if not getattr(w, "contrast_supported", True):
+                        self.remote_set_applied.emit(name, brightness, 0)
                         return True
                     try:
                         with w.lock:
@@ -2719,6 +2876,7 @@ class MainWindow(QtWidgets.QWidget):
                     except Exception as e:
                         print(f"Remote set contrast error: {e}")
                         return False
+                self.remote_set_applied.emit(name, brightness, contrast)
                 return True
         return False
 
@@ -2999,6 +3157,7 @@ class MainWindow(QtWidgets.QWidget):
         if monitor_index < len(self.screen_analyzers) and self.screen_analyzers[monitor_index] is not None:
             self.screen_analyzers[monitor_index].set_current_ddc(link_value)
         self._update_auto_adjust_info(monitor_index)
+        self._broadcast_monitor_state_if_server_enabled()
 
     def on_luminance_updated(self, monitor_index, lum):
         if 0 <= monitor_index < len(self._monitor_auto_states):
@@ -3216,6 +3375,7 @@ class MainWindow(QtWidgets.QWidget):
         self._sync_global_link_from_available_monitors()
         self._update_auto_adjust_info()
         self.trigger_save()
+        self._broadcast_monitor_state_if_server_enabled()
 
     def update_global_link(self, value):
         """ 統一更新介面、圖示與所有螢幕的聯動值 """
@@ -3240,6 +3400,7 @@ class MainWindow(QtWidgets.QWidget):
                     pass
             self._sync_global_link_from_available_monitors()
             self._update_auto_adjust_info()
+            self._broadcast_monitor_state_if_server_enabled()
         finally:
             self._updating_global_link = False
 
