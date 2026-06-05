@@ -113,6 +113,16 @@ KEY_NAME_TO_VK = {
     "滑鼠上一頁": 0x05, # VK_XBUTTON1
     "滑鼠下一頁": 0x06, # VK_XBUTTON2
 }
+KEY_NAME_TO_VKS = {
+    key: (vk,)
+    for key, vk in KEY_NAME_TO_VK.items()
+}
+KEY_NAME_TO_VKS.update({
+    "Alt": (0x12, 0xA4, 0xA5),    # VK_MENU, VK_LMENU, VK_RMENU
+    "Ctrl": (0x11, 0xA2, 0xA3),   # VK_CONTROL, VK_LCONTROL, VK_RCONTROL
+    "Shift": (0x10, 0xA0, 0xA1),  # VK_SHIFT, VK_LSHIFT, VK_RSHIFT
+    "Win": (0x5B, 0x5C),          # VK_LWIN, VK_RWIN
+})
 DEFAULT_LEVEL_SHORTCUTS = [
     {"keys": ["Ctrl", "NumPad0"], "type": "絕對值", "value": 0},
     {"keys": ["Ctrl", "NumPad1"], "type": "絕對值", "value": 25},
@@ -438,7 +448,7 @@ class GlobalHotkeyWheelHook(QtCore.QObject):
     def set_trigger_shortcut(self, *keys):
         normalized = []
         for key in keys:
-            key_name = key if key in KEY_NAME_TO_VK else "None"
+            key_name = key if key in KEY_NAME_TO_VKS else "None"
             if key_name != "None" and key_name not in normalized:
                 normalized.append(key_name)
         self.trigger_keys = (normalized + ["None", "None", "None"])[:3]
@@ -448,11 +458,11 @@ class GlobalHotkeyWheelHook(QtCore.QObject):
         for shortcut in shortcuts:
             shortcut_keys = shortcut.get("keys")
             if isinstance(shortcut_keys, list):
-                keys = [key for key in shortcut_keys[:3] if key in KEY_NAME_TO_VK]
+                keys = [key for key in shortcut_keys[:3] if key in KEY_NAME_TO_VKS]
             else:
                 modifiers = normalize_modifiers(shortcut.get("modifiers", []))
                 key_name = shortcut.get("key")
-                keys = [key for key in modifiers + [key_name] if key in KEY_NAME_TO_VK]
+                keys = [key for key in modifiers + [key_name] if key in KEY_NAME_TO_VKS]
             if not keys:
                 continue
 
@@ -482,12 +492,17 @@ class GlobalHotkeyWheelHook(QtCore.QObject):
     def _is_key_pressed(self, key_name):
         if key_name in (None, "", "None"):
             return True
-        if key_name == "Win":
-            return bool(self.user32.GetAsyncKeyState(self.VK_LWIN) & 0x8000) or bool(self.user32.GetAsyncKeyState(self.VK_RWIN) & 0x8000)
-        vk = KEY_NAME_TO_VK.get(key_name)
-        if vk is None:
+        vks = KEY_NAME_TO_VKS.get(key_name)
+        if not vks:
             return False
-        return bool(self.user32.GetAsyncKeyState(vk) & 0x8000)
+        return any(bool(self.user32.GetAsyncKeyState(vk) & 0x8000) for vk in vks)
+
+    def _key_name_matches_vk(self, key_name, vk):
+        return int(vk) in KEY_NAME_TO_VKS.get(key_name, ())
+
+    def _active_keys_pressed(self, keys):
+        active_keys = [key_name for key_name in keys if key_name not in (None, "", "None")]
+        return bool(active_keys) and all(self._is_key_pressed(key_name) for key_name in active_keys)
 
     def _get_pressed_modifiers(self):
         return tuple(modifier for modifier in MODIFIER_ORDER if self._is_modifier_pressed(modifier))
@@ -495,9 +510,9 @@ class GlobalHotkeyWheelHook(QtCore.QObject):
     def _match_level_shortcut(self, vk):
         for shortcut in self.level_shortcuts:
             keys = shortcut["keys"]
-            if vk not in [KEY_NAME_TO_VK.get(key_name) for key_name in keys]:
+            if not any(self._key_name_matches_vk(key_name, vk) for key_name in keys):
                 continue
-            if all(self._is_key_pressed(key_name) for key_name in keys):
+            if self._active_keys_pressed(keys):
                 return shortcut["type"], shortcut["value"]
         return None
 
@@ -577,10 +592,7 @@ class GlobalHotkeyWheelHook(QtCore.QObject):
                     high_word = (ms.mouseData >> 16) & 0xFFFF
                     delta = ctypes.c_short(high_word).value
 
-                    active_trigger_keys = [key_name for key_name in self.trigger_keys if key_name not in (None, "", "None")]
-                    trigger_keys_pressed = bool(active_trigger_keys) and all(self._is_key_pressed(key_name) for key_name in active_trigger_keys)
-
-                    if trigger_keys_pressed:
+                    if self._active_keys_pressed(self.trigger_keys):
                         wheel_steps = int(delta / 120) if delta != 0 else 0
                         if wheel_steps == 0:
                             wheel_steps = 1 if delta > 0 else -1
@@ -1108,7 +1120,7 @@ class ShortcutConfigRow(QtWidgets.QWidget):
         value = int(max(0, min(100, shortcut.get("value", 0))))
 
         for button, key in zip([self.key1_button, self.key2_button, self.key3_button], keys):
-            button.set_key_name(key if key in KEY_NAME_TO_VK or key == "None" else "None")
+            button.set_key_name(key if key in KEY_NAME_TO_VKS or key == "None" else "None")
         self.type_combo.setCurrentText(sc_type if sc_type in SHORTCUT_TYPE_OPTIONS else "絕對值")
         self.value_spin.setValue(value)
         self._on_type_changed(self.type_combo.currentText())
@@ -1119,7 +1131,7 @@ class ShortcutConfigRow(QtWidgets.QWidget):
             self.key2_button.key_name,
             self.key3_button.key_name,
         ]
-        keys = [key for key in keys if key in KEY_NAME_TO_VK]
+        keys = [key for key in keys if key in KEY_NAME_TO_VKS]
         sc_type = self.type_combo.currentText()
         return {
             "keys": keys,
@@ -1147,7 +1159,7 @@ class KeyCaptureButton(QtWidgets.QPushButton):
         self.setFocus(QtCore.Qt.FocusReason.MouseFocusReason)
 
     def set_key_name(self, key_name):
-        if key_name in KEY_NAME_TO_VK:
+        if key_name in KEY_NAME_TO_VKS:
             self.key_name = key_name
         elif key_name == "None" and self.allow_none:
             self.key_name = "None"
@@ -3834,7 +3846,7 @@ class MainWindow(QtWidgets.QWidget):
             self.step_value = float(self.step_combo.currentText())
 
             saved_trigger_keys = [
-                key if key in KEY_NAME_TO_VK or key == "None" else "None"
+                key if key in KEY_NAME_TO_VKS or key == "None" else "None"
                 for key in saved_trigger_keys
             ]
 
