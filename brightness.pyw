@@ -43,6 +43,13 @@ try:
 except ImportError:
     HAS_VAPOURSYNTH = False
 
+try:
+    import wmi
+    HAS_WMI = True
+except Exception:
+    wmi = None
+    HAS_WMI = False
+
 # 可選：指定 VapourSynth 腳本 (.vpy) 後，優先使用該管線抓取畫面亮度
 # PowerShell 範例：$env:BRIGHTNESS_VS_SCRIPT='C:\path\to\source.vpy'
 VAPOURSYNTH_SCRIPT_PATH = os.environ.get("BRIGHTNESS_VS_SCRIPT", "").strip()
@@ -100,6 +107,87 @@ DEFAULT_LEVEL_SHORTCUTS = [
 ]
 
 
+class MONITORINFOEXW(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("rcMonitor", wintypes.RECT),
+        ("rcWork", wintypes.RECT),
+        ("dwFlags", wintypes.DWORD),
+        ("szDevice", wintypes.WCHAR * 32),
+    ]
+
+
+def _rect_to_tuple(rect):
+    return (int(rect.left), int(rect.top), int(rect.right), int(rect.bottom))
+
+
+def get_windows_display_rects():
+    if sys.platform != "win32":
+        return {}
+
+    user32 = ctypes.windll.user32
+    rects = {}
+
+    MONITORENUMPROC = ctypes.WINFUNCTYPE(
+        wintypes.BOOL,
+        wintypes.HMONITOR,
+        wintypes.HDC,
+        ctypes.POINTER(wintypes.RECT),
+        wintypes.LPARAM,
+    )
+
+    def enum_proc(hmonitor, _hdc, _rect, _lparam):
+        info = MONITORINFOEXW()
+        info.cbSize = ctypes.sizeof(MONITORINFOEXW)
+        if user32.GetMonitorInfoW(hmonitor, ctypes.byref(info)):
+            rects[str(info.szDevice)] = {
+                "rect": _rect_to_tuple(info.rcMonitor),
+                "primary": bool(info.dwFlags & 1),
+            }
+        return True
+
+    try:
+        user32.EnumDisplayMonitors(0, 0, MONITORENUMPROC(enum_proc), 0)
+    except Exception:
+        return {}
+    return rects
+
+
+def get_dxgi_display_targets():
+    """Return DXGI targets ordered like visible monitors: primary first, then position."""
+    if not HAS_DXGI:
+        return []
+
+    try:
+        factory = dxcam.DXFactory()
+        metadata = getattr(factory, "output_metadata", {}) or {}
+        display_rects = get_windows_display_rects()
+        targets = []
+        for device_idx, outputs in enumerate(getattr(factory, "outputs", [])):
+            for output_idx, output in enumerate(outputs):
+                display_name = getattr(output, "devicename", "")
+                meta = metadata.get(display_name) or []
+                rect_info = display_rects.get(display_name, {})
+                rect = rect_info.get("rect")
+                primary = bool(meta[1]) if len(meta) > 1 else bool(rect_info.get("primary", False))
+                targets.append({
+                    "device_idx": int(device_idx),
+                    "output_idx": int(output_idx),
+                    "display_name": display_name,
+                    "primary": primary,
+                    "rect": rect,
+                })
+
+        def sort_key(target):
+            rect = target.get("rect") or (10**9, 10**9, 10**9, 10**9)
+            return (0 if target.get("primary") else 1, rect[1], rect[0], target["device_idx"], target["output_idx"])
+
+        return sorted(targets, key=sort_key)
+    except Exception as e:
+        print(f"DXGI output mapping error: {e}")
+        return []
+
+
 def normalize_modifiers(modifiers):
     normalized = []
     for modifier in modifiers:
@@ -144,6 +232,44 @@ def get_monitor_display_name(monitor, index, caps=None):
             return f"{value.strip()} {index + 1}"
 
     return f"Display {index + 1}"
+
+
+def _wmi_brightness_supported():
+    if not HAS_WMI or wmi is None:
+        return False
+    try:
+        conn = wmi.WMI(namespace="WMI")
+        methods = list(conn.WmiMonitorBrightnessMethods())
+        monitors = list(conn.WmiMonitorBrightness())
+        return bool(methods and monitors)
+    except Exception:
+        return False
+
+
+def _wmi_set_brightness(value):
+    if not _wmi_brightness_supported():
+        return False
+    try:
+        conn = wmi.WMI(namespace="WMI")
+        percent = int(max(0, min(100, value)))
+        for method in conn.WmiMonitorBrightnessMethods():
+            method.WmiSetBrightness(percent, 0)
+        return True
+    except Exception:
+        return False
+
+
+def _wmi_get_brightness():
+    if not _wmi_brightness_supported():
+        return None
+    try:
+        conn = wmi.WMI(namespace="WMI")
+        monitors = list(conn.WmiMonitorBrightness())
+        if monitors:
+            value = getattr(monitors[0], "CurrentBrightness", None)
+            return int(value) if value is not None else None
+    except Exception:
+        return None
 
 
 def qt_key_event_to_name(event):
@@ -431,12 +557,13 @@ class GlobalHotkeyWheelHook(QtCore.QObject):
 # Worker Thread
 # =========================
 class DDCWorker(QtCore.QRunnable):
-    def __init__(self, monitor, lock, brightness=None, contrast=None):
+    def __init__(self, monitor, lock, brightness=None, contrast=None, contrast_supported=True):
         super().__init__()
         self.monitor = monitor
         self.lock = lock
         self.brightness = brightness
         self.contrast = contrast
+        self.contrast_supported = contrast_supported
 
     def run(self):
         try:
@@ -445,9 +572,12 @@ class DDCWorker(QtCore.QRunnable):
                 with self.monitor as m:
                     if self.brightness is not None:
                         m.set_luminance(int(self.brightness))
-                    if self.contrast is not None:
+                    if self.contrast_supported and self.contrast is not None:
                         m.set_contrast(int(self.contrast))
+            return
         except Exception as e:
+            if self.brightness is not None and _wmi_set_brightness(self.brightness):
+                return
             print("DDC Error:", e)
 
 # =========================
@@ -464,6 +594,7 @@ class MonitorWrapper:
         self.brightness_supported = monitor is not None
         self.contrast_supported = monitor is not None
         self.available = monitor is not None
+        self.wmi_supported = _wmi_brightness_supported()
         self.name = name or f"Display {index + 1}"
 
         if monitor is None:
@@ -492,14 +623,16 @@ class MonitorWrapper:
                 except Exception:
                     pass
 
-                self.supported = self.brightness_supported or self.contrast_supported
+                self.supported = self.brightness_supported or self.contrast_supported or self.wmi_supported
                 self.available = self.supported
+                if self.wmi_supported and not self.contrast_supported:
+                    self.contrast_supported = False
         except Exception:
-            # DDC 通訊失敗 → 不支援 DDC
-            self.supported = False
-            self.brightness_supported = False
+            # DDC 通訊失敗 → 若 WMI 可用則回退到筆電亮度控制；否則標記為不可用
+            self.supported = self.wmi_supported
+            self.brightness_supported = self.wmi_supported
             self.contrast_supported = False
-            self.available = False
+            self.available = self.wmi_supported
         self.name = get_monitor_display_name(monitor, index, caps)
 
     def set_available(self, available):
@@ -524,9 +657,14 @@ class MonitorWrapper:
         except Exception:
             pass
 
+        if brightness is None:
+            brightness = _wmi_get_brightness()
+
         if brightness is not None:
             b_min, b_max = self.brightness_range
             brightness = max(b_min, min(b_max, brightness))
+        if contrast is None and not self.contrast_supported:
+            contrast = 0
         if contrast is not None:
             c_min, c_max = self.contrast_range
             contrast = max(c_min, min(c_max, contrast))
@@ -618,16 +756,72 @@ class MonitorWidget(QtWidgets.QGroupBox):
         self.b_slider.value_label.setText(str(b_val))
         self.c_slider.value_label.setText(str(c_val))
 
+    def _sync_link_value_from_current_levels(self):
+        b_min, b_max = self.monitor.brightness_range
+        c_min, c_max = self.monitor.contrast_range
+        brightness = self.pending_brightness if self.pending_brightness is not None else self.b_slider.slider.value()
+        contrast = self.pending_contrast if self.pending_contrast is not None else self.c_slider.slider.value()
+
+        if not self.monitor.contrast_supported:
+            b_range = max(0, b_max - b_min)
+            link_value = 0 if b_range <= 0 else int(round(((max(b_min, min(b_max, int(round(brightness))) - b_min) / b_range) * 100)))
+        else:
+            b_range = max(0, b_max - b_min)
+            c_range = max(0, c_max - c_min)
+            total = b_range + c_range
+            if total <= 0:
+                link_value = 0
+            else:
+                brightness = max(b_min, min(b_max, int(round(brightness))))
+                contrast = max(c_min, min(c_max, int(round(contrast))))
+                if brightness <= b_min:
+                    units = max(0, min(c_range, contrast - c_min))
+                else:
+                    units = c_range + max(0, min(b_range, brightness - b_min))
+                link_value = int(round((units / total) * 100))
+
+        link_value = max(0, min(100, link_value))
+        self.link_slider.slider.blockSignals(True)
+        self.link_slider.slider.setValue(link_value)
+        self.link_slider.value_label.setText(str(link_value))
+        self.link_slider.slider.blockSignals(False)
+        return link_value
+
     def on_brightness(self, v):
         self.pending_brightness = v
+        link_value = self._sync_link_value_from_current_levels()
+        self.value_changed.emit(link_value)
         self.restart()
 
     def on_contrast(self, v):
+        if not self.monitor.contrast_supported:
+            self.pending_contrast = 0
+            self.sync_sliders(self.b_slider.slider.value(), 0)
+            link_value = self._sync_link_value_from_current_levels()
+            self.value_changed.emit(link_value)
+            return
         self.pending_contrast = v
+        link_value = self._sync_link_value_from_current_levels()
+        self.value_changed.emit(link_value)
         self.restart()
 
     def on_link(self, percent):
         if not self.monitor.available:
+            return
+        if not self.monitor.contrast_supported:
+            b_min, b_max = self.monitor.brightness_range
+            b_range = max(0, b_max - b_min)
+            brightness = b_min + (float(percent) / 100.0) * b_range
+            brightness = max(b_min, min(b_max, int(round(brightness))))
+            self.pending_brightness = brightness
+            self.pending_contrast = 0
+            self.sync_sliders(brightness, 0)
+            self.link_slider.slider.blockSignals(True)
+            self.link_slider.slider.setValue(int(round(percent)))
+            self.link_slider.value_label.setText(str(int(round(percent))))
+            self.link_slider.slider.blockSignals(False)
+            self.restart()
+            self.value_changed.emit(percent)
             return
         b_min, b_max = self.monitor.brightness_range
         c_min, c_max = self.monitor.contrast_range
@@ -648,6 +842,10 @@ class MonitorWidget(QtWidgets.QGroupBox):
         self.pending_contrast = contrast
 
         self.sync_sliders(brightness, contrast)
+        self.link_slider.slider.blockSignals(True)
+        self.link_slider.slider.setValue(int(round(percent)))
+        self.link_slider.value_label.setText(str(int(round(percent))))
+        self.link_slider.slider.blockSignals(False)
         self.restart()
         self.value_changed.emit(percent)
 
@@ -672,7 +870,14 @@ class MonitorWidget(QtWidgets.QGroupBox):
     def apply_values(self):
         if not self.monitor.available:
             return
-        worker = DDCWorker(self.monitor.monitor, self.monitor.lock, self.pending_brightness, self.pending_contrast)
+        contrast_value = 0 if not self.monitor.contrast_supported else self.pending_contrast
+        worker = DDCWorker(
+            self.monitor.monitor,
+            self.monitor.lock,
+            self.pending_brightness,
+            contrast_value,
+            contrast_supported=self.monitor.contrast_supported,
+        )
         self.threadpool.start(worker)
 
     def set_available(self, available):
@@ -681,8 +886,15 @@ class MonitorWidget(QtWidgets.QGroupBox):
         self.setStyleSheet(f"QGroupBox::title {{ color: white; }} QGroupBox {{ color: rgba(255,255,255,{opacity}); }}")
         for attr in ("b_slider", "c_slider", "link_slider"):
             obj = getattr(self, attr, None)
-            if obj:
-                obj.slider.setEnabled(available)
+            if not obj:
+                continue
+            enabled = available
+            if attr == "c_slider":
+                enabled = available and self.monitor.contrast_supported
+            obj.slider.setEnabled(enabled)
+            if attr == "c_slider" and not enabled:
+                obj.slider.setValue(0)
+                obj.value_label.setText("0")
         if available:
             self.setTitle(self.monitor.name)
         else:
@@ -1004,22 +1216,27 @@ class _CaptureThread(QtCore.QThread):
         # UDP 已移除；改由 TCP server 在捕捉到亮度時廣播。
 
     @classmethod
-    def _get_dxgi_camera(cls, output_idx=0):
+    def _get_dxgi_camera(cls, device_idx=0, output_idx=0):
         if not HAS_DXGI or cls._dxgi_disabled:
             return None
+        key = (int(device_idx), int(output_idx))
         with cls._dxgi_lock:
-            if output_idx not in cls._dxgi_cameras:
-                cls._dxgi_cameras[output_idx] = dxcam.create(output_idx=output_idx, output_color="RGB")
-            return cls._dxgi_cameras[output_idx]
+            if key not in cls._dxgi_cameras:
+                cls._dxgi_cameras[key] = dxcam.create(
+                    device_idx=key[0],
+                    output_idx=key[1],
+                    output_color="RGB",
+                )
+            return cls._dxgi_cameras[key]
 
     @classmethod
-    def _disable_dxgi(cls, output_idx=None):
+    def _disable_dxgi(cls, device_idx=None, output_idx=None):
         with cls._dxgi_lock:
-            if output_idx is None:
+            if device_idx is None or output_idx is None:
                 cls._dxgi_disabled = True
                 cls._dxgi_cameras = {}
             else:
-                cls._dxgi_cameras.pop(output_idx, None)
+                cls._dxgi_cameras.pop((int(device_idx), int(output_idx)), None)
 
     @classmethod
     def _get_vapoursynth_capture(cls):
@@ -1051,9 +1268,13 @@ class _CaptureThread(QtCore.QThread):
 
     def _capture_dxgi(self):
         """使用 DXGI 方式截圖（高效）"""
+        device_idx = 0
+        output_idx = 0
         try:
-            output_idx = int(getattr(self.parent(), "output_idx", 0) or 0)
-            camera = self._get_dxgi_camera(output_idx)
+            parent = self.parent()
+            device_idx = int(getattr(parent, "dxgi_device_idx", 0) or 0)
+            output_idx = int(getattr(parent, "dxgi_output_idx", getattr(parent, "output_idx", 0)) or 0)
+            camera = self._get_dxgi_camera(device_idx, output_idx)
             if camera is None:
                 return None
 
@@ -1070,8 +1291,8 @@ class _CaptureThread(QtCore.QThread):
             avg = np.mean(downsampled)
             return avg / 255.0 * 100.0
         except Exception as e:
-            print(f"DXGI 截圖錯誤: {e}")
-            self._disable_dxgi(output_idx)
+            print(f"DXGI 截圖錯誤 (device={device_idx}, output={output_idx}): {e}")
+            self._disable_dxgi(device_idx, output_idx)
             self.use_dxgi = False
             return None
 
@@ -1104,9 +1325,13 @@ class ScreenAnalyzer(QtCore.QObject):
     luminance_updated = QtCore.pyqtSignal(float)  # 即時畫面亮度 0-100
     luminance_source_updated = QtCore.pyqtSignal(str)  # 亮度來源："VPY" / "VS" / "DXGI" / "—"
 
-    def __init__(self, parent=None, output_idx=0):
+    def __init__(self, parent=None, output_idx=0, dxgi_target=None):
         super().__init__(parent)
         self.output_idx = int(output_idx)
+        dxgi_target = dxgi_target or {}
+        self.dxgi_device_idx = int(dxgi_target.get("device_idx", 0))
+        self.dxgi_output_idx = int(dxgi_target.get("output_idx", self.output_idx))
+        self.dxgi_display_name = str(dxgi_target.get("display_name", ""))
         self.enabled = False
         self._last_source = "—"
         self.target = 50        # 目標畫面亮度 0-100
@@ -1859,6 +2084,14 @@ class MainWindow(QtWidgets.QWidget):
             if analyzer is not None:
                 analyzer.stop()
 
+        dxgi_targets = get_dxgi_display_targets()
+        if dxgi_targets:
+            target_text = ", ".join(
+                f"{i}:D{t['device_idx']}O{t['output_idx']}{'*' if t.get('primary') else ''}"
+                for i, t in enumerate(dxgi_targets)
+            )
+            print(f"DXGI targets: {target_text}")
+
         self.screen_analyzers = []
         self._monitor_auto_states = []
         for idx, wrapper in enumerate(self.monitor_wrappers):
@@ -1867,7 +2100,12 @@ class MainWindow(QtWidgets.QWidget):
                 self.screen_analyzers.append(None)
                 continue
 
-            analyzer = ScreenAnalyzer(self, output_idx=idx)
+            dxgi_target = dxgi_targets[idx] if idx < len(dxgi_targets) else {
+                "device_idx": 0,
+                "output_idx": idx,
+                "display_name": "",
+            }
+            analyzer = ScreenAnalyzer(self, output_idx=idx, dxgi_target=dxgi_target)
             self._configure_screen_analyzer(analyzer)
             analyzer.adjust_requested.connect(lambda delta, i=idx: self.on_screen_adjust_requested(i, delta))
             analyzer.luminance_updated.connect(lambda lum, i=idx: self.on_luminance_updated(i, lum))
@@ -2370,6 +2608,16 @@ class MainWindow(QtWidgets.QWidget):
     def _link_value_from_levels(self, wrapper, brightness, contrast):
         b_min, b_max = wrapper.brightness_range
         c_min, c_max = wrapper.contrast_range
+
+        if not getattr(wrapper, "contrast_supported", True):
+            if brightness is None:
+                brightness = b_min
+            brightness = max(b_min, min(b_max, int(brightness)))
+            b_range = max(0, b_max - b_min)
+            if b_range <= 0:
+                return 0
+            return int(round(((brightness - b_min) / b_range) * 100))
+
         b_range = max(0, b_max - b_min)
         c_range = max(0, c_max - c_min)
         total = b_range + c_range
