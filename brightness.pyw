@@ -2836,6 +2836,7 @@ class MainWindow(QtWidgets.QWidget):
             self.remote_servers_map.pop(key, None)
 
         self._rebuild_remote_widgets()
+        self._sync_global_link_from_available_monitors()
         self.refresh_tray_display()
 
     def _sync_remote_widget(self, widget, wrapper):
@@ -3007,6 +3008,9 @@ class MainWindow(QtWidgets.QWidget):
             brightness = b_min if b_range <= 0 else b_min + (float(percent) / 100.0) * b_range
             brightness = int(round(max(b_min, min(b_max, brightness))))
             self._queue_remote_set(srv, wrapper.name, brightness, None, wrapper)
+            self._sync_global_link_from_available_monitors()
+            self._sync_main_global_link_controls()
+            self.refresh_tray_display()
             return
         b_range = b_max - b_min
         c_range = c_max - c_min
@@ -3023,6 +3027,9 @@ class MainWindow(QtWidgets.QWidget):
         brightness = int(round(brightness))
         contrast = int(round(contrast))
         self._queue_remote_set(srv, wrapper.name, brightness, contrast, wrapper)
+        self._sync_global_link_from_available_monitors()
+        self._sync_main_global_link_controls()
+        self.refresh_tray_display()
 
     def _queue_remote_set(self, server_name, monitor_name, brightness, contrast, wrapper):
         key = (server_name, monitor_name)
@@ -3229,13 +3236,31 @@ class MainWindow(QtWidgets.QWidget):
                 pass
         return values
 
+    def _available_global_link_values(self):
+        values = []
+        for idx, (wrapper, widget) in enumerate(zip(self.monitor_wrappers, self.monitor_widgets)):
+            if not getattr(wrapper, "available", False):
+                continue
+            try:
+                values.append(("local", idx, int(widget.link_slider.slider.value())))
+            except RuntimeError:
+                pass
+        for idx, (wrapper, widget) in enumerate(zip(self._remote_wrappers, self._remote_widgets)):
+            if not getattr(wrapper, "available", False):
+                continue
+            try:
+                values.append(("remote", idx, int(widget.link_slider.slider.value())))
+            except RuntimeError:
+                pass
+        return values
+
     def _sync_global_link_from_available_monitors(self):
-        values = self._available_link_values()
+        values = self._available_global_link_values()
         if not values:
             return
-        self.global_link_value = int(round(sum(value for _idx, value in values) / len(values)))
-        for idx, value in values:
-            if idx < len(self.screen_analyzers) and self.screen_analyzers[idx] is not None:
+        self.global_link_value = int(round(sum(value for _kind, _idx, value in values) / len(values)))
+        for kind, idx, value in values:
+            if kind == "local" and idx < len(self.screen_analyzers) and self.screen_analyzers[idx] is not None:
                 self.screen_analyzers[idx].set_current_ddc(value)
         self._sync_main_global_link_controls()
 
@@ -3581,6 +3606,17 @@ class MainWindow(QtWidgets.QWidget):
                     w.on_link(value) # 確保發送 DDC 指令
                 except RuntimeError:
                     # widget 已被刪除（熱插拔後），跳過
+                    pass
+            for wrapper, w in zip(self._remote_wrappers, self._remote_widgets):
+                if not getattr(wrapper, "available", False):
+                    continue
+                try:
+                    w.link_slider.slider.blockSignals(True)
+                    w.link_slider.slider.setValue(value)
+                    w.link_slider.slider.blockSignals(False)
+                    w.link_slider.value_label.setText(str(value))
+                    w.on_link(value)
+                except RuntimeError:
                     pass
             self._sync_global_link_from_available_monitors()
             self._update_auto_adjust_info()
