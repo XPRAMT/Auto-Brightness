@@ -2038,6 +2038,7 @@ class MainWindow(QtWidgets.QWidget):
         self._remote_widgets = []
         self._remote_monitor_data = []
         self.remote_servers_map = {}
+        self._pending_remote_sets = {}
 
         # 畫面自動調整
         self.auto_adjust_enabled = False
@@ -2772,6 +2773,7 @@ class MainWindow(QtWidgets.QWidget):
             widget.link_slider.slider.setValue(link_value)
             widget.link_slider.slider.blockSignals(False)
             widget.link_slider.value_label.setText(str(link_value))
+            widget.restart()
             break
         self._sync_global_link_from_available_monitors()
         self._update_auto_adjust_info()
@@ -2827,9 +2829,7 @@ class MainWindow(QtWidgets.QWidget):
             b_range = max(0, b_max - b_min)
             brightness = b_min if b_range <= 0 else b_min + (float(percent) / 100.0) * b_range
             brightness = int(round(max(b_min, min(b_max, brightness))))
-            if self._net_client.remote_set(srv, wrapper.name, brightness, None):
-                wrapper._brightness = brightness
-                wrapper._contrast = 0
+            self._queue_remote_set(srv, wrapper.name, brightness, None, wrapper)
             return
         b_range = b_max - b_min
         c_range = c_max - c_min
@@ -2845,37 +2845,41 @@ class MainWindow(QtWidgets.QWidget):
             brightness = b_min + (value - c_range)
         brightness = int(round(brightness))
         contrast = int(round(contrast))
-        if self._net_client.remote_set(srv, wrapper.name, brightness, contrast):
+        self._queue_remote_set(srv, wrapper.name, brightness, contrast, wrapper)
+
+    def _queue_remote_set(self, server_name, monitor_name, brightness, contrast, wrapper):
+        key = (server_name, monitor_name)
+        self._pending_remote_sets[key] = {
+            "brightness": brightness,
+            "contrast": contrast,
+            "wrapper": wrapper,
+            "scheduled": self._pending_remote_sets.get(key, {}).get("scheduled", False),
+        }
+        if self._pending_remote_sets[key]["scheduled"]:
+            return
+        self._pending_remote_sets[key]["scheduled"] = True
+        QtCore.QTimer.singleShot(100, lambda k=key: self._flush_remote_set(k))
+
+    def _flush_remote_set(self, key):
+        payload = self._pending_remote_sets.pop(key, None)
+        if not payload:
+            return
+        server_name, monitor_name = key
+        brightness = payload.get("brightness")
+        contrast = payload.get("contrast")
+        wrapper = payload.get("wrapper")
+        if self._net_client.remote_set(server_name, monitor_name, brightness, contrast) and isinstance(wrapper, RemoteMonitorWrapper):
             wrapper._brightness = brightness
-            wrapper._contrast = contrast
+            wrapper._contrast = 0 if contrast is None and not wrapper.contrast_supported else contrast
 
     def _remote_set_monitor(self, name, brightness, contrast):
         """由 NetworkMonitorServer 回呼：遠端要求設定本機螢幕"""
         for w in self.monitor_wrappers:
             if w.name == name and w.available:
-                if brightness is not None:
-                    try:
-                        if w.monitor is None:
-                            if not _wmi_set_brightness(int(brightness)):
-                                return False
-                        else:
-                            with w.lock:
-                                with w.monitor as m:
-                                    m.set_luminance(int(brightness))
-                    except Exception as e:
-                        print(f"Remote set luminance error: {e}")
-                        return False
-                if contrast is not None:
-                    if not getattr(w, "contrast_supported", True):
-                        self.remote_set_applied.emit(name, brightness, 0)
-                        return True
-                    try:
-                        with w.lock:
-                            with w.monitor as m:
-                                m.set_contrast(int(contrast))
-                    except Exception as e:
-                        print(f"Remote set contrast error: {e}")
-                        return False
+                if brightness is None and contrast is None:
+                    return False
+                if contrast is not None and not getattr(w, "contrast_supported", True):
+                    contrast = 0
                 self.remote_set_applied.emit(name, brightness, contrast)
                 return True
         return False
