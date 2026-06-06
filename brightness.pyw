@@ -67,6 +67,7 @@ AUTO_BRIGHTNESS_CONTENT_COEFF = 1.0
 AUTO_BRIGHTNESS_CONTENT_COEFF_MIN_FACTOR = 0.5
 AUTO_BRIGHTNESS_CONTENT_COEFF_MAX_FACTOR = 1.5
 AUTO_BRIGHTNESS_WEIGHT_DEFAULT = 1.0
+NETWORK_DEBUG_LOG_ENABLED = False
 
 MODIFIER_ORDER = ["Alt", "Ctrl", "Shift", "Win"]
 SHORTCUT_MODIFIER_OPTIONS = ["None"] + MODIFIER_ORDER
@@ -249,6 +250,8 @@ def _network_log_value(value):
 
 
 def log_network_signal(direction, content, value):
+    if not NETWORK_DEBUG_LOG_ENABLED:
+        return
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
     print(f"{timestamp} {direction} {content} {_network_log_value(value)}")
 
@@ -2265,6 +2268,7 @@ class MainWindow(QtWidgets.QWidget):
         self.shortcut_key2 = "Win"
         self.shortcut_key3 = "None"
         self.auto_start_enabled = False
+        self.network_debug_enabled = False
         self.level_shortcuts = [dict(item) for item in DEFAULT_LEVEL_SHORTCUTS]
         self.global_hook = None
         self._loading_settings = False
@@ -2686,9 +2690,14 @@ class MainWindow(QtWidgets.QWidget):
             self.auto_start_enabled = self.is_startup_enabled()
         self.autostart_checkbox.setChecked(self.auto_start_enabled)
 
+        self.network_debug_checkbox = QtWidgets.QCheckBox("Debug 網路狀態")
+        self.network_debug_checkbox.setChecked(self.network_debug_enabled)
+        self.network_debug_checkbox.toggled.connect(self.on_network_debug_toggled)
+
         global_grid.addWidget(QtWidgets.QLabel("Step"), 0, 0)
         global_grid.addWidget(self.step_combo, 0, 1)
         global_grid.addWidget(self.autostart_checkbox, 1, 0, 1, 2)
+        global_grid.addWidget(self.network_debug_checkbox, 2, 0, 1, 2)
         global_group.setLayout(global_grid)
         gen_layout.addWidget(global_group)
 
@@ -3648,6 +3657,12 @@ class MainWindow(QtWidgets.QWidget):
         self.set_startup_enabled(self.auto_start_enabled)
         self.trigger_save()
 
+    def on_network_debug_toggled(self, checked):
+        global NETWORK_DEBUG_LOG_ENABLED
+        self.network_debug_enabled = bool(checked)
+        NETWORK_DEBUG_LOG_ENABLED = self.network_debug_enabled
+        self.trigger_save()
+
     def create_tray_icon(self, current_value, target_value=None):
         """ 動態繪製托盤圖示；啟用自動亮度時顯示上下兩行數值 """
         pixmap = QtGui.QPixmap(32, 32)
@@ -3809,6 +3824,7 @@ class MainWindow(QtWidgets.QWidget):
             "global_link": self.global_link_value,
             "step": self.get_step_value(),
             "auto_start": self.auto_start_enabled,
+            "network_debug": self.network_debug_enabled,
             "shortcut": {
                 "keys": [self.shortcut_key1, self.shortcut_key2, self.shortcut_key3],
                 "key1": self.shortcut_key1,
@@ -3866,6 +3882,7 @@ class MainWindow(QtWidgets.QWidget):
             saved_link = data.get("global_link", 0) if isinstance(data, dict) else 0
             saved_step = data.get("step", 5) if isinstance(data, dict) else 5
             saved_auto_start = data.get("auto_start", self.is_startup_enabled()) if isinstance(data, dict) else self.is_startup_enabled()
+            saved_network_debug = bool(data.get("network_debug", False)) if isinstance(data, dict) else False
             shortcut = data.get("shortcut", {}) if isinstance(data, dict) else {}
             saved_level_shortcuts = data.get("level_shortcuts", [dict(item) for item in DEFAULT_LEVEL_SHORTCUTS]) if isinstance(data, dict) else [dict(item) for item in DEFAULT_LEVEL_SHORTCUTS]
             saved_trigger_keys = shortcut.get("keys") if isinstance(shortcut, dict) else None
@@ -3894,6 +3911,9 @@ class MainWindow(QtWidgets.QWidget):
                     loaded_network_mode = "disabled"
             self._network_mode = loaded_network_mode
             self._sync_network_flags_from_mode()
+            self.network_debug_enabled = saved_network_debug
+            global NETWORK_DEBUG_LOG_ENABLED
+            NETWORK_DEBUG_LOG_ENABLED = self.network_debug_enabled
 
             # 先決定是否啟用自動調整，避免啟動流程誤下發 DDC 指令
             self.auto_adjust_enabled = bool(auto_adjust_data.get("enabled", False))
@@ -3961,6 +3981,10 @@ class MainWindow(QtWidgets.QWidget):
             self.auto_adjust_capture_interval = max(0.1, min(5.0, self.auto_adjust_capture_interval))
             self.auto_adjust_step_percent = max(0.01, min(100.0, self.auto_adjust_step_percent))
             self.auto_adjust_resource_saving_idle_seconds = max(0.1, min(60.0, self.auto_adjust_resource_saving_idle_seconds))
+            if hasattr(self, "network_debug_checkbox"):
+                self.network_debug_checkbox.blockSignals(True)
+                self.network_debug_checkbox.setChecked(self.network_debug_enabled)
+                self.network_debug_checkbox.blockSignals(False)
             self.auto_adjust_checkbox.blockSignals(True)
             if hasattr(self, "main_auto_adjust_checkbox"):
                 self.main_auto_adjust_checkbox.blockSignals(True)
