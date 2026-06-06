@@ -1944,7 +1944,7 @@ class NetworkMonitorClient(QtCore.QObject):
         self._zeroconf = Zeroconf()
         listener = _ServiceListener(self._on_service_changed)
         self._browser = ServiceBrowser(self._zeroconf, NETWORK_SERVICE_TYPE, listener)
-        # 定期刷新
+        # 定期保底刷新；有訂閱連線時由 server 主動推送，避免重複回傳。
         self._refresh_timer = QtCore.QTimer(self)
         self._refresh_timer.timeout.connect(self._refresh_all)
         self._refresh_timer.start(10000)
@@ -2017,6 +2017,10 @@ class NetworkMonitorClient(QtCore.QObject):
 
     def _refresh_all(self):
         for name in list(self._discovered_servers.keys()):
+            with self._subscriptions_lock:
+                state = self._subscriptions.get(name)
+                if state and state.get("running") and state.get("socket") is not None:
+                    continue
             self._query_server(name)
 
     def _emit_remote_monitors(self):
@@ -2034,19 +2038,23 @@ class NetworkMonitorClient(QtCore.QObject):
             return
         if "monitors" not in message:
             return
-        log_network_payload("接收", message)
         entry = self._discovered_servers.get(name)
         if not entry:
             return
         monitors = message.get("monitors", [])
-        entry["monitors"] = monitors if isinstance(monitors, list) else []
+        normalized_monitors = [dict(m) for m in monitors if isinstance(m, dict)] if isinstance(monitors, list) else []
         state = {}
         if "auto_target" in message:
             state["auto_target"] = message.get("auto_target")
         if "auto_enabled" in message:
             state["auto_enabled"] = message.get("auto_enabled")
-        if state:
-            entry["state"] = state
+        signature = json.dumps({"monitors": normalized_monitors, "state": state}, sort_keys=True, ensure_ascii=False)
+        if entry.get("_last_message_signature") == signature:
+            return
+        entry["_last_message_signature"] = signature
+        log_network_payload("接收", message)
+        entry["monitors"] = normalized_monitors
+        entry["state"] = state
         info = entry["info"]
         hostname = info.properties.get(b"hostname", b"unknown").decode()
         monitor_count = len(entry["monitors"])
@@ -2149,8 +2157,6 @@ class NetworkMonitorClient(QtCore.QObject):
                         line, _ = buf.split(b"\n", 1)
                         resp = json.loads(line)
                         ok = bool(resp.get("ok"))
-                        if ok:
-                            self._handle_server_message(server_name, resp)
                         return ok
         except Exception as e:
             print(f"Remote set error: {e}")
@@ -2184,8 +2190,6 @@ class NetworkMonitorClient(QtCore.QObject):
                         line, _ = buf.split(b"\n", 1)
                         resp = json.loads(line)
                         ok = bool(resp.get("ok"))
-                        if ok:
-                            self._handle_server_message(server_name, resp)
                         return ok
         except Exception as e:
             print(f"Remote set state error: {e}")
