@@ -252,6 +252,7 @@ def _network_log_value(value):
 def log_network_signal(direction, content, value):
     if not NETWORK_DEBUG_LOG_ENABLED:
         return
+    direction = {"發送": "->", "接收": "<-"}.get(direction, direction)
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
     print(f"{timestamp} {direction} {content} {_network_log_value(value)}")
 
@@ -3448,7 +3449,7 @@ class MainWindow(QtWidgets.QWidget):
         """ 計算所有螢幕亮度+對比總級數並通知 ScreenAnalyzer """
         total = sum(
             (w.brightness_range[1] - w.brightness_range[0]) +
-            (w.contrast_range[1] - w.contrast_range[0])
+            ((w.contrast_range[1] - w.contrast_range[0]) if getattr(w, "contrast_supported", True) else 0)
             for w in self.monitor_wrappers
         )
         self._for_each_screen_analyzer(lambda analyzer: setattr(analyzer, "total_levels", max(1, total)))
@@ -3479,7 +3480,8 @@ class MainWindow(QtWidgets.QWidget):
             b_min, b_max = wrapper.brightness_range
             c_min, c_max = wrapper.contrast_range
             b_range = max(0, b_max - b_min)
-            c_range = max(0, c_max - c_min)
+            contrast_supported = getattr(wrapper, "contrast_supported", True)
+            c_range = max(0, c_max - c_min) if contrast_supported else 0
             total_levels = b_range + c_range
             if total_levels <= 0:
                 return
@@ -3489,18 +3491,23 @@ class MainWindow(QtWidgets.QWidget):
                 level_step = 1
 
             brightness = int(widget.b_slider.slider.value())
-            contrast = int(widget.c_slider.slider.value())
+            contrast = 0 if not contrast_supported else int(widget.c_slider.slider.value())
             brightness = max(b_min, min(b_max, brightness))
-            contrast = max(c_min, min(c_max, contrast))
+            contrast = 0 if not contrast_supported else max(c_min, min(c_max, contrast))
 
-            if brightness <= b_min:
+            if not contrast_supported:
+                current_units = max(0, min(b_range, brightness - b_min))
+            elif brightness <= b_min:
                 current_units = max(0, min(c_range, contrast - c_min))
             else:
                 current_units = c_range + max(0, min(b_range, brightness - b_min))
 
             new_units = max(0, min(total_levels, current_units + sign * level_step))
 
-            if new_units <= c_range:
+            if not contrast_supported:
+                new_contrast = 0
+                new_brightness = b_min + new_units
+            elif new_units <= c_range:
                 new_contrast = c_min + new_units
                 new_brightness = b_min
             else:
