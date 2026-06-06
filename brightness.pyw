@@ -242,6 +242,47 @@ def get_dynamic_content_coeff(luminance):
     return float(AUTO_BRIGHTNESS_CONTENT_COEFF) * factor
 
 
+def _network_log_value(value):
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def log_network_signal(direction, content, value):
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"{timestamp} {direction} {content} {_network_log_value(value)}")
+
+
+def log_network_payload(direction, payload):
+    if not isinstance(payload, dict):
+        return
+    if payload.get("name") is not None and ("brightness" in payload or "contrast" in payload):
+        brightness = payload.get("brightness")
+        contrast = payload.get("contrast")
+        if contrast is None:
+            value = f"brightness={brightness}"
+        else:
+            value = f"brightness={brightness}, contrast={contrast}"
+        log_network_signal(direction, payload.get("name", "unknown"), value)
+    if "global_link" in payload:
+        log_network_signal(direction, "global", payload.get("global_link"))
+    if "auto_enabled" in payload:
+        log_network_signal(direction, "自動亮度", bool(payload.get("auto_enabled")))
+    if "auto_target" in payload:
+        log_network_signal(direction, "自動亮度目標", payload.get("auto_target"))
+    for monitor in payload.get("monitors", []) or []:
+        if not isinstance(monitor, dict):
+            continue
+        name = monitor.get("name", "unknown")
+        brightness = monitor.get("brightness")
+        contrast = monitor.get("contrast")
+        if contrast is None:
+            value = f"brightness={brightness}"
+        else:
+            value = f"brightness={brightness}, contrast={contrast}"
+        log_network_signal(direction, name, value)
+
+
 def get_monitor_display_name(monitor, index, caps=None):
     if isinstance(caps, dict):
         model = caps.get("model", "").strip()
@@ -1752,9 +1793,14 @@ class NetworkMonitorServer:
                         line = line.strip()
                         if not line:
                             continue
+                        try:
+                            log_network_payload("接收", json.loads(line))
+                        except Exception:
+                            pass
                         response = self._process_request(line)
                         should_broadcast = bool(response.pop("_broadcast_monitors", False))
                         try:
+                            log_network_payload("發送", response)
                             client.sendall((json.dumps(response) + "\n").encode())
                             if should_broadcast:
                                 self.broadcast_monitor_state()
@@ -1777,6 +1823,7 @@ class NetworkMonitorServer:
     def broadcast_luminance(self, value: float, source: str = "—"):
         """向所有已連線 client 廣播亮度事件（JSON line）。"""
         payload = {"event": "luminance", "value": float(value), "source": source, "ts": time.time()}
+        log_network_signal("發送", "畫面亮度", f"{float(value):.1f} source={source}")
         self._broadcast_payload(payload)
 
     def _monitor_snapshot(self):
@@ -1807,6 +1854,7 @@ class NetworkMonitorServer:
         payload = self._state_payload()
         payload["event"] = "monitors"
         payload["ts"] = time.time()
+        log_network_payload("發送", payload)
         self._broadcast_payload(payload)
 
     def _app_state_snapshot(self):
@@ -1986,6 +2034,7 @@ class NetworkMonitorClient(QtCore.QObject):
             return
         if "monitors" not in message:
             return
+        log_network_payload("接收", message)
         entry = self._discovered_servers.get(name)
         if not entry:
             return
@@ -2088,6 +2137,7 @@ class NetworkMonitorClient(QtCore.QObject):
                     req["brightness"] = int(brightness)
                 if contrast is not None:
                     req["contrast"] = int(contrast)
+                log_network_payload("發送", req)
                 s.sendall(json.dumps(req).encode() + b"\n")
                 buf = b""
                 while True:
@@ -2122,6 +2172,7 @@ class NetworkMonitorClient(QtCore.QObject):
                     req["auto_target"] = int(auto_target)
                 if auto_enabled is not None:
                     req["auto_enabled"] = bool(auto_enabled)
+                log_network_payload("發送", req)
                 s.sendall(json.dumps(req).encode() + b"\n")
                 buf = b""
                 while True:
