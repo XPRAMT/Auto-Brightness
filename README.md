@@ -1,6 +1,6 @@
 # Auto Brightness
 
-Language: English | [繁體中文](README_TW.md)
+English | [繁體中文](README_TW.md)
 
 Auto Brightness is a Windows desktop utility for controlling monitor brightness and contrast from a compact PyQt6 tray app. It supports DDC/CI external displays, WMI brightness fallback for compatible built-in displays, global hotkeys, content-aware automatic brightness, and LAN-based remote monitor control.
 

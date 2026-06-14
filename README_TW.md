@@ -1,6 +1,6 @@
 # Auto Brightness
 
-語言：[English](README.md) | 繁體中文
+[English](README.md) | 繁體中文
 
 Auto Brightness 是一個 Windows 桌面工具，以精簡的 PyQt6 系統匣應用程式控制螢幕亮度與對比。它支援 DDC/CI 外接螢幕、相容內建螢幕的 WMI 亮度備援、全域快捷鍵、依畫面內容自動調整亮度，以及區域網路遠端控制螢幕。
 
