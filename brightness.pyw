@@ -6,51 +6,23 @@ import os
 import time
 import socket
 from ctypes import wintypes
+from typing import Optional
 
 # 避免 Windows 上 Qt 輸出 DPI awareness 的無害警告
 os.environ.setdefault("QT_LOGGING_RULES", "qt.qpa.window=false")
 
 from PyQt6 import QtWidgets, QtCore, QtGui
 from monitorcontrol import get_monitors
-
-# zeroconf 用於 mDNS
-try:
-    from zeroconf import Zeroconf, ServiceInfo, ServiceBrowser
-except Exception:
-    Zeroconf = None
-    ServiceInfo = None
-    ServiceBrowser = None
+from zeroconf import Zeroconf, ServiceInfo, ServiceBrowser
+import numpy as np
+import dxcam
+import vapoursynth as vs
+import wmi
 
 try:
     import winreg
 except ImportError:
     winreg = None
-
-try:
-    import numpy as np
-    HAS_NUMPY = True
-except ImportError:
-    HAS_NUMPY = False
-
-# 嘗試導入 DXGI 截圖模組
-try:
-    import dxcam
-    HAS_DXGI = True
-except ImportError:
-    HAS_DXGI = False
-
-try:
-    import vapoursynth as vs
-    HAS_VAPOURSYNTH = True
-except ImportError:
-    HAS_VAPOURSYNTH = False
-
-try:
-    import wmi
-    HAS_WMI = True
-except Exception:
-    wmi = None
-    HAS_WMI = False
 
 # 可選：指定 VapourSynth 腳本 (.vpy) 後，優先使用該管線抓取畫面亮度
 # PowerShell 範例：$env:BRIGHTNESS_VS_SCRIPT='C:\path\to\source.vpy'
@@ -179,9 +151,6 @@ def get_windows_display_rects():
 
 def get_dxgi_display_targets():
     """Return DXGI targets ordered like visible monitors: primary first, then position."""
-    if not HAS_DXGI:
-        return []
-
     try:
         factory = getattr(dxcam, "__factory", None)
         if factory is None:
@@ -305,8 +274,6 @@ def get_monitor_display_name(monitor, index, caps=None):
 
 
 def _wmi_brightness_supported():
-    if not HAS_WMI or wmi is None:
-        return False
     try:
         conn = wmi.WMI(namespace="WMI")
         methods = list(conn.WmiMonitorBrightnessMethods())
@@ -447,7 +414,7 @@ def link_value_from_levels(wrapper, brightness, contrast):
     return int(round((units / total) * 100))
 
 
-def levels_from_link_value(wrapper, percent, unsupported_contrast=0):
+def levels_from_link_value(wrapper, percent, unsupported_contrast: Optional[int] = 0):
     percent = max(0.0, min(100.0, float(percent)))
     b_min, b_max = wrapper.brightness_range
     c_min, c_max = wrapper.contrast_range
@@ -1301,8 +1268,6 @@ class _VapourSynthCapture:
     """VapourSynth 逐幀亮度擷取（原型）。"""
 
     def __init__(self, script_path):
-        if not HAS_VAPOURSYNTH:
-            raise RuntimeError("VapourSynth 不可用")
         if not script_path:
             raise RuntimeError("未設定 VapourSynth 腳本路徑")
         if not os.path.isfile(script_path):
@@ -1374,12 +1339,12 @@ class _CaptureThread(QtCore.QThread):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.use_dxgi = HAS_DXGI and HAS_NUMPY
-        self.use_vapoursynth = HAS_VAPOURSYNTH and bool(VAPOURSYNTH_SCRIPT_PATH)
+        self.use_dxgi = True
+        self.use_vapoursynth = bool(VAPOURSYNTH_SCRIPT_PATH)
 
     @classmethod
     def _get_dxgi_camera(cls, device_idx=0, output_idx=0):
-        if not HAS_DXGI or cls._dxgi_disabled:
+        if cls._dxgi_disabled:
             return None
         key = (int(device_idx), int(output_idx))
         with cls._dxgi_lock:
@@ -1402,7 +1367,7 @@ class _CaptureThread(QtCore.QThread):
 
     @classmethod
     def _get_vapoursynth_capture(cls):
-        if not HAS_VAPOURSYNTH or cls._vs_disabled or not VAPOURSYNTH_SCRIPT_PATH:
+        if cls._vs_disabled or not VAPOURSYNTH_SCRIPT_PATH:
             return None
         with cls._vs_lock:
             if cls._vs_capture is None:
@@ -1705,9 +1670,6 @@ class NetworkMonitorServer:
     def start(self):
         if self._running:
             return
-        if Zeroconf is None or ServiceInfo is None:
-            print("NetServer unavailable: zeroconf is not installed")
-            return
         self._running = True
         self._server_thread = threading.Thread(target=self._run_server, daemon=True, name="NetServer")
         self._server_thread.start()
@@ -1955,9 +1917,6 @@ class NetworkMonitorClient(QtCore.QObject):
 
     def start(self):
         if self._running:
-            return
-        if Zeroconf is None or ServiceBrowser is None:
-            print("Network client unavailable: zeroconf is not installed")
             return
         self._running = True
         self._zeroconf = Zeroconf()
@@ -2780,14 +2739,6 @@ class MainWindow(QtWidgets.QWidget):
         auto_grid.setSpacing(6)
 
         self.auto_adjust_checkbox = QtWidgets.QCheckBox("啟用根據畫面內容自動調整亮度")
-        if not (HAS_DXGI and HAS_NUMPY):
-            self.auto_adjust_checkbox.setEnabled(False)
-            msg = "需要安裝依賴: "
-            if not HAS_NUMPY:
-                msg += "numpy (pip install numpy)"
-            if not HAS_DXGI:
-                msg += " dxcam (pip install dxcam)"
-            self.auto_adjust_checkbox.setToolTip(msg)
         self.auto_adjust_checkbox.setChecked(self.auto_adjust_enabled)
         self.auto_adjust_checkbox.toggled.connect(self.on_auto_adjust_toggled)
 

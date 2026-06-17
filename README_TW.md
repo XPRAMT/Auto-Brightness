@@ -22,9 +22,7 @@ Auto Brightness 是一個 Windows 桌面工具，以精簡的 PyQt6 系統匣應
 - Windows。
 - 建議使用 Python 3.10 或更新版本。
 - 外接螢幕需支援 DDC/CI 才能控制亮度與對比。
-- Python 套件：
-  - 必要：`PyQt6`、`monitorcontrol`
-  - 建議或選用：`zeroconf`、`numpy`、`dxcam`、`wmi`、`vapoursynth`
+- Python 套件：`PyQt6`、`monitorcontrol`、`zeroconf`、`numpy`、`dxcam`、`wmi`、`vapoursynth`。
 
 ## 安裝
 
@@ -34,10 +32,10 @@ cd Auto-Brightness
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-python -m pip install PyQt6 monitorcontrol zeroconf numpy dxcam wmi
+python -m pip install PyQt6 monitorcontrol zeroconf numpy dxcam wmi vapoursynth
 ```
 
-只有在需要自訂 VapourSynth 擷取管線時，才需要另外安裝 `vapoursynth`。
+所有列出的套件都會在啟動時匯入。若缺少任一套件，程式會直接結束，方便先安裝缺少的依賴。
 
 ## 使用方式
 
@@ -63,7 +61,7 @@ python .\brightness.pyw
 
 自動亮度會取樣畫面亮度，並逐步將螢幕背光調整到設定的目標。你可以在設定介面調整目標亮度、門檻、權重、擷取間隔、每次調整幅度與省資源閒置行為。
 
-安裝 `dxcam` 與 `numpy` 後，程式可使用 DXGI 擷取。如果已安裝 VapourSynth，且 `BRIGHTNESS_VS_SCRIPT` 指向 `.vpy` 檔案，也可以使用該腳本作為擷取來源。
+程式會使用 `dxcam` 與 `numpy` 進行 DXGI 擷取。如果 `BRIGHTNESS_VS_SCRIPT` 指向 `.vpy` 檔案，也可以使用 VapourSynth 腳本作為擷取來源。
 
 ## 注意事項
 
