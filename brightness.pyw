@@ -56,8 +56,6 @@ except Exception:
 # PowerShell 範例：$env:BRIGHTNESS_VS_SCRIPT='C:\path\to\source.vpy'
 VAPOURSYNTH_SCRIPT_PATH = os.environ.get("BRIGHTNESS_VS_SCRIPT", "").strip()
 
-# 先前支援透過 UDP 傳輸每幀亮度的機制已移除，改為透過 TCP（NetworkMonitorServer）以固定頻率廣播亮度。
-
 SETTINGS_FILE = "settings.json"
 SETTINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), SETTINGS_FILE)
 
@@ -555,9 +553,6 @@ class GlobalHotkeyWheelHook(QtCore.QObject):
             if not self._is_key_pressed(key_name):
                 return False
         return True
-
-    def _get_pressed_modifiers(self):
-        return tuple(modifier for modifier in MODIFIER_ORDER if self._is_modifier_pressed(modifier))
 
     def _match_level_shortcut(self, vk):
         for shortcut in self.level_shortcuts:
@@ -1273,8 +1268,6 @@ class KeyCaptureButton(QtWidgets.QPushButton):
 # =========================
 # Screen Auto Brightness Analyzer
 # =========================
-# UDP luminance server 已移除；本程式改以 TCP 廣播亮度樣本 (NetworkMonitorServer.broadcast_luminance)
-
 
 class _VapourSynthCapture:
     """VapourSynth 逐幀亮度擷取（原型）。"""
@@ -1355,7 +1348,6 @@ class _CaptureThread(QtCore.QThread):
         super().__init__(parent)
         self.use_dxgi = HAS_DXGI and HAS_NUMPY
         self.use_vapoursynth = HAS_VAPOURSYNTH and bool(VAPOURSYNTH_SCRIPT_PATH)
-        # UDP 已移除；改由 TCP server 在捕捉到亮度時廣播。
 
     @classmethod
     def _get_dxgi_camera(cls, device_idx=0, output_idx=0):
@@ -1442,11 +1434,6 @@ class _CaptureThread(QtCore.QThread):
         result = None
         source = "—"
 
-        # 優先使用 UDP 區間平均（涵蓋自上次截圖以來的所有幀）
-        # 即使目前在 DXGI 模式，只要 VPY 重新開始發送資料就會自動切回 VPY
-        # 取消 UDP 路徑：改由本程式依序呼叫 VS/DXGI 擷取亮度
-
-        # UDP 沒有資料時，嘗試走 VapourSynth 腳本管線
         if result is None and self.use_vapoursynth:
             result = self._capture_vapoursynth()
             if result is not None:
@@ -2579,10 +2566,6 @@ class MainWindow(QtWidgets.QWidget):
             print(f"Monitor raw count changed: {self._prev_raw_monitor_count} → {current_count}")
             self._update_monitor_availability()
 
-    def _rebuild_monitor_ui(self):
-        """螢幕熱插拔時安全重建UI（保留 wrapper，只更新可用性）"""
-        self._update_monitor_availability()
-
     def build_main_page(self):
         page = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout()
@@ -2881,7 +2864,6 @@ class MainWindow(QtWidgets.QWidget):
         net_grid.addWidget(QtWidgets.QLabel("模式"), 0, 0)
         net_grid.addWidget(self.net_mode_combo, 0, 1)
         net_grid.addWidget(self.net_servers_label, 1, 0, 1, 2)
-        # 已移除 UDP 防火牆按鈕（改為透過 TCP 廣播亮度）
         net_group.setLayout(net_grid)
         net_layout.addWidget(net_group)
         net_layout.addStretch()
@@ -2946,14 +2928,6 @@ class MainWindow(QtWidgets.QWidget):
     def _on_net_mode_changed(self, index):
         mode = {0: "disabled", 1: "server", 2: "client"}.get(int(index), "disabled")
         self._set_network_mode(mode)
-
-    def _on_net_server_toggled(self, enabled):
-        self._set_network_mode("server" if enabled else "disabled")
-
-    def _on_net_client_toggled(self, enabled):
-        self._set_network_mode("client" if enabled else "disabled")
-
-    # UDP 防火牆按鈕與 UAC 提升相關功能已移除（改用 TCP 廣播）。
 
     def _on_remote_monitors_updated(self, monitors):
         if hasattr(self, "net_servers_label"):
@@ -3384,17 +3358,6 @@ class MainWindow(QtWidgets.QWidget):
             self.main_global_link_slider.blockSignals(False)
             self.main_global_link_value_label.setText(str(value))
 
-    def _available_link_values(self):
-        values = []
-        for idx, (wrapper, widget) in enumerate(zip(self.monitor_wrappers, self.monitor_widgets)):
-            if not getattr(wrapper, "available", False):
-                continue
-            try:
-                values.append((idx, int(widget.link_slider.slider.value())))
-            except RuntimeError:
-                pass
-        return values
-
     def _available_global_link_values(self):
         values = []
         for idx, (wrapper, widget) in enumerate(zip(self.monitor_wrappers, self.monitor_widgets)):
@@ -3795,12 +3758,6 @@ class MainWindow(QtWidgets.QWidget):
             self._broadcast_monitor_state_if_server_enabled()
         finally:
             self._updating_global_link = False
-
-    def toggle_window(self):
-        if self.isVisible():
-            self.hide()
-        else:
-            self.show_main_page()
 
     def closeEvent(self, event):
         if not self._is_quitting:
