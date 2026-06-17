@@ -402,6 +402,91 @@ def qt_key_event_to_name(event, allow_modifiers=False):
     return None
 
 
+def set_slider_object_value(slider_obj, value):
+    value = int(round(value))
+    slider_obj.slider.blockSignals(True)
+    slider_obj.slider.setValue(value)
+    slider_obj.slider.blockSignals(False)
+    slider_obj.value_label.setText(str(value))
+
+
+def link_value_from_levels(wrapper, brightness, contrast):
+    b_min, b_max = wrapper.brightness_range
+    c_min, c_max = wrapper.contrast_range
+
+    if not getattr(wrapper, "contrast_supported", True):
+        if brightness is None:
+            brightness = b_min
+        brightness = max(b_min, min(b_max, int(round(brightness))))
+        b_range = max(0, b_max - b_min)
+        if b_range <= 0:
+            return 0
+        return int(round(((brightness - b_min) / b_range) * 100))
+
+    b_range = max(0, b_max - b_min)
+    c_range = max(0, c_max - c_min)
+    total = b_range + c_range
+    if total <= 0:
+        return 0
+
+    if brightness is None and contrast is None:
+        return 0
+    if brightness is None:
+        brightness = b_min
+    if contrast is None:
+        contrast = c_min
+
+    brightness = max(b_min, min(b_max, int(round(brightness))))
+    contrast = max(c_min, min(c_max, int(round(contrast))))
+
+    if brightness <= b_min:
+        units = max(0, min(c_range, contrast - c_min))
+    else:
+        units = c_range + max(0, min(b_range, brightness - b_min))
+
+    return int(round((units / total) * 100))
+
+
+def levels_from_link_value(wrapper, percent, unsupported_contrast=0):
+    percent = max(0.0, min(100.0, float(percent)))
+    b_min, b_max = wrapper.brightness_range
+    c_min, c_max = wrapper.contrast_range
+
+    if not getattr(wrapper, "contrast_supported", True):
+        b_range = max(0, b_max - b_min)
+        brightness = b_min if b_range <= 0 else b_min + (percent / 100.0) * b_range
+        return int(round(max(b_min, min(b_max, brightness)))), unsupported_contrast
+
+    b_range = max(0, b_max - b_min)
+    c_range = max(0, c_max - c_min)
+    total = b_range + c_range
+    if total <= 0:
+        return int(round(b_min)), int(round(c_min))
+
+    value = percent / 100.0 * total
+    if value <= c_range:
+        return int(round(b_min)), int(round(c_min + value))
+    return int(round(b_min + (value - c_range))), int(round(c_max))
+
+
+def levels_from_link_units(wrapper, units):
+    b_min, b_max = wrapper.brightness_range
+    c_min, c_max = wrapper.contrast_range
+    b_range = max(0, b_max - b_min)
+    contrast_supported = getattr(wrapper, "contrast_supported", True)
+    c_range = max(0, c_max - c_min) if contrast_supported else 0
+    total = b_range + c_range
+    units = max(0, min(total, int(round(units))))
+
+    if total <= 0:
+        return int(round(b_min)), 0 if not contrast_supported else int(round(c_min))
+    if not contrast_supported:
+        return int(round(b_min + units)), 0
+    if units <= c_range:
+        return int(round(b_min)), int(round(c_min + units))
+    return int(round(b_min + (units - c_range))), int(round(c_max))
+
+
 # =========================
 # Windows Global Hook (Alt + Win + Wheel)
 # =========================
@@ -877,34 +962,10 @@ class MonitorWidget(QtWidgets.QGroupBox):
         self.c_slider.value_label.setText(str(c_val))
 
     def _sync_link_value_from_current_levels(self):
-        b_min, b_max = self.monitor.brightness_range
-        c_min, c_max = self.monitor.contrast_range
         brightness = self.pending_brightness if self.pending_brightness is not None else self.b_slider.slider.value()
         contrast = self.pending_contrast if self.pending_contrast is not None else self.c_slider.slider.value()
-
-        if not self.monitor.contrast_supported:
-            b_range = max(0, b_max - b_min)
-            link_value = 0 if b_range <= 0 else int(round(((max(b_min, min(b_max, int(round(brightness))) - b_min) / b_range) * 100)))
-        else:
-            b_range = max(0, b_max - b_min)
-            c_range = max(0, c_max - c_min)
-            total = b_range + c_range
-            if total <= 0:
-                link_value = 0
-            else:
-                brightness = max(b_min, min(b_max, int(round(brightness))))
-                contrast = max(c_min, min(c_max, int(round(contrast))))
-                if brightness <= b_min:
-                    units = max(0, min(c_range, contrast - c_min))
-                else:
-                    units = c_range + max(0, min(b_range, brightness - b_min))
-                link_value = int(round((units / total) * 100))
-
-        link_value = max(0, min(100, link_value))
-        self.link_slider.slider.blockSignals(True)
-        self.link_slider.slider.setValue(link_value)
-        self.link_slider.value_label.setText(str(link_value))
-        self.link_slider.slider.blockSignals(False)
+        link_value = max(0, min(100, link_value_from_levels(self.monitor, brightness, contrast)))
+        set_slider_object_value(self.link_slider, link_value)
         return link_value
 
     def on_brightness(self, v):
@@ -928,44 +989,11 @@ class MonitorWidget(QtWidgets.QGroupBox):
     def on_link(self, percent):
         if not self.monitor.available:
             return
-        if not self.monitor.contrast_supported:
-            b_min, b_max = self.monitor.brightness_range
-            b_range = max(0, b_max - b_min)
-            brightness = b_min + (float(percent) / 100.0) * b_range
-            brightness = max(b_min, min(b_max, int(round(brightness))))
-            self.pending_brightness = brightness
-            self.pending_contrast = 0
-            self.sync_sliders(brightness, 0)
-            self.link_slider.slider.blockSignals(True)
-            self.link_slider.slider.setValue(int(round(percent)))
-            self.link_slider.value_label.setText(str(int(round(percent))))
-            self.link_slider.slider.blockSignals(False)
-            self.restart()
-            self.value_changed.emit(percent)
-            return
-        b_min, b_max = self.monitor.brightness_range
-        c_min, c_max = self.monitor.contrast_range
-
-        b_range = b_max - b_min
-        c_range = c_max - c_min
-        total = b_range + c_range
-        value = percent / 100 * total
-
-        if value <= c_range:
-            contrast = c_min + value
-            brightness = b_min
-        else:
-            contrast = c_max
-            brightness = b_min + (value - c_range)
-
+        brightness, contrast = levels_from_link_value(self.monitor, percent)
         self.pending_brightness = brightness
         self.pending_contrast = contrast
-
         self.sync_sliders(brightness, contrast)
-        self.link_slider.slider.blockSignals(True)
-        self.link_slider.slider.setValue(int(round(percent)))
-        self.link_slider.value_label.setText(str(int(round(percent))))
-        self.link_slider.slider.blockSignals(False)
+        set_slider_object_value(self.link_slider, percent)
         self.restart()
         self.value_changed.emit(percent)
 
@@ -2979,11 +3007,8 @@ class MainWindow(QtWidgets.QWidget):
         if contrast is None:
             contrast = 0 if not wrapper.contrast_supported else widget.c_slider.slider.value()
         widget.sync_sliders(brightness, contrast)
-        link_value = self._link_value_from_levels(wrapper, brightness, contrast)
-        widget.link_slider.slider.blockSignals(True)
-        widget.link_slider.slider.setValue(link_value)
-        widget.link_slider.slider.blockSignals(False)
-        widget.link_slider.value_label.setText(str(link_value))
+        link_value = link_value_from_levels(wrapper, brightness, contrast)
+        set_slider_object_value(widget.link_slider, link_value)
 
     def _broadcast_monitor_state_if_server_enabled(self):
         if not self._network_server_enabled or not getattr(self, "_net_server", None):
@@ -3079,11 +3104,8 @@ class MainWindow(QtWidgets.QWidget):
             widget.pending_brightness = b
             widget.pending_contrast = c
             widget.sync_sliders(b, c)
-            link_value = self._link_value_from_levels(wrapper, b, c)
-            widget.link_slider.slider.blockSignals(True)
-            widget.link_slider.slider.setValue(link_value)
-            widget.link_slider.slider.blockSignals(False)
-            widget.link_slider.value_label.setText(str(link_value))
+            link_value = link_value_from_levels(wrapper, b, c)
+            set_slider_object_value(widget.link_slider, link_value)
             widget.restart()
             break
         self._sync_global_link_from_available_monitors()
@@ -3134,31 +3156,14 @@ class MainWindow(QtWidgets.QWidget):
         if not isinstance(wrapper, RemoteMonitorWrapper):
             return
         srv = wrapper._server_name
-        b_min, b_max = wrapper.brightness_range
-        c_min, c_max = wrapper.contrast_range
         if not wrapper.contrast_supported:
-            b_range = max(0, b_max - b_min)
-            brightness = b_min if b_range <= 0 else b_min + (float(percent) / 100.0) * b_range
-            brightness = int(round(max(b_min, min(b_max, brightness))))
+            brightness, _contrast = levels_from_link_value(wrapper, percent, unsupported_contrast=None)
             self._queue_remote_set(srv, wrapper.name, brightness, None, wrapper)
             self._sync_global_link_from_available_monitors()
             self._sync_main_global_link_controls()
             self.refresh_tray_display()
             return
-        b_range = b_max - b_min
-        c_range = c_max - c_min
-        total = b_range + c_range
-        if total <= 0:
-            return
-        value = percent / 100 * total
-        if value <= c_range:
-            contrast = c_min + value
-            brightness = b_min
-        else:
-            contrast = c_max
-            brightness = b_min + (value - c_range)
-        brightness = int(round(brightness))
-        contrast = int(round(contrast))
+        brightness, contrast = levels_from_link_value(wrapper, percent)
         self._queue_remote_set(srv, wrapper.name, brightness, contrast, wrapper)
         self._sync_global_link_from_available_monitors()
         self._sync_main_global_link_controls()
@@ -3225,43 +3230,6 @@ class MainWindow(QtWidgets.QWidget):
         self.refresh_tray_display()
         self.tray.show()
 
-    def _link_value_from_levels(self, wrapper, brightness, contrast):
-        b_min, b_max = wrapper.brightness_range
-        c_min, c_max = wrapper.contrast_range
-
-        if not getattr(wrapper, "contrast_supported", True):
-            if brightness is None:
-                brightness = b_min
-            brightness = max(b_min, min(b_max, int(brightness)))
-            b_range = max(0, b_max - b_min)
-            if b_range <= 0:
-                return 0
-            return int(round(((brightness - b_min) / b_range) * 100))
-
-        b_range = max(0, b_max - b_min)
-        c_range = max(0, c_max - c_min)
-        total = b_range + c_range
-        if total <= 0:
-            return 0
-
-        if brightness is None and contrast is None:
-            return 0
-        if brightness is None:
-            brightness = b_min
-        if contrast is None:
-            contrast = c_min
-
-        brightness = max(b_min, min(b_max, int(brightness)))
-        contrast = max(c_min, min(c_max, int(contrast)))
-
-        # Link 滑桿的對應：先走對比，再走亮度
-        if brightness <= b_min:
-            units = max(0, min(c_range, contrast - c_min))
-        else:
-            units = c_range + max(0, min(b_range, brightness - b_min))
-
-        return int(round((units / total) * 100))
-
     def sync_ui_with_current_monitor_levels(self):
         if not self.monitor_wrappers or not self.monitor_widgets:
             return
@@ -3279,11 +3247,8 @@ class MainWindow(QtWidgets.QWidget):
 
                 widget.sync_sliders(brightness, contrast)
 
-                link_value = self._link_value_from_levels(wrapper, brightness, contrast)
-                widget.link_slider.slider.blockSignals(True)
-                widget.link_slider.slider.setValue(link_value)
-                widget.link_slider.slider.blockSignals(False)
-                widget.link_slider.value_label.setText(str(link_value))
+                link_value = link_value_from_levels(wrapper, brightness, contrast)
+                set_slider_object_value(widget.link_slider, link_value)
                 link_values.append(link_value)
             except RuntimeError:
                 # widget 已被刪除，跳過
@@ -3467,21 +3432,9 @@ class MainWindow(QtWidgets.QWidget):
 
             new_units = max(0, min(total_levels, current_units + sign * level_step))
 
-            if not contrast_supported:
-                new_contrast = 0
-                new_brightness = b_min + new_units
-            elif new_units <= c_range:
-                new_contrast = c_min + new_units
-                new_brightness = b_min
-            else:
-                new_contrast = c_max
-                new_brightness = b_min + (new_units - c_range)
-
             link_value = int(round((new_units / total_levels) * 100))
-            widget.link_slider.slider.blockSignals(True)
-            widget.link_slider.slider.setValue(link_value)
-            widget.link_slider.slider.blockSignals(False)
-            widget.link_slider.value_label.setText(str(link_value))
+            new_brightness, new_contrast = levels_from_link_units(wrapper, new_units)
+            set_slider_object_value(widget.link_slider, link_value)
 
             widget.pending_brightness = int(round(new_brightness))
             widget.pending_contrast = int(round(new_contrast))
@@ -3734,10 +3687,7 @@ class MainWindow(QtWidgets.QWidget):
                 if not getattr(wrapper, "available", False):
                     continue
                 try:
-                    w.link_slider.slider.blockSignals(True)
-                    w.link_slider.slider.setValue(value)
-                    w.link_slider.slider.blockSignals(False)
-                    w.link_slider.value_label.setText(str(value))
+                    set_slider_object_value(w.link_slider, value)
                     w.on_link(value) # 確保發送 DDC 指令
                 except RuntimeError:
                     # widget 已被刪除（熱插拔後），跳過
@@ -3746,10 +3696,7 @@ class MainWindow(QtWidgets.QWidget):
                 if not getattr(wrapper, "available", False):
                     continue
                 try:
-                    w.link_slider.slider.blockSignals(True)
-                    w.link_slider.slider.setValue(value)
-                    w.link_slider.slider.blockSignals(False)
-                    w.link_slider.value_label.setText(str(value))
+                    set_slider_object_value(w.link_slider, value)
                     w.on_link(value)
                 except RuntimeError:
                     pass
