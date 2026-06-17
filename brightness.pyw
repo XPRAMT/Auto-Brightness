@@ -2788,15 +2788,11 @@ class MainWindow(QtWidgets.QWidget):
         self.auto_adjust_resource_saving_idle_spin.setToolTip("畫面亮度差異為 0 持續多久後，開始倍增截圖間隔")
         self.auto_adjust_resource_saving_idle_spin.valueChanged.connect(self.on_auto_adjust_settings_changed)
 
-        auto_formula_label = QtWidgets.QLabel(
-            "加權亮度 = "
-            "(<i>畫面亮度</i> &times; <i>內容係數</i> + "
-            "<i>背光亮度</i> &times; <i>背光權重</i>) "
-            "&divide; (<i>內容係數</i> + <i>背光權重</i>)"
-        )
-        auto_formula_label.setTextFormat(QtCore.Qt.TextFormat.RichText)
-        auto_formula_label.setWordWrap(True)
-        auto_formula_label.setStyleSheet("color: gray; font-size: 10px;")
+        self.auto_formula_label = QtWidgets.QLabel()
+        self.auto_formula_label.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        self.auto_formula_label.setWordWrap(True)
+        self.auto_formula_label.setStyleSheet("color: gray; font-size: 10px;")
+        self._update_auto_formula_label()
 
         auto_grid.addWidget(self.auto_adjust_checkbox, 0, 0, 1, 4)
         auto_grid.addWidget(QtWidgets.QLabel("截圖間隔"), 1, 0)
@@ -2810,7 +2806,7 @@ class MainWindow(QtWidgets.QWidget):
         auto_grid.addWidget(self.auto_adjust_resource_saving_checkbox, 3, 0, 1, 2)
         auto_grid.addWidget(QtWidgets.QLabel("靜止門檻"), 3, 2)
         auto_grid.addWidget(self.auto_adjust_resource_saving_idle_spin, 3, 3)
-        auto_grid.addWidget(auto_formula_label, 4, 0, 1, 4)
+        auto_grid.addWidget(self.auto_formula_label, 4, 0, 1, 4)
         auto_group.setLayout(auto_grid)
         mon_layout.addWidget(auto_group)
 
@@ -3268,6 +3264,7 @@ class MainWindow(QtWidgets.QWidget):
             self.auto_target_slider.setValue(self.auto_adjust_target)
             self.auto_target_slider.blockSignals(False)
             self.auto_target_value_label.setText(str(self.auto_adjust_target))
+        self._update_auto_formula_label()
         self._update_auto_adjust_info()
         self.trigger_save()
 
@@ -3421,7 +3418,31 @@ class MainWindow(QtWidgets.QWidget):
             self._monitor_auto_states[monitor_index]["source"] = source
         self._update_auto_adjust_info(monitor_index)
 
+    def _current_content_coeff(self):
+        values = [
+            float(state["avg"])
+            for state in self._monitor_auto_states
+            if state.get("avg") is not None
+        ]
+        if not values:
+            return float(AUTO_BRIGHTNESS_CONTENT_COEFF)
+        return get_dynamic_content_coeff(sum(values) / len(values))
+
+    def _update_auto_formula_label(self):
+        label = getattr(self, "auto_formula_label", None)
+        if label is None:
+            return
+        content_coeff = self._current_content_coeff()
+        weight = float(self.auto_adjust_weight)
+        label.setText(
+            "加權亮度 = "
+            f"(<i>畫面亮度</i> &times; <i>內容係數({content_coeff:.2f})</i> + "
+            f"<i>背光亮度</i> &times; <i>背光權重({weight:.2f})</i>) "
+            f"&divide; (<i>內容係數({content_coeff:.2f})</i> + <i>背光權重({weight:.2f})</i>)"
+        )
+
     def _update_auto_adjust_info(self, monitor_index=None):
+        self._update_auto_formula_label()
         indexes = range(len(self.monitor_widgets)) if monitor_index is None else [monitor_index]
         target = float(self.auto_adjust_target)
         weight = float(self.auto_adjust_weight)
