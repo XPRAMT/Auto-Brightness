@@ -3231,9 +3231,7 @@ class MainWindow(QtWidgets.QWidget):
             if not isinstance(monitors_data, dict):
                 return
 
-            local_names = [w.name for w in self.monitor_wrappers
-                           if not isinstance(w, RemoteMonitorWrapper)]
-            range_map = self._build_range_map(monitors_data, local_names)
+            range_map = self._build_range_map(monitors_data)
 
             for wrapper in self.monitor_wrappers:
                 if isinstance(wrapper, RemoteMonitorWrapper):
@@ -3245,12 +3243,9 @@ class MainWindow(QtWidgets.QWidget):
         except Exception:
             pass
 
-    def _build_range_map(self, monitors_data: dict, current_names: list[str]) -> dict:
-        """建立 wrapper_name → (b_range, c_range) 查詢表。
-        優先精確名稱配對。若 wrapper 名稱是通用名稱（"Display N"）且無精確匹配，
-        則從 monitors_data 中找出未被任何當前 wrapper 使用的「孤兒」條目來配對。"""
+    def _build_range_map(self, monitors_data: dict) -> dict:
+        """建立 saved_name → (b_range, c_range) 查詢表（純名稱配對）。"""
         range_map: dict = {}
-        orphans: dict = {}
         for saved_name, saved_data in monitors_data.items():
             if not isinstance(saved_data, dict):
                 continue
@@ -3258,21 +3253,7 @@ class MainWindow(QtWidgets.QWidget):
                 list(saved_data.get("b_range", [0, 100])),
                 list(saved_data.get("c_range", [0, 100])),
             )
-            if saved_name in current_names:
-                range_map[saved_name] = pair
-            else:
-                orphans[saved_name] = pair
-
-        for name in current_names:
-            if name in range_map:
-                continue
-            if orphans and name.startswith("Display "):
-                orphan_name, orphan_pair = next(iter(orphans.items()))
-                range_map[name] = orphan_pair
-                del orphans[orphan_name]
-            else:
-                range_map[name] = None
-
+            range_map[saved_name] = pair
         return range_map
 
     # ---- 網路功能 ----
@@ -4187,8 +4168,12 @@ class MainWindow(QtWidgets.QWidget):
                 }
 
         try:
-            with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+            tmp = SETTINGS_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, SETTINGS_PATH)  # 原子操作
         except Exception as e:
             print("Save Error:", e)
 
@@ -4282,11 +4267,10 @@ class MainWindow(QtWidgets.QWidget):
             self.auto_start_enabled = bool(saved_auto_start)
             self.set_startup_enabled(self.auto_start_enabled)
 
-            # 載入監視器範圍 — 按名稱配對，通用名稱降級到孤兒條目
+            # 載入監視器範圍 — 精確名稱配對
             if isinstance(monitors_data, dict):
                 local = [w for w in self.monitor_wrappers if not isinstance(w, RemoteMonitorWrapper)]
-                local_names = [w.name for w in local]
-                range_map = self._build_range_map(monitors_data, local_names)
+                range_map = self._build_range_map(monitors_data)
                 for wrapper, widget, rw in zip(local, self.monitor_widgets, self.monitor_range_widgets):
                     pair = range_map.get(wrapper.name)
                     if pair is None:
@@ -4362,6 +4346,14 @@ class MainWindow(QtWidgets.QWidget):
             self.save_settings()
         except Exception as e:
             print("Load Error:", e)
+            # 檔案可能損毀 → 備份後建立新檔，避免用預設值覆蓋
+            try:
+                import shutil
+                bak = SETTINGS_PATH + ".bak"
+                shutil.copy2(SETTINGS_PATH, bak)
+                print(f"已備份損毀設定檔至 {bak}")
+            except Exception:
+                pass
         finally:
             self._loading_settings = False
 
