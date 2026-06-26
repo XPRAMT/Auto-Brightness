@@ -962,9 +962,6 @@ class MonitorWrapper:
             self.available = self.wmi_supported
         self.name = get_monitor_display_name(monitor, index, caps)
 
-    def set_available(self, available):
-        self.available = available
-
     def read_current_levels(self):
         if not self.available or self.monitor is None:
             return None, None
@@ -2600,9 +2597,6 @@ class MainWindow(QtWidgets.QWidget):
             except Exception:
                 pass
 
-        self._known_monitor_names = sorted(
-            w.name for w in self.monitor_wrappers if _is_valid_monitor_name(w.name)
-        )
         self._prev_raw_monitor_count = len(detected)
 
         # 完全沒偵測到時，從設定恢復已知螢幕佔位
@@ -2684,7 +2678,6 @@ class MainWindow(QtWidgets.QWidget):
                 w.supported = False
                 self.monitor_wrappers.append(w)
                 cleaned_names.append(name)
-            self._known_monitor_names = cleaned_names
         except Exception:
             pass
 
@@ -3133,11 +3126,6 @@ class MainWindow(QtWidgets.QWidget):
 
         # ── 組合 wrappers（先 local，遠端由 _reinsert_remote_widgets 獨立處理） ──
         self.monitor_wrappers = list(fresh_wrappers)
-
-        self._known_monitor_names = sorted(
-            w.name for w in self.monitor_wrappers
-            if _is_valid_monitor_name(w.name)
-        )
 
         print(f"  完成: {len(fresh_wrappers)} 台可用螢幕, {len(self._remote_wrappers)} 台遠端")
 
@@ -3666,7 +3654,6 @@ class MainWindow(QtWidgets.QWidget):
                 cb.blockSignals(True)
                 cb.setChecked(checked)
                 cb.blockSignals(False)
-        self.update_auto_adjust_controls_visibility()
         self.refresh_tray_display()
         self.trigger_save()
         self._broadcast_monitor_state_if_server_enabled()
@@ -3750,9 +3737,6 @@ class MainWindow(QtWidgets.QWidget):
     def adjust_auto_adjust_target(self, delta):
         new_val = self.snap_to_step(self.auto_adjust_target + delta)
         self.set_auto_adjust_target(new_val)
-
-    def update_auto_adjust_controls_visibility(self):
-        pass  # auto_target_group 永遠顯示
 
     def _update_analyzer_levels(self):
         """ 計算所有螢幕亮度+對比總級數並通知 ScreenAnalyzer """
@@ -4152,7 +4136,6 @@ class MainWindow(QtWidgets.QWidget):
             "auto_start": self.auto_start_enabled,
             "network_debug": self.network_debug_enabled,
             "shortcut": {
-                "keys": [self.shortcut_key1, self.shortcut_key2, self.shortcut_key3],
                 "key1": self.shortcut_key1,
                 "key2": self.shortcut_key2,
                 "key3": self.shortcut_key3,
@@ -4372,7 +4355,6 @@ class MainWindow(QtWidgets.QWidget):
             else:
                 self.sync_ui_with_current_monitor_levels()
 
-            self.update_auto_adjust_controls_visibility()
             self._update_auto_adjust_info()
         except FileNotFoundError:
             self.clear_shortcut_rows()
@@ -4380,13 +4362,7 @@ class MainWindow(QtWidgets.QWidget):
                 self.add_shortcut_row(shortcut_item)
             self.level_shortcuts = self.get_level_shortcuts()
             self.apply_level_shortcuts_to_hook()
-            # 同步 _known_monitor_names 與實際 wrappers 一致（名稱配對已在上方完成）
-            local_wrappers = [w for w in self.monitor_wrappers if not isinstance(w, RemoteMonitorWrapper)]
-            self._known_monitor_names = sorted(
-                w.name for w in local_wrappers if _is_valid_monitor_name(w.name)
-            )
             self.sync_ui_with_current_monitor_levels()
-            self.update_auto_adjust_controls_visibility()
             self.refresh_tray_display()
             # 首次啟動時立即建立預設設定檔，避免使用者找不到檔案。
             self.save_settings()
