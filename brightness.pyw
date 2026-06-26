@@ -3196,8 +3196,23 @@ class MainWindow(QtWidgets.QWidget):
         print("===== 重新偵測完成 =====")
 
     def _rebuild_monitor_widgets(self):
-        """重建 container 內的螢幕 widget（容器本身在 layout 中位置固定，不跳動）。"""
-        # 清理舊 widget（從 container 移除）
+        """重建 container 內的螢幕 widget（含遠端）。
+        容器本身在 layout 中位置固定，內部變化不觸發外層 reflow。"""
+        # 清理遠端相關
+        if hasattr(self, "_remote_separator") and self._remote_separator is not None:
+            try:
+                self.monitor_container_layout.removeWidget(self._remote_separator)
+                self._remote_separator.deleteLater()
+            except Exception:
+                pass
+            self._remote_separator = None
+        for w in list(self._remote_widgets):
+            try:
+                self.monitor_container_layout.removeWidget(w)
+            except Exception:
+                pass
+
+        # 清理舊的 local widget
         for w in list(self.monitor_widgets):
             try:
                 self.monitor_container_layout.removeWidget(w)
@@ -3206,7 +3221,7 @@ class MainWindow(QtWidgets.QWidget):
                 pass
         self.monitor_widgets.clear()
 
-        # 填入新 widget
+        # 填入新 local widget
         local_wrappers = [w for w in self.monitor_wrappers if not isinstance(w, RemoteMonitorWrapper)]
         for wrapper in local_wrappers:
             widget = MonitorWidget(wrapper, self.threadpool)
@@ -3534,7 +3549,7 @@ class MainWindow(QtWidgets.QWidget):
         self._broadcast_monitor_state_if_server_enabled()
 
     def _reinsert_remote_widgets(self):
-        """UI 重建後，從現有 remote wrappers 重新建立 remote widget 並插入 layout。"""
+        """UI 重建後，從現有 remote wrappers 重新建立 remote widget 並插入 container。"""
         for wrapper in list(self._remote_wrappers):
             key = (wrapper._server_name, wrapper.name)
             widget = MonitorWidget(wrapper, self.threadpool)
@@ -3542,7 +3557,31 @@ class MainWindow(QtWidgets.QWidget):
             widget.value_changed.connect(self._on_remote_monitor_link_changed)
             self._remote_widgets.append(widget)
             self.remote_servers_map[key] = widget
-        self._rebuild_remote_widgets()
+        self._append_remote_widgets_to_container()
+
+    def _append_remote_widgets_to_container(self):
+        """將遠端 widget 附加到 monitor_container 底部（local 螢幕之後）。"""
+        if not self._remote_widgets:
+            return
+        layout = getattr(self, "monitor_container_layout", None)
+        if layout is None:
+            return
+        # 先移除舊的遠端 widget（避免重複）
+        for w in self._remote_widgets:
+            try:
+                layout.removeWidget(w)
+            except Exception:
+                pass
+        # 加入分隔標籤（若 container 中已有 local widget）
+        if self.monitor_widgets:
+            sep = QtWidgets.QLabel("─── 遠端螢幕 ───")
+            sep.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            sep.setStyleSheet("color: gray; font-size: 10px; padding: 4px;")
+            layout.addWidget(sep)
+            self._remote_separator = sep
+        # 插入遠端 widget
+        for w in self._remote_widgets:
+            layout.addWidget(w)
 
     def _clear_remote_wrappers(self):
         for w in self._remote_wrappers:
@@ -3553,29 +3592,31 @@ class MainWindow(QtWidgets.QWidget):
         self._remote_wrappers.clear()
         self._remote_widgets.clear()
         self.remote_servers_map.clear()
-        self._rebuild_remote_widgets()
+        self._remove_remote_from_container()
 
-    def _rebuild_remote_widgets(self):
-        """將遠端螢幕加入主頁面 layout（在 local 螢幕之後）"""
-        if not hasattr(self, "main_page") or not self.main_page:
-            return
-        layout = self.main_page.layout()
+    def _remove_remote_from_container(self):
+        """從 container 移除遠端 widget 與分隔線。"""
+        layout = getattr(self, "monitor_container_layout", None)
         if layout is None:
             return
-        insert_idx = max(0, layout.count() - 1)
-        for i in range(layout.count()):
-            item = layout.itemAt(i)
-            if item and item.spacerItem() is not None:
-                insert_idx = i
-                break
-        # 移除所有現有遠端 widget（避免重複）
-        for w in self._remote_widgets:
-            if w.isVisible():
+        sep = getattr(self, "_remote_separator", None)
+        if sep is not None:
+            try:
+                layout.removeWidget(sep)
+                sep.deleteLater()
+            except Exception:
+                pass
+            self._remote_separator = None
+        for w in list(self._remote_widgets):
+            try:
                 layout.removeWidget(w)
-        # 重新插入
-        for w in self._remote_widgets:
-            layout.insertWidget(insert_idx, w)
-            insert_idx += 1
+            except Exception:
+                pass
+
+    def _rebuild_remote_widgets(self):
+        """重新整理 container 中的遠端 widget（位置在 local 螢幕之後）。"""
+        self._remove_remote_from_container()
+        self._append_remote_widgets_to_container()
 
     def _on_remote_monitor_link_changed(self, percent):
         """遠端螢幕聯動滑桿變更 → 透過網路發送 set 指令"""
