@@ -401,22 +401,70 @@ def log_network_payload(direction, payload):
 
 
 def get_monitor_display_name(monitor, index, caps=None):
+    # 嘗試從 VCP capabilities dict 取得 model
     if isinstance(caps, dict):
         model = caps.get("model", "").strip()
-        if model:
+        if model and _is_valid_monitor_name(model):
             return model
 
-    for attr_name in ("name", "display_name", "description", "model", "monitor_name"):
+    # 嘗試從 monitor 物件的各屬性取得名稱
+    for attr_name in ("name", "display_name", "description", "model", "monitor_name", "edid"):
         value = getattr(monitor, attr_name, None)
         if isinstance(value, str) and value.strip():
-            return value.strip()
+            cleaned = value.strip()
+            if _is_valid_monitor_name(cleaned):
+                return cleaned
+
+    # 嘗試從 EDID 取得名稱
+    try:
+        edid = getattr(monitor, "edid", None) or getattr(monitor, "get_edid", lambda: None)()
+        if edid and isinstance(edid, bytes):
+            name = _parse_edid_monitor_name(edid)
+            if name:
+                return name
+    except Exception:
+        pass
 
     for attr_name in ("manufacturer", "brand"):
         value = getattr(monitor, attr_name, None)
         if isinstance(value, str) and value.strip():
-            return f"{value.strip()} {index + 1}"
+            cleaned = value.strip()
+            if _is_valid_monitor_name(cleaned):
+                return f"{cleaned} {index + 1}"
 
     return f"Display {index + 1}"
+
+
+def _is_valid_monitor_name(name: str) -> bool:
+    """檢查字串是否像有效的螢幕名稱（拒絕原始 VCP capabilities 文字）。"""
+    if not name or len(name) < 2 or len(name) > 100:
+        return False
+    # 包含 VCP 原始資料特徵（大量括號、prot()/type()/model() 等）→ 拒絕
+    suspicious = ("prot(", "type(", "model(", "vcp(", "cmds(", "mccs_ver")
+    if any(s in name.lower() for s in suspicious):
+        return False
+    # 包含控制字元或換行 → 拒絕
+    for ch in name:
+        if ord(ch) < 32 or ord(ch) == 127:
+            return False
+    return True
+
+
+def _parse_edid_monitor_name(edid: bytes) -> str | None:
+    """從 EDID 解析螢幕名稱（Descriptor Block 類型 0xFC 為 Monitor Name）。"""
+    try:
+        if len(edid) < 128:
+            return None
+        for offset in range(54, 126, 18):
+            tag = edid[offset + 3]
+            if tag == 0xFC:
+                raw = edid[offset + 5 : offset + 18]
+                name = raw.decode("utf-8", errors="replace").strip().rstrip("\n").strip()
+                if name and _is_valid_monitor_name(name):
+                    return name
+    except Exception:
+        pass
+    return None
 
 
 def _wmi_brightness_supported():
@@ -916,6 +964,9 @@ class MonitorWrapper:
         self.name = name or f"Display {index + 1}"
 
         if monitor is None:
+            # 如果傳入了名稱但無效，使用預設
+            if name and not _is_valid_monitor_name(self.name):
+                self.name = f"Display {index + 1}"
             return
 
         caps = None
@@ -2535,7 +2586,11 @@ class MainWindow(QtWidgets.QWidget):
                 saved = json.load(f)
             known_names = saved.get("known_monitor_names", [])
             monitors_data = saved.get("monitors", [])
+            cleaned_names = []
             for i, name in enumerate(known_names):
+                if not _is_valid_monitor_name(name):
+                    print(f"Skipping invalid monitor name from settings: {name!r}")
+                    continue
                 b_range = [0, 100]
                 c_range = [0, 100]
                 if i < len(monitors_data):
@@ -2546,7 +2601,8 @@ class MainWindow(QtWidgets.QWidget):
                 w.available = False
                 w.supported = False
                 self.monitor_wrappers.append(w)
-            self._known_monitor_names = known_names
+                cleaned_names.append(name)
+            self._known_monitor_names = cleaned_names
         except Exception:
             pass
 
@@ -3983,8 +4039,10 @@ class MainWindow(QtWidgets.QWidget):
         self.save_timer.start(200)
 
     def save_settings(self):
+        # 儲存前過濾無效的螢幕名稱
+        valid_names = [n for n in self._known_monitor_names if _is_valid_monitor_name(n)]
         data = {
-            "known_monitor_names": self._known_monitor_names,
+            "known_monitor_names": valid_names,
             "global_link": self.global_link_value,
             "step": self.get_step_value(),
             "auto_start": self.auto_start_enabled,
