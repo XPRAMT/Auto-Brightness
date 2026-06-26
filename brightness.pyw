@@ -2554,11 +2554,29 @@ class MainWindow(QtWidgets.QWidget):
         self._remote_widgets = []   # 遠端螢幕的 MonitorWidget
         self._remote_monitor_data = []  # 原始資料（用於 remote_set）
 
-        # 初始螢幕偵測：先設為空，等待背景 refresh_monitors() 完成後自動重建 UI。
-        # 這樣第一次啟動和「重新偵測」按鈕使用完全相同的流程。
+        # 初始螢幕偵測（快速單次，不重試）：先有初步結果就顯示，
+        # 之後背景 refresh_monitors() 會做完整重試 + 更新。
         self.monitor_wrappers = []
-        self._known_monitor_names = []
-        self._prev_raw_monitor_count = 0
+        try:
+            detected = _run_ddc_with_timeout(lambda: list(get_monitors()), timeout_sec=3.0, default=[])
+        except Exception:
+            detected = []
+        for i, m in enumerate(detected):
+            try:
+                w = _run_ddc_with_timeout(lambda m=m, i=i: MonitorWrapper(m, i), timeout_sec=2.0, default=None)
+                if w is not None:
+                    self.monitor_wrappers.append(w)
+            except Exception:
+                pass
+
+        self._known_monitor_names = sorted(
+            w.name for w in self.monitor_wrappers if _is_valid_monitor_name(w.name)
+        )
+        self._prev_raw_monitor_count = len(detected)
+
+        # 完全沒偵測到時，從設定恢復已知螢幕佔位
+        if not self.monitor_wrappers:
+            self._restore_known_monitors_from_settings()
 
         self.monitor_widgets = []
         self.monitor_range_widgets = []
@@ -2594,8 +2612,9 @@ class MainWindow(QtWidgets.QWidget):
 
         self.load_settings()
         self.show_main_page()
-        # 啟動後透過 refresh_monitors 完成初始螢幕偵測（與「重新偵測」按鈕同一流程）
-        QtCore.QTimer.singleShot(100, self.refresh_monitors)
+        # 若初始偵測沒找到任何可用螢幕，3 秒後重試
+        if not self._has_available_local_monitor():
+            QtCore.QTimer.singleShot(3000, self.refresh_monitors)
 
     def _has_available_local_monitor(self):
         return any(
@@ -2609,7 +2628,7 @@ class MainWindow(QtWidgets.QWidget):
             with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
                 saved = json.load(f)
             known_names = saved.get("known_monitor_names", [])
-            monitors_data = saved.get("monitors", [])
+            monitors_data = saved.get("monitors", {})
             cleaned_names = []
             for i, name in enumerate(known_names):
                 if not _is_valid_monitor_name(name):
@@ -2617,7 +2636,13 @@ class MainWindow(QtWidgets.QWidget):
                     continue
                 b_range = [0, 100]
                 c_range = [0, 100]
-                if i < len(monitors_data):
+                # 支援新格式（name-keyed dict）與舊格式（positional array）
+                if isinstance(monitors_data, dict):
+                    saved_entry = monitors_data.get(name)
+                    if saved_entry:
+                        b_range = list(saved_entry.get("b_range", [0, 100]))
+                        c_range = list(saved_entry.get("c_range", [0, 100]))
+                elif isinstance(monitors_data, list) and i < len(monitors_data):
                     b_range = list(monitors_data[i].get("b_range", [0, 100]))
                     c_range = list(monitors_data[i].get("c_range", [0, 100]))
                 w = MonitorWrapper(monitor=None, index=i, name=name,
