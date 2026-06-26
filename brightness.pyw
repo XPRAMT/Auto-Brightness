@@ -2828,21 +2828,28 @@ class MainWindow(QtWidgets.QWidget):
         layout.addWidget(self.auto_target_group)
 
         if not self.monitor_wrappers:
-            layout.addWidget(QtWidgets.QLabel("未偵測到可控制的螢幕"))
-
-        # 監視器容器：固定位置，內部 widget 重建時不影響外層 layout
-        self.monitor_container = QtWidgets.QWidget()
-        self.monitor_container_layout = QtWidgets.QVBoxLayout()
-        self.monitor_container_layout.setContentsMargins(0, 0, 0, 0)
-        self.monitor_container_layout.setSpacing(5)
-        self.monitor_container.setLayout(self.monitor_container_layout)
-        for wrapper in self.monitor_wrappers:
-            monitor_widget = MonitorWidget(wrapper, self.threadpool)
-            monitor_widget.value_changed.connect(self.on_monitor_link_changed)
-            monitor_widget.set_available(wrapper.available)
-            self.monitor_widgets.append(monitor_widget)
-            self.monitor_container_layout.addWidget(monitor_widget)
-        layout.addWidget(self.monitor_container)
+            self.monitor_container = QtWidgets.QWidget()
+            self.monitor_container_layout = QtWidgets.QVBoxLayout()
+            self.monitor_container_layout.setContentsMargins(0, 0, 0, 0)
+            self.monitor_container_layout.setSpacing(5)
+            self.monitor_container.setLayout(self.monitor_container_layout)
+            label = QtWidgets.QLabel("未偵測到可控制的螢幕")
+            self.monitor_container_layout.addWidget(label)
+            layout.addWidget(self.monitor_container)
+        else:
+            # 監視器容器：固定位置，內部 widget 重建時不影響外層 layout
+            self.monitor_container = QtWidgets.QWidget()
+            self.monitor_container_layout = QtWidgets.QVBoxLayout()
+            self.monitor_container_layout.setContentsMargins(0, 0, 0, 0)
+            self.monitor_container_layout.setSpacing(5)
+            self.monitor_container.setLayout(self.monitor_container_layout)
+            for wrapper in self.monitor_wrappers:
+                monitor_widget = MonitorWidget(wrapper, self.threadpool)
+                monitor_widget.value_changed.connect(self.on_monitor_link_changed)
+                monitor_widget.set_available(wrapper.available)
+                self.monitor_widgets.append(monitor_widget)
+                self.monitor_container_layout.addWidget(monitor_widget)
+            layout.addWidget(self.monitor_container)
 
         layout.addStretch()
         page.setLayout(layout)
