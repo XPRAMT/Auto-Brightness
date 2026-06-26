@@ -3195,44 +3195,25 @@ class MainWindow(QtWidgets.QWidget):
 
     def _reload_monitor_ranges_from_settings(self):
         """從設定檔載入儲存的監視器範圍（按名稱配對），
-        同時同步到已建立的 MonitorWidget 與 MonitorRangeWidget。
-
-        注意：refresh_monitors() 會建立全新的 wrapper 物件，而
-        MonitorRangeWidget（在 settings page）仍引用舊 wrapper。
-        因此必須按名稱比對，而不是物件 identity。"""
+        同時同步到已建立的 MonitorWidget 與 MonitorRangeWidget。"""
         try:
             with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
                 saved = json.load(f)
             monitors_data = saved.get("monitors", {})
+            if not isinstance(monitors_data, dict):
+                return
 
-            # 建立名稱 → 範圍查詢表
-            range_map = {}
-            if isinstance(monitors_data, dict):
-                for name, data in monitors_data.items():
-                    if isinstance(data, dict):
-                        range_map[name] = (
-                            list(data.get("b_range", [0, 100])),
-                            list(data.get("c_range", [0, 100])),
-                        )
-            elif isinstance(monitors_data, list):
-                local_wrappers = [w for w in self.monitor_wrappers
-                                  if not isinstance(w, RemoteMonitorWrapper)]
-                for i, item in enumerate(monitors_data):
-                    if i < len(local_wrappers) and isinstance(item, dict):
-                        name = local_wrappers[i].name
-                        range_map[name] = (
-                            list(item.get("b_range", [0, 100])),
-                            list(item.get("c_range", [0, 100])),
-                        )
-
-            # 更新所有 wrapper 的範圍
+            # 更新所有 wrapper 的範圍（按名稱配對）
             for wrapper in self.monitor_wrappers:
                 if isinstance(wrapper, RemoteMonitorWrapper):
                     continue
-                if wrapper.name in range_map:
-                    b_range, c_range = range_map[wrapper.name]
-                    wrapper.brightness_range = list(b_range)
-                    wrapper.contrast_range = list(c_range)
+                saved_data = monitors_data.get(wrapper.name)
+                if saved_data is None:
+                    continue
+                b_range = list(saved_data.get("b_range", wrapper.brightness_range))
+                c_range = list(saved_data.get("c_range", wrapper.contrast_range))
+                wrapper.brightness_range = b_range
+                wrapper.contrast_range = c_range
 
             # 同步到 MonitorWidget（按名稱比對）
             for widget in self.monitor_widgets:
@@ -3240,31 +3221,36 @@ class MainWindow(QtWidgets.QWidget):
                     name = widget.monitor.name
                 except RuntimeError:
                     continue
-                if name in range_map:
-                    b_range, c_range = range_map[name]
-                    try:
-                        widget.set_ranges(b_range, c_range)
-                    except RuntimeError:
-                        pass
+                saved_data = monitors_data.get(name)
+                if saved_data is None:
+                    continue
+                b_range = list(saved_data.get("b_range", [0, 100]))
+                c_range = list(saved_data.get("c_range", [0, 100]))
+                try:
+                    widget.set_ranges(b_range, c_range)
+                except RuntimeError:
+                    pass
 
-            # 同步到 MonitorRangeWidget（按名稱比對，而非物件 identity）
-            # 同時更新 rw.monitor 指向新的 wrapper，確保後續使用者修改寫入正確物件
+            # 同步到 MonitorRangeWidget（按名稱比對）
+            # 同時更新 rw.monitor 指向新的 wrapper
             name_to_wrapper = {w.name: w for w in self.monitor_wrappers
                                if not isinstance(w, RemoteMonitorWrapper)}
             for rw in self.monitor_range_widgets:
                 try:
-                    name = rw.monitor.name if hasattr(rw, "monitor") else ""
+                    name = rw.monitor.name
                 except RuntimeError:
                     continue
-                if name in range_map:
-                    b_range, c_range = range_map[name]
-                    try:
-                        rw.set_ranges(b_range, c_range, emit_signal=False)
-                    except RuntimeError:
-                        pass
-                    # 更新 rw.monitor 指向新 wrapper（若名稱相符）
-                    if name in name_to_wrapper and rw.monitor is not name_to_wrapper[name]:
-                        rw.monitor = name_to_wrapper[name]
+                saved_data = monitors_data.get(name)
+                if saved_data is None:
+                    continue
+                b_range = list(saved_data.get("b_range", [0, 100]))
+                c_range = list(saved_data.get("c_range", [0, 100]))
+                try:
+                    rw.set_ranges(b_range, c_range, emit_signal=False)
+                except RuntimeError:
+                    pass
+                if name in name_to_wrapper and rw.monitor is not name_to_wrapper[name]:
+                    rw.monitor = name_to_wrapper[name]
         except Exception:
             pass
 
@@ -4273,49 +4259,21 @@ class MainWindow(QtWidgets.QWidget):
             self.auto_start_enabled = bool(saved_auto_start)
             self.set_startup_enabled(self.auto_start_enabled)
 
-            # 載入監視器範圍 — 按名稱配對，失敗時按位置降級
+            # 載入監視器範圍 — 只按名稱配對
             # 支援新格式：{"monitor_name": {"b_range": [...], "c_range": [...]}}
             # 相容舊格式：[{"b_range": [...], "c_range": [...]}, ...]
             if isinstance(monitors_data, dict):
-                # 新格式（name keyed dict）— 先按名稱配對
+                # 新格式（name keyed dict）
                 local = [w for w in self.monitor_wrappers if not isinstance(w, RemoteMonitorWrapper)]
-                named_items = [(wrapper, widget, rw) for wrapper, widget, rw
-                               in zip(local, self.monitor_widgets, self.monitor_range_widgets)
-                               if wrapper.name in monitors_data]
-                for wrapper, widget, rw in named_items:
-                    saved = monitors_data[wrapper.name]
-                    b_range = saved.get("b_range", wrapper.brightness_range)
-                    c_range = saved.get("c_range", wrapper.contrast_range)
-                    wrapper.brightness_range = list(b_range)
-                    wrapper.contrast_range = list(c_range)
-                    rw.set_ranges(wrapper.brightness_range, wrapper.contrast_range, emit_signal=False)
-                    widget.set_ranges(wrapper.brightness_range, wrapper.contrast_range)
-                # 名稱未匹配的 wrapper，按位置從 dict 的 value 列表降級比對
-                unmatched = [(wrapper, widget, rw) for wrapper, widget, rw
-                             in zip(local, self.monitor_widgets, self.monitor_range_widgets)
-                             if wrapper.name not in monitors_data]
-                dict_values = list(monitors_data.values())
-                for idx, (wrapper, widget, rw) in enumerate(unmatched):
-                    if idx < len(dict_values):
-                        saved = dict_values[idx]
+                for wrapper, widget, rw in zip(local, self.monitor_widgets, self.monitor_range_widgets):
+                    saved = monitors_data.get(wrapper.name)
+                    if saved is not None:
                         b_range = saved.get("b_range", wrapper.brightness_range)
                         c_range = saved.get("c_range", wrapper.contrast_range)
                         wrapper.brightness_range = list(b_range)
                         wrapper.contrast_range = list(c_range)
                         rw.set_ranges(wrapper.brightness_range, wrapper.contrast_range, emit_signal=False)
                         widget.set_ranges(wrapper.brightness_range, wrapper.contrast_range)
-            elif isinstance(monitors_data, list):
-                # 舊格式（positional array）— 相容降級
-                for wrapper, monitor_widget, range_widget, data_item in zip(
-                    self.monitor_wrappers, self.monitor_widgets, self.monitor_range_widgets,
-                    monitors_data[:len(self.monitor_wrappers)]
-                ):
-                    b_range = data_item.get("b_range", wrapper.brightness_range)
-                    c_range = data_item.get("c_range", wrapper.contrast_range)
-                    wrapper.brightness_range = list(b_range)
-                    wrapper.contrast_range = list(c_range)
-                    range_widget.set_ranges(wrapper.brightness_range, wrapper.contrast_range, emit_signal=False)
-                    monitor_widget.set_ranges(wrapper.brightness_range, wrapper.contrast_range)
 
             # 載入畫面自動調整設定
             self.auto_adjust_target = int(auto_adjust_data.get("target", 50))
