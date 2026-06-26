@@ -4039,8 +4039,11 @@ class MainWindow(QtWidgets.QWidget):
         self.save_timer.start(200)
 
     def save_settings(self):
-        # 儲存前過濾無效的螢幕名稱
-        valid_names = [n for n in self._known_monitor_names if _is_valid_monitor_name(n)]
+        # 直接從 monitor_wrappers 推導有效名稱（不依賴 _known_monitor_names 變數）
+        local_wrappers = [w for w in self.monitor_wrappers if not isinstance(w, RemoteMonitorWrapper)]
+        valid_names = sorted(
+            w.name for w in local_wrappers if _is_valid_monitor_name(w.name)
+        )
         data = {
             "known_monitor_names": valid_names,
             "global_link": self.global_link_value,
@@ -4069,21 +4072,25 @@ class MainWindow(QtWidgets.QWidget):
                 "server_enabled": self._network_server_enabled,
                 "client_enabled": self._network_client_enabled,
             },
-            "monitors": [],
+            "monitors": {},
         }
-        for wrapper in self.monitor_wrappers:
-            data["monitors"].append({
-                "b_range": wrapper.brightness_range,
-                "c_range": wrapper.contrast_range
-            })
+        # 以 name 為 key 儲存監視器範圍資料（取代舊的 positional array）
+        for wrapper in local_wrappers:
+            name = wrapper.name
+            if _is_valid_monitor_name(name):
+                data["monitors"][name] = {
+                    "b_range": wrapper.brightness_range,
+                    "c_range": wrapper.contrast_range
+                }
 
         # 無螢幕時保留既有設定，避免重啟後螢幕範圍遺失
         if not data["monitors"]:
             try:
                 with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
                     old = json.load(f)
-                    old_monitors = old.get("monitors", [])
-                    if old_monitors:
+                    old_monitors = old.get("monitors", {}) or old.get("monitors", [])
+                    # 只保留 dict 格式的舊資料；舊 positional array 不保留
+                    if isinstance(old_monitors, dict) and old_monitors:
                         data["monitors"] = old_monitors
             except Exception:
                 pass
@@ -4184,13 +4191,33 @@ class MainWindow(QtWidgets.QWidget):
             self.auto_start_enabled = bool(saved_auto_start)
             self.set_startup_enabled(self.auto_start_enabled)
 
-            for wrapper, monitor_widget, range_widget, data_item in zip(self.monitor_wrappers, self.monitor_widgets, self.monitor_range_widgets, monitors_data[:len(self.monitor_wrappers)]):
-                b_range = data_item.get("b_range", wrapper.brightness_range)
-                c_range = data_item.get("c_range", wrapper.contrast_range)
-                wrapper.brightness_range = list(b_range)
-                wrapper.contrast_range = list(c_range)
-                range_widget.set_ranges(wrapper.brightness_range, wrapper.contrast_range, emit_signal=False)
-                monitor_widget.set_ranges(wrapper.brightness_range, wrapper.contrast_range)
+            # 載入監視器範圍 — 按名稱配對，而非按位置
+            # 支援新格式：{"monitor_name": {"b_range": [...], "c_range": [...]}}
+            # 相容舊格式：[{"b_range": [...], "c_range": [...]}, ...]
+            if isinstance(monitors_data, dict):
+                # 新格式（name keyed dict）
+                for wrapper, widget, rw in zip(self.monitor_wrappers, self.monitor_widgets, self.monitor_range_widgets):
+                    name = wrapper.name
+                    saved = monitors_data.get(name)
+                    if saved is not None:
+                        b_range = saved.get("b_range", wrapper.brightness_range)
+                        c_range = saved.get("c_range", wrapper.contrast_range)
+                        wrapper.brightness_range = list(b_range)
+                        wrapper.contrast_range = list(c_range)
+                        rw.set_ranges(wrapper.brightness_range, wrapper.contrast_range, emit_signal=False)
+                        widget.set_ranges(wrapper.brightness_range, wrapper.contrast_range)
+            elif isinstance(monitors_data, list):
+                # 舊格式（positional array）— 相容降級
+                for wrapper, monitor_widget, range_widget, data_item in zip(
+                    self.monitor_wrappers, self.monitor_widgets, self.monitor_range_widgets,
+                    monitors_data[:len(self.monitor_wrappers)]
+                ):
+                    b_range = data_item.get("b_range", wrapper.brightness_range)
+                    c_range = data_item.get("c_range", wrapper.contrast_range)
+                    wrapper.brightness_range = list(b_range)
+                    wrapper.contrast_range = list(c_range)
+                    range_widget.set_ranges(wrapper.brightness_range, wrapper.contrast_range, emit_signal=False)
+                    monitor_widget.set_ranges(wrapper.brightness_range, wrapper.contrast_range)
 
             # 載入畫面自動調整設定
             self.auto_adjust_target = int(auto_adjust_data.get("target", 50))
@@ -4252,6 +4279,11 @@ class MainWindow(QtWidgets.QWidget):
                 self.add_shortcut_row(shortcut_item)
             self.level_shortcuts = self.get_level_shortcuts()
             self.apply_level_shortcuts_to_hook()
+            # 同步 _known_monitor_names 與實際 wrappers 一致（名稱配對已在上方完成）
+            local_wrappers = [w for w in self.monitor_wrappers if not isinstance(w, RemoteMonitorWrapper)]
+            self._known_monitor_names = sorted(
+                w.name for w in local_wrappers if _is_valid_monitor_name(w.name)
+            )
             self.sync_ui_with_current_monitor_levels()
             self.update_auto_adjust_controls_visibility()
             self.refresh_tray_display()
