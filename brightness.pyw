@@ -3248,15 +3248,33 @@ class MainWindow(QtWidgets.QWidget):
                 except RuntimeError:
                     pass
 
-            # 同步到 MonitorRangeWidget，更新 rw.monitor 指向新 wrapper
+            # 同步到 MonitorRangeWidget，同時更新 rw.monitor 指向新 wrapper
+            # rw.monitor 可能是舊 wrapper（名稱不同於當前偵測名稱），但範圍以新名稱為準
             name_to_wrapper = {w.name: w for w in self.monitor_wrappers
                                if not isinstance(w, RemoteMonitorWrapper)}
-            for rw in self.monitor_range_widgets:
+
+            def _find_range_for_rw(rw) -> tuple | None:
                 try:
                     name = rw.monitor.name
                 except RuntimeError:
-                    continue
+                    return None
+                # 1. 精確匹配新名稱
                 pair = range_map.get(name)
+                if pair is not None:
+                    return pair
+                # 2. 在 monitors_data 中找舊名稱的直接配對
+                saved = monitors_data.get(name)
+                if saved is not None and isinstance(saved, dict):
+                    pair = (
+                        list(saved.get("b_range", [0, 100])),
+                        list(saved.get("c_range", [0, 100])),
+                    )
+                    range_map[name] = pair
+                    return pair
+                return None
+
+            for rw in self.monitor_range_widgets:
+                pair = _find_range_for_rw(rw)
                 if pair is None:
                     continue
                 b_range, c_range = pair
@@ -3264,6 +3282,7 @@ class MainWindow(QtWidgets.QWidget):
                     rw.set_ranges(b_range, c_range, emit_signal=False)
                 except RuntimeError:
                     pass
+                name = getattr(rw.monitor, "name", "")
                 if name in name_to_wrapper and rw.monitor is not name_to_wrapper[name]:
                     rw.monitor = name_to_wrapper[name]
         except Exception:
