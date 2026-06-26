@@ -3150,10 +3150,9 @@ class MainWindow(QtWidgets.QWidget):
         # ── 從設定檔載入範圍到 wrapper ──
         self._reload_monitor_ranges_from_settings()
 
-        # ── 重建 UI（兩頁都重建，所有 widget 建構時自動讀取 wrapper 範圍） ──
-        self._rebuild_all_ui()
-        # 重建後恢復快捷鍵 UI（與 init 流程一致）
-        self._restore_shortcut_rows()
+        # ── 重建螢幕 UI（main page 的 monitor widget + settings page 的範圍設定） ──
+        self._rebuild_monitor_widgets()
+        self._rebuild_range_widgets()
 
         # ── 重建完成後，重新插入遠端螢幕 widgets ──
         self._reinsert_remote_widgets()
@@ -3182,50 +3181,114 @@ class MainWindow(QtWidgets.QWidget):
 
         print("===== 重新偵測完成 =====")
 
-    def _rebuild_all_ui(self):
-        """完全重建 main page 與 settings page（呼叫 build_main_page / build_settings_page）。
-        所有 widget 從頭建立，直接綁定當前的 monitor_wrappers，不需後續 patch。"""
-        # 清理舊的 monitor widgets 列表
+    def _rebuild_monitor_widgets(self):
+        """重建 main page 中的螢幕 widget（只替換 MonitorWidget 區域）。"""
+        # 清理舊 widget
         for w in list(self.monitor_widgets):
             try:
                 w.deleteLater()
             except Exception:
                 pass
         self.monitor_widgets.clear()
-        self.monitor_range_widgets.clear()
 
-        # 清理舊的遠端 widget
-        for w in list(self._remote_widgets):
+        # 從 main_page layout 移除所有 MonitorWidget 實例
+        if hasattr(self, "main_page") and self.main_page is not None:
+            layout = self.main_page.layout()
+            if layout is not None:
+                for i in reversed(range(layout.count())):
+                    item = layout.itemAt(i)
+                    if item and item.widget() and isinstance(item.widget(), MonitorWidget):
+                        layout.removeWidget(item.widget())
+
+        # 建立新 widget 並插入到 spacer 之前
+        local_wrappers = [w for w in self.monitor_wrappers if not isinstance(w, RemoteMonitorWrapper)]
+        if not local_wrappers:
+            return
+
+        for wrapper in local_wrappers:
+            widget = MonitorWidget(wrapper, self.threadpool)
+            widget.value_changed.connect(self.on_monitor_link_changed)
+            widget.set_available(wrapper.available)
+            widget.set_ranges(wrapper.brightness_range, wrapper.contrast_range)
+            self.monitor_widgets.append(widget)
+
+        if hasattr(self, "main_page") and self.main_page is not None:
+            layout = self.main_page.layout()
+            if layout is not None:
+                insert_idx = layout.count()
+                for i in range(layout.count()):
+                    item = layout.itemAt(i)
+                    if item and item.spacerItem() is not None:
+                        insert_idx = i
+                        break
+                for widget in self.monitor_widgets:
+                    layout.insertWidget(insert_idx, widget)
+                    insert_idx += 1
+
+    def _rebuild_range_widgets(self):
+        """重建 settings page → Monitors tab 中的範圍 widget。"""
+        for rw in list(self.monitor_range_widgets):
             try:
-                w.deleteLater()
+                rw.deleteLater()
             except Exception:
                 pass
-        self._remote_widgets.clear()
-        self.remote_servers_map.clear()
+        self.monitor_range_widgets.clear()
 
-        # 記錄當前頁面
-        showing_settings = self.stack.currentWidget() is self.settings_page
+        # 找到 settings page → Monitors tab 的 layout
+        try:
+            tabs = None
+            sl = self.settings_page.layout()
+            if sl is not None:
+                for i in range(sl.count()):
+                    item = sl.itemAt(i)
+                    if item and item.widget() and isinstance(item.widget(), QtWidgets.QTabWidget):
+                        tabs = item.widget()
+                        break
+            if tabs is None:
+                return
+            mon_scroll = tabs.widget(1)  # Monitors tab index = 1
+            if mon_scroll is None:
+                return
+            mon_container = mon_scroll.widget()
+            if mon_container is None:
+                return
+            mon_layout = mon_container.layout()
+            if mon_layout is None:
+                return
 
-        # 重建 main page
-        new_main = self.build_main_page()
-        # 重建 settings page
-        new_settings = self.build_settings_page()
-        new_settings.setMinimumWidth(600)
+            # 移除舊的 range widget + 「未偵測到」label
+            for i in reversed(range(mon_layout.count())):
+                item = mon_layout.itemAt(i)
+                if item is None:
+                    continue
+                w = item.widget()
+                if w is None:
+                    continue
+                if isinstance(w, MonitorRangeWidget):
+                    mon_layout.removeWidget(w)
+                elif isinstance(w, QtWidgets.QLabel) and "未偵測" in w.text():
+                    mon_layout.removeWidget(w)
 
-        # 在 stack 中替換兩頁
-        self.stack.removeWidget(self.main_page)
-        self.stack.removeWidget(self.settings_page)
-        if self.main_page is not None:
-            self.main_page.deleteLater()
-        if self.settings_page is not None:
-            self.settings_page.deleteLater()
-        self.main_page = new_main
-        self.settings_page = new_settings
-        self.stack.addWidget(self.main_page)
-        self.stack.addWidget(self.settings_page)
+            # 插入新 range widget（在 auto_group 之後、stretch 之前）
+            insert_idx = mon_layout.count()
+            for i in range(mon_layout.count()):
+                item = mon_layout.itemAt(i)
+                if item and item.spacerItem() is not None:
+                    insert_idx = i
+                    break
 
-        # 恢復頁面
-        self.stack.setCurrentWidget(self.settings_page if showing_settings else self.main_page)
+            for wrapper, widget in zip(self.monitor_wrappers, self.monitor_widgets):
+                if isinstance(wrapper, RemoteMonitorWrapper):
+                    continue
+                rw = MonitorRangeWidget(wrapper)
+                rw.ranges_changed.connect(widget.set_ranges)
+                rw.ranges_changed.connect(lambda _b, _c: self.trigger_save())
+                rw.ranges_changed.connect(lambda _b, _c: self._update_analyzer_levels())
+                self.monitor_range_widgets.append(rw)
+                mon_layout.insertWidget(insert_idx, rw)
+                insert_idx += 1
+        except Exception:
+            pass
 
     def _restore_shortcut_rows(self):
         """重建 settings page 後，從 self.level_shortcuts 重新填入快捷鍵行。
