@@ -3421,6 +3421,13 @@ class MainWindow(QtWidgets.QWidget):
                 widget = next((w for w in self._remote_widgets if w.monitor is existing), None)
                 if widget:
                     self._sync_remote_widget(widget, existing)
+                else:
+                    # wrapper 存在但 widget 已被重建刪除 → 重新建立
+                    widget = MonitorWidget(existing, self.threadpool)
+                    self._sync_remote_widget(widget, existing)
+                    widget.value_changed.connect(self._on_remote_monitor_link_changed)
+                    self._remote_widgets.append(widget)
+                    self.remote_servers_map[key] = widget
             else:
                 wrapper = RemoteMonitorWrapper(data, srv)
                 self._remote_wrappers.append(wrapper)
