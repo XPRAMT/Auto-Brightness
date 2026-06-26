@@ -2635,12 +2635,9 @@ class MainWindow(QtWidgets.QWidget):
         self.show_main_page()
         # 立即啟動畫面分析器（使用 inline 偵測到的螢幕）
         self._init_screen_analyzers()
-        # 背景補充偵測：若沒抓到可用螢幕，3 秒後完整重試
+        # 若沒抓到可用螢幕，3 秒後完整重試（背景重試仍會載入設定）
         if not self._has_available_local_monitor():
             QtCore.QTimer.singleShot(3000, self.refresh_monitors)
-        else:
-            # 有抓到螢幕但仍做一次背景更新（取得更準確的 VCP 資訊）
-            QtCore.QTimer.singleShot(5000, self.refresh_monitors)
 
     def _has_available_local_monitor(self):
         return any(
@@ -3085,6 +3082,9 @@ class MainWindow(QtWidgets.QWidget):
         self._refresh_in_progress = True
         print("===== 重新偵測螢幕（完整重建） =====")
 
+        # ── 第 0 步：先存檔，確保使用者的最新設定不會遺失 ──
+        self.save_settings()
+
         # ── 第 1 步：停止所有分析器（主執行緒安全） ──
         self._for_each_screen_analyzer(lambda a: a.stop())
         self.screen_analyzers = []
@@ -3248,6 +3248,9 @@ class MainWindow(QtWidgets.QWidget):
                         pass
 
             # 同步到 MonitorRangeWidget（按名稱比對，而非物件 identity）
+            # 同時更新 rw.monitor 指向新的 wrapper，確保後續使用者修改寫入正確物件
+            name_to_wrapper = {w.name: w for w in self.monitor_wrappers
+                               if not isinstance(w, RemoteMonitorWrapper)}
             for rw in self.monitor_range_widgets:
                 try:
                     name = rw.monitor.name if hasattr(rw, "monitor") else ""
@@ -3259,6 +3262,9 @@ class MainWindow(QtWidgets.QWidget):
                         rw.set_ranges(b_range, c_range, emit_signal=False)
                     except RuntimeError:
                         pass
+                    # 更新 rw.monitor 指向新 wrapper（若名稱相符）
+                    if name in name_to_wrapper and rw.monitor is not name_to_wrapper[name]:
+                        rw.monitor = name_to_wrapper[name]
         except Exception:
             pass
 
