@@ -1015,9 +1015,10 @@ class MonitorWidget(QtWidgets.QGroupBox):
     value_changed = QtCore.pyqtSignal(int)
 
     def __init__(self, monitor_wrapper, threadpool):
-        # 遠端螢幕顯示「IP - 螢幕名稱」作為唯一辨識
-        if isinstance(monitor_wrapper, RemoteMonitorWrapper) and monitor_wrapper._remote_address:
-            display_title = f"{monitor_wrapper._remote_address} - {monitor_wrapper.name}"
+        # 遠端螢幕顯示「伺服器名: 螢幕名稱」
+        if isinstance(monitor_wrapper, RemoteMonitorWrapper):
+            srv_name = getattr(monitor_wrapper, "_server_name", "")
+            display_title = f"{srv_name}: {monitor_wrapper.name}"
         else:
             display_title = monitor_wrapper.name
         super().__init__(display_title)
@@ -1195,8 +1196,9 @@ class MonitorRangeWidget(QtWidgets.QGroupBox):
     ranges_changed = QtCore.pyqtSignal(list, list)
 
     def __init__(self, monitor_wrapper):
-        if isinstance(monitor_wrapper, RemoteMonitorWrapper) and monitor_wrapper._remote_address:
-            display = f"{monitor_wrapper._remote_address} - {monitor_wrapper.name} Settings"
+        if isinstance(monitor_wrapper, RemoteMonitorWrapper):
+            srv_name = getattr(monitor_wrapper, "_server_name", "")
+            display = f"{srv_name}: {monitor_wrapper.name} Settings"
         else:
             display = f"{monitor_wrapper.name} Settings"
         super().__init__(display)
