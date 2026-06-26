@@ -3152,6 +3152,8 @@ class MainWindow(QtWidgets.QWidget):
 
         # ── 重建 UI（兩頁都重建，所有 widget 建構時自動讀取 wrapper 範圍） ──
         self._rebuild_all_ui()
+        # 重建後恢復快捷鍵 UI（與 init 流程一致）
+        self._restore_shortcut_rows()
 
         # ── 重建完成後，重新插入遠端螢幕 widgets ──
         self._reinsert_remote_widgets()
@@ -3221,6 +3223,19 @@ class MainWindow(QtWidgets.QWidget):
 
         # 恢復頁面
         self.stack.setCurrentWidget(self.settings_page if showing_settings else self.main_page)
+
+    def _restore_shortcut_rows(self):
+        """重建 settings page 後，從 self.level_shortcuts 重新填入快捷鍵行。
+        兩條路徑（init / refresh）共用。"""
+        # 清除新 layout 中由 build_settings_page 建立的空預設行
+        self.clear_shortcut_rows()
+        items = list(self.level_shortcuts) or []
+        if not items:
+            items = [dict(item) for item in DEFAULT_LEVEL_SHORTCUTS]
+        for shortcut_item in items:
+            self.add_shortcut_row(shortcut_item)
+        self.level_shortcuts = self.get_level_shortcuts()
+        self.apply_level_shortcuts_to_hook()
 
     def _reload_monitor_ranges_from_settings(self):
         """從設定檔載入儲存的監視器範圍到 wrapper（widget 在建構時已自動讀取）。"""
@@ -4252,14 +4267,9 @@ class MainWindow(QtWidgets.QWidget):
             self.shortcut_key1, self.shortcut_key2, self.shortcut_key3 = saved_trigger_keys
             self.apply_shortcut_to_hook()
 
-            self.clear_shortcut_rows()
-            for shortcut_item in saved_level_shortcuts:
-                self.add_shortcut_row(shortcut_item)
-            if not self.shortcut_rows:
-                for shortcut_item in DEFAULT_LEVEL_SHORTCUTS:
-                    self.add_shortcut_row(shortcut_item)
-            self.level_shortcuts = self.get_level_shortcuts()
-            self.apply_level_shortcuts_to_hook()
+            # 載入快捷鍵（共用方法，與 refresh 路徑一致）
+            self.level_shortcuts = [dict(item) for item in saved_level_shortcuts]
+            self._restore_shortcut_rows()
 
             self.autostart_checkbox.blockSignals(True)
             self.autostart_checkbox.setChecked(bool(saved_auto_start))
