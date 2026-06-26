@@ -113,6 +113,152 @@ class MONITORINFOEXW(ctypes.Structure):
     ]
 
 
+# =========================
+# 熱插拔監聽器 + 背景偵測 + DDC 逾時包裝
+# =========================
+
+class _MonitorHotplugWatcher(QtCore.QObject):
+    """背景執行緒監聽 WMI 螢幕熱插拔事件，偵測到變動時通知 UI 執行緒重新掃描。
+    若 WMI 不可用（非 Windows / 權限不足），則降級為定時輪詢（timer）模式。"""
+    monitors_changed = QtCore.pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._running = False
+        self._thread: threading.Thread | None = None
+        self._poll_timer: QtCore.QTimer | None = None
+
+    def start(self, poll_interval_ms: int = 5000):
+        if self._running:
+            return
+        self._running = True
+        # 先用 WMI 事件監聽（非阻塞背景執行緒）
+        if sys.platform == "win32":
+            try:
+                self._thread = threading.Thread(target=self._wmi_event_loop, daemon=True, name="WMIHotplug")
+                self._thread.start()
+                return  # WMI 成功啟動，不再需要 timer
+            except Exception:
+                pass  # WMI 失敗則降級到 timer
+        # 降級：用 QTimer 定期輪詢
+        self._poll_timer = QtCore.QTimer(self)
+        self._poll_timer.timeout.connect(self.monitors_changed.emit)
+        self._poll_timer.start(poll_interval_ms)
+
+    def stop(self):
+        self._running = False
+        if self._poll_timer:
+            self._poll_timer.stop()
+            self._poll_timer = None
+
+    def _wmi_event_loop(self):
+        """在背景執行緒監聽 WMI 熱插拔事件（Win32_DesktopMonitor 的建立/刪除）。"""
+        try:
+            import wmi as wmi_mod
+            wmi_conn = wmi_mod.WMI()
+            watch_creation = wmi_conn.watch_for(
+                notification_type="Creation",
+                wmi_class="Win32_DesktopMonitor",
+                delay_secs=1,
+            )
+            watch_deletion = wmi_conn.watch_for(
+                notification_type="Deletion",
+                wmi_class="Win32_DesktopMonitor",
+                delay_secs=1,
+            )
+            from collections import deque
+            watches = deque([watch_creation, watch_deletion])
+            while self._running and watches:
+                watcher = watches.popleft()
+                try:
+                    watcher(timeout_ms=2000)
+                    if self._running:
+                        self.monitors_changed.emit()
+                except wmi_mod.x_wmi_timed_out:
+                    pass
+                except Exception:
+                    pass
+                if self._running:
+                    watches.append(watcher)
+        except Exception:
+            # WMI 事件監聽失敗（權限不足等），不做任何事（主執行緒會用 timer 降級）
+            pass
+
+
+def _run_ddc_with_timeout(func, timeout_sec: float = 3.0, default=None):
+    """在獨立執行緒執行 DDC 操作，若逾時則返回 default 值。避免卡死的螢幕凍結 UI。"""
+    result = [default]
+    exception = [None]
+    event = threading.Event()
+
+    def worker():
+        try:
+            result[0] = func()
+        except Exception as e:
+            exception[0] = e
+        finally:
+            event.set()
+
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+    t.join(timeout_sec)
+    if t.is_alive():
+        print(f"[DDC] Timeout ({timeout_sec}s) — monitor may be disconnected")
+        return default
+    if exception[0]:
+        raise exception[0]
+    return result[0]
+
+
+class _MonitorDetectWorker(QtCore.QObject):
+    """背景執行螢幕偵測（get_monitors + MonitorWrapper 建立），
+    避免卡死的 DDC 操作阻塞 UI 執行緒。結果透過 signals 回傳。"""
+    detection_finished = QtCore.pyqtSignal(list, list)
+    # (wrappers: list[MonitorWrapper|None], detected_names: list[str])
+
+    def __init__(self):
+        super().__init__()
+        self._timeout = 5.0
+
+    def run_detection(self):
+        """在背景執行緒呼叫 — 由 QThread pool 執行。"""
+        try:
+            monitors = _run_ddc_with_timeout(
+                lambda: list(get_monitors()),
+                timeout_sec=self._timeout,
+                default=[],
+            )
+        except Exception:
+            monitors = []
+
+        wrappers = []
+        detected_names = []
+        for i, m in enumerate(monitors):
+            try:
+                w = MonitorWrapper(m, i)
+                w.available = w.supported
+                wrappers.append(w)
+                if w.supported:
+                    detected_names.append(w.name)
+            except Exception as e:
+                print(f"Monitor detection error for index {i}: {e}")
+                wrappers.append(None)
+
+        self.detection_finished.emit(wrappers, detected_names)
+
+    def run_quick_count(self):
+        """僅快速取得螢幕數量（比完整偵測輕量，但有逾時保護）。"""
+        try:
+            count = _run_ddc_with_timeout(
+                lambda: len(list(get_monitors())),
+                timeout_sec=2.0,
+                default=-1,
+            )
+        except Exception:
+            count = -1
+        self.detection_finished.emit([count], [])
+
+
 def _rect_to_tuple(rect):
     return (int(rect.left), int(rect.top), int(rect.right), int(rect.bottom))
 
@@ -817,15 +963,22 @@ class MonitorWrapper:
         contrast = None
         try:
             with self.lock:
-                with self.monitor as m:
-                    try:
-                        brightness = int(m.get_luminance())
-                    except Exception:
-                        brightness = None
-                    try:
-                        contrast = int(m.get_contrast())
-                    except Exception:
-                        contrast = None
+                def _read():
+                    with self.monitor as m:
+                        b = None
+                        c = None
+                        try:
+                            b = int(m.get_luminance())
+                        except Exception:
+                            b = None
+                        try:
+                            c = int(m.get_contrast())
+                        except Exception:
+                            c = None
+                        return b, c
+                brightness, contrast = _run_ddc_with_timeout(
+                    _read, timeout_sec=3.0, default=(None, None)
+                )
         except Exception:
             pass
 
@@ -2292,7 +2445,27 @@ class MainWindow(QtWidgets.QWidget):
         self._remote_widgets = []   # 遠端螢幕的 MonitorWidget
         self._remote_monitor_data = []  # 原始資料（用於 remote_set）
 
-        wrappers = [MonitorWrapper(m, i) for i, m in enumerate(get_monitors())]
+        # 初始螢幕偵測（使用逾時保護，避免卡死 UI）
+        try:
+            detected_monitors = _run_ddc_with_timeout(
+                lambda: list(get_monitors()),
+                timeout_sec=5.0,
+                default=[],
+            )
+        except Exception:
+            detected_monitors = []
+        wrappers = []
+        for i, m in enumerate(detected_monitors):
+            try:
+                w = _run_ddc_with_timeout(
+                    lambda m=m, i=i: MonitorWrapper(m, i),
+                    timeout_sec=3.0,
+                    default=None,
+                )
+                if w is not None:
+                    wrappers.append(w)
+            except Exception:
+                pass
         self.monitor_wrappers = []
         for w in wrappers:
             if not w.supported:
@@ -2301,7 +2474,7 @@ class MainWindow(QtWidgets.QWidget):
 
         self._init_screen_analyzers()
         self._known_monitor_names = sorted(w.name for w in self.monitor_wrappers)
-        self._prev_raw_monitor_count = len(list(get_monitors()))
+        self._prev_raw_monitor_count = len(detected_monitors)
 
         # 無支援螢幕時，從設定檔恢復已知螢幕（保持 UI 顯示但灰階）
         if not self.monitor_wrappers:
@@ -2317,10 +2490,10 @@ class MainWindow(QtWidgets.QWidget):
         self.save_timer.setSingleShot(True)
         self.save_timer.timeout.connect(self.save_settings)
 
-        # 定時偵測螢幕熱插拔（每 10 秒輕量檢查一次）
-        self._monitor_watch_timer = QtCore.QTimer()
-        self._monitor_watch_timer.timeout.connect(self._check_monitors_changed)
-        self._monitor_watch_timer.start(10000)
+        # 熱插拔偵測（優先使用 WMI 事件監聽，降級到 5 秒輪詢）
+        self._hotplug_watcher = _MonitorHotplugWatcher(self)
+        self._hotplug_watcher.monitors_changed.connect(self._on_hotplug_event)
+        self._hotplug_watcher.start(poll_interval_ms=5000)
 
         root_layout = QtWidgets.QVBoxLayout()
         root_layout.setContentsMargins(10, 10, 10, 10)
@@ -2541,17 +2714,110 @@ class MainWindow(QtWidgets.QWidget):
                 wrapper = self.monitor_wrappers[idx] if idx < len(self.monitor_wrappers) else None
                 analyzer.enabled = self.auto_adjust_enabled and bool(getattr(wrapper, "available", False))
 
-    def _check_monitors_changed(self):
-        """輕量檢查螢幕數量是否變化，變化時更新可用狀態"""
-        if self._loading_settings:
+    def _on_hotplug_event(self):
+        """收到熱插拔事件或 timer 觸發時，在背景執行緒重新偵測螢幕。"""
+        if self._loading_settings or self._is_quitting:
             return
+        # 輕量檢查：若數量沒變則跳過完整偵測
         try:
-            current_count = len(list(get_monitors()))
+            current_count = _run_ddc_with_timeout(
+                lambda: len(list(get_monitors())),
+                timeout_sec=2.0,
+                default=-1,
+            )
         except Exception:
+            current_count = -1
+        if current_count >= 0 and current_count != self._prev_raw_monitor_count:
+            print(f"Monitor count changed: {self._prev_raw_monitor_count} → {current_count}")
+            self._start_background_detection()
+        elif current_count < 0:
+            # 偵測失敗（可能所有螢幕都斷線），重試完整偵測
+            self._start_background_detection()
+
+    def _start_background_detection(self):
+        """在背景執行緒完整偵測螢幕，結果回來後更新 UI。"""
+        self._detect_worker = _MonitorDetectWorker()
+        self._detect_worker.detection_finished.connect(self._on_detection_results)
+        thread = QtCore.QThread(self)
+        self._detect_worker.moveToThread(thread)
+        thread.started.connect(self._detect_worker.run_detection)
+        thread.finished.connect(thread.deleteLater)
+        thread.start()
+        # 儲存 thread 參考以便在完成時清理
+        self._detect_thread = thread
+
+    def _on_detection_results(self, wrappers, detected_names):
+        """背景偵測完成後，更新螢幕狀態（在主執行緒執行）。"""
+        # 清理 thread
+        if hasattr(self, "_detect_thread") and self._detect_thread is not None:
+            self._detect_thread.quit()
+            self._detect_thread = None
+        self._detect_worker = None
+
+        if wrappers is None:
             return
-        if current_count != self._prev_raw_monitor_count:
-            print(f"Monitor raw count changed: {self._prev_raw_monitor_count} → {current_count}")
-            self._update_monitor_availability()
+
+        # 過濾出成功的 wrapper
+        detected_wrappers = {}
+        for w in wrappers:
+            if w is not None and w.supported:
+                detected_wrappers[w.name] = w
+
+        local_wrappers = [w for w in self.monitor_wrappers if not isinstance(w, RemoteMonitorWrapper)]
+        remote_wrappers = [w for w in self.monitor_wrappers if isinstance(w, RemoteMonitorWrapper)]
+        current_names = {w.name for w in local_wrappers}
+        changed = False
+
+        # 新增：完全新的螢幕
+        for name, detected in detected_wrappers.items():
+            if name not in current_names:
+                w = detected
+                w.index = len(local_wrappers)
+                w.available = True
+                local_wrappers.append(w)
+                print(f"Monitor added: {name}")
+                changed = True
+
+        # 更新：現有螢幕的可用/不可用狀態
+        for idx, w in enumerate(local_wrappers):
+            detected = detected_wrappers.get(w.name)
+            if detected is not None:
+                was_unavailable = not w.available
+                preserved_b_range = list(w.brightness_range)
+                preserved_c_range = list(w.contrast_range)
+                w.monitor = detected.monitor
+                w.lock = detected.lock
+                w.index = idx
+                w.supported = detected.supported
+                w.brightness_supported = detected.brightness_supported
+                w.contrast_supported = detected.contrast_supported
+                w.wmi_supported = detected.wmi_supported
+                if preserved_b_range:
+                    w.brightness_range = preserved_b_range
+                if preserved_c_range:
+                    w.contrast_range = preserved_c_range
+                w.available = True
+                if was_unavailable:
+                    print(f"Monitor became available: {w.name}")
+                    changed = True
+            else:
+                if w.available:
+                    print(f"Monitor became unavailable: {w.name}")
+                    changed = True
+                w.available = False
+                w.monitor = None
+
+        if not changed:
+            return
+
+        self.monitor_wrappers = local_wrappers + remote_wrappers
+        self._known_monitor_names = sorted(w.name for w in local_wrappers)
+        self._prev_raw_monitor_count = len(detected_wrappers)
+
+        self._sync_local_monitor_widgets()
+        self.sync_ui_with_current_monitor_levels()
+        self.refresh_tray_display()
+        self._init_screen_analyzers()
 
     def build_main_page(self):
         page = QtWidgets.QWidget()
@@ -2868,9 +3134,8 @@ class MainWindow(QtWidgets.QWidget):
         self.activateWindow()
 
     def refresh_monitors(self):
-        """重新偵測螢幕按鈕：更新可用狀態，保留所有已知螢幕"""
-        self._update_monitor_availability()
-        self._update_analyzer_levels()
+        """重新偵測螢幕按鈕：在背景執行完整偵測，避免卡死 UI。"""
+        self._start_background_detection()
         self.trigger_save()
 
     # ---- 網路功能 ----
@@ -3700,6 +3965,11 @@ class MainWindow(QtWidgets.QWidget):
         self.save_settings()
         if self.global_hook is not None:
             self.global_hook.stop()
+        if hasattr(self, "_hotplug_watcher"):
+            self._hotplug_watcher.stop()
+        if hasattr(self, "_detect_thread") and self._detect_thread is not None:
+            self._detect_thread.quit()
+            self._detect_thread = None
         self._for_each_screen_analyzer(lambda analyzer: analyzer.stop())
         self._net_server.stop()
         self._net_client.stop()
