@@ -1015,10 +1015,9 @@ class MonitorWidget(QtWidgets.QGroupBox):
     value_changed = QtCore.pyqtSignal(int)
 
     def __init__(self, monitor_wrapper, threadpool):
-        # 遠端螢幕顯示「伺服器名: 螢幕名稱」
         if isinstance(monitor_wrapper, RemoteMonitorWrapper):
-            srv_name = getattr(monitor_wrapper, "_server_name", "")
-            display_title = f"{srv_name}: {monitor_wrapper.name}"
+            host = getattr(monitor_wrapper, "_server_hostname", "")
+            display_title = f"{host}: {monitor_wrapper.name}"
         else:
             display_title = monitor_wrapper.name
         super().__init__(display_title)
@@ -1197,8 +1196,8 @@ class MonitorRangeWidget(QtWidgets.QGroupBox):
 
     def __init__(self, monitor_wrapper):
         if isinstance(monitor_wrapper, RemoteMonitorWrapper):
-            srv_name = getattr(monitor_wrapper, "_server_name", "")
-            display = f"{srv_name}: {monitor_wrapper.name} Settings"
+            host = getattr(monitor_wrapper, "_server_hostname", "")
+            display = f"{host}: {monitor_wrapper.name} Settings"
         else:
             display = f"{monitor_wrapper.name} Settings"
         super().__init__(display)
@@ -2514,7 +2513,7 @@ class RemoteMonitorWrapper:
     def __init__(self, data, server_name):
         self.name = data.get("name", f"Remote {server_name}")
         self._server_name = server_name
-        self._remote_address = data.get("_remote_address", "").strip()
+        self._server_hostname = data.get("_remote_server", server_name)
         self.brightness_range = list(data.get("brightness_range", [0, 100]))
         self.contrast_range = list(data.get("contrast_range", [0, 100]))
         self.brightness_supported = data.get("brightness_supported", True)
