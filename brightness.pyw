@@ -1015,7 +1015,12 @@ class MonitorWidget(QtWidgets.QGroupBox):
     value_changed = QtCore.pyqtSignal(int)
 
     def __init__(self, monitor_wrapper, threadpool):
-        super().__init__(monitor_wrapper.name)
+        # 遠端螢幕顯示「IP - 螢幕名稱」作為唯一辨識
+        if isinstance(monitor_wrapper, RemoteMonitorWrapper) and monitor_wrapper._remote_address:
+            display_title = f"{monitor_wrapper._remote_address} - {monitor_wrapper.name}"
+        else:
+            display_title = monitor_wrapper.name
+        super().__init__(display_title)
 
         self.monitor = monitor_wrapper
         self.threadpool = threadpool
@@ -1190,7 +1195,11 @@ class MonitorRangeWidget(QtWidgets.QGroupBox):
     ranges_changed = QtCore.pyqtSignal(list, list)
 
     def __init__(self, monitor_wrapper):
-        super().__init__(f"{monitor_wrapper.name} Settings")
+        if isinstance(monitor_wrapper, RemoteMonitorWrapper) and monitor_wrapper._remote_address:
+            display = f"{monitor_wrapper._remote_address} - {monitor_wrapper.name} Settings"
+        else:
+            display = f"{monitor_wrapper.name} Settings"
+        super().__init__(display)
         self.monitor = monitor_wrapper
 
         layout = QtWidgets.QGridLayout()
@@ -2501,13 +2510,9 @@ class _RefreshDetectWorker(QtCore.QObject):
 class RemoteMonitorWrapper:
     """遠端螢幕的 MonitorWrapper 等價物件（唯讀/可遠端設定）。"""
     def __init__(self, data, server_name):
-        addr = data.get("_remote_address", "").strip()
-        base_name = data.get("name", "Remote")
-        if addr:
-            self.name = f"{addr} - {base_name}"
-        else:
-            self.name = f"{server_name} - {base_name}"
+        self.name = data.get("name", f"Remote {server_name}")
         self._server_name = server_name
+        self._remote_address = data.get("_remote_address", "").strip()
         self.brightness_range = list(data.get("brightness_range", [0, 100]))
         self.contrast_range = list(data.get("contrast_range", [0, 100]))
         self.brightness_supported = data.get("brightness_supported", True)
