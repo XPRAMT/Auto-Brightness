@@ -1501,6 +1501,28 @@ class _CaptureThread(QtCore.QThread):
         self.use_vapoursynth = bool(VAPOURSYNTH_SCRIPT_PATH)
 
     @classmethod
+    def initialize_dxgi(cls) -> list:
+        """初始化 DXGI 工廠並回傳可用 targets（供 _init_screen_analyzers 等共用）。
+        若 dxcam 不可用或初始化失敗則回傳 []. 同時重置信號狀態。"""
+        cls._dxgi_disabled = False
+        try:
+            # 確保 factory 被初始化（dxcam.create 會設定 __factory）
+            if getattr(dxcam, "__factory", None) is None:
+                cls._get_dxgi_camera(0, 0)
+            return get_dxgi_display_targets()
+        except Exception as e:
+            print(f"DXGI init error: {e}")
+            cls._dxgi_disabled = True
+            return []
+
+    @classmethod
+    def reset_dxgi(cls):
+        """完全重設 DXGI 狀態（釋放所有 camera，清除快取）。"""
+        with cls._dxgi_lock:
+            cls._dxgi_cameras = {}
+            cls._dxgi_disabled = False
+
+    @classmethod
     def _get_dxgi_camera(cls, device_idx=0, output_idx=0):
         if cls._dxgi_disabled:
             return None
@@ -2611,9 +2633,14 @@ class MainWindow(QtWidgets.QWidget):
 
         self.load_settings()
         self.show_main_page()
-        # 若初始偵測沒找到任何可用螢幕，3 秒後重試
+        # 立即啟動畫面分析器（使用 inline 偵測到的螢幕）
+        self._init_screen_analyzers()
+        # 背景補充偵測：若沒抓到可用螢幕，3 秒後完整重試
         if not self._has_available_local_monitor():
             QtCore.QTimer.singleShot(3000, self.refresh_monitors)
+        else:
+            # 有抓到螢幕但仍做一次背景更新（取得更準確的 VCP 資訊）
+            QtCore.QTimer.singleShot(5000, self.refresh_monitors)
 
     def _has_available_local_monitor(self):
         return any(
@@ -3115,7 +3142,8 @@ class MainWindow(QtWidgets.QWidget):
         # ── 重新載入設定中的範圍 ──
         self._reload_monitor_ranges_from_settings()
 
-        # ── 重新初始化分析器 ──
+        # ── 重新初始化分析器（先重設 DXGI 狀態） ──
+        _CaptureThread.reset_dxgi()
         self._init_screen_analyzers()
         self._sync_screen_analyzer_enabled()
 
