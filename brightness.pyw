@@ -2199,9 +2199,17 @@ class NetworkMonitorClient(QtCore.QObject):
         all_monitors = []
         for srv_name, entry in self._discovered_servers.items():
             hostname = entry["info"].properties.get(b"hostname", srv_name).decode()
+            addr = ""
+            try:
+                addrs = entry["info"].parsed_addresses()
+                if addrs:
+                    addr = addrs[0]
+            except Exception:
+                pass
             for mon in entry.get("monitors", []):
                 mon["_remote_server"] = hostname
                 mon["_remote_name"] = srv_name
+                mon["_remote_address"] = addr
                 all_monitors.append(mon)
         self.remote_monitors_updated.emit(all_monitors)
 
@@ -2493,7 +2501,12 @@ class _RefreshDetectWorker(QtCore.QObject):
 class RemoteMonitorWrapper:
     """遠端螢幕的 MonitorWrapper 等價物件（唯讀/可遠端設定）。"""
     def __init__(self, data, server_name):
-        self.name = data.get("name", f"Remote {server_name}")
+        addr = data.get("_remote_address", "").strip()
+        base_name = data.get("name", "Remote")
+        if addr:
+            self.name = f"{addr} - {base_name}"
+        else:
+            self.name = f"{server_name} - {base_name}"
         self._server_name = server_name
         self.brightness_range = list(data.get("brightness_range", [0, 100]))
         self.contrast_range = list(data.get("contrast_range", [0, 100]))
@@ -3198,7 +3211,7 @@ class MainWindow(QtWidgets.QWidget):
     def _rebuild_monitor_widgets(self):
         """重建 container 內的螢幕 widget（含遠端）。
         容器本身在 layout 中位置固定，內部變化不觸發外層 reflow。"""
-        # 清理遠端相關
+        # 清理遠端 widget（C++ 物件 + 列表）
         if hasattr(self, "_remote_separator") and self._remote_separator is not None:
             try:
                 self.monitor_container_layout.removeWidget(self._remote_separator)
@@ -3209,8 +3222,10 @@ class MainWindow(QtWidgets.QWidget):
         for w in list(self._remote_widgets):
             try:
                 self.monitor_container_layout.removeWidget(w)
+                w.deleteLater()
             except Exception:
                 pass
+        self._remote_widgets.clear()
 
         # 清理舊的 local widget
         for w in list(self.monitor_widgets):
@@ -3587,12 +3602,12 @@ class MainWindow(QtWidgets.QWidget):
         for w in self._remote_wrappers:
             if w in self.monitor_wrappers:
                 self.monitor_wrappers.remove(w)
+        self._remove_remote_from_container()
         for widget in self._remote_widgets:
             widget.deleteLater()
         self._remote_wrappers.clear()
         self._remote_widgets.clear()
         self.remote_servers_map.clear()
-        self._remove_remote_from_container()
 
     def _remove_remote_from_container(self):
         """從 container 移除遠端 widget 與分隔線。"""
