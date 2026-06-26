@@ -3070,19 +3070,23 @@ class MainWindow(QtWidgets.QWidget):
 
         self._prev_raw_monitor_count = detected_count
 
-        # ── 合併當前的遠端 wrappers（live，網路功能會即時更新此列表） ──
-        current_remotes = list(self._remote_wrappers) if hasattr(self, "_remote_wrappers") else []
-        self.monitor_wrappers = fresh_wrappers + current_remotes
+        # ── 組合 wrappers（先 local，遠端由 _reinsert_remote_widgets 獨立處理） ──
+        self.monitor_wrappers = list(fresh_wrappers)
 
         self._known_monitor_names = sorted(
             w.name for w in self.monitor_wrappers
-            if not isinstance(w, RemoteMonitorWrapper) and _is_valid_monitor_name(w.name)
+            if _is_valid_monitor_name(w.name)
         )
 
-        print(f"  完成: {len(fresh_wrappers)} 台可用螢幕, {len(current_remotes)} 台遠端")
+        print(f"  完成: {len(fresh_wrappers)} 台可用螢幕, {len(self._remote_wrappers)} 台遠端")
 
-        # ── 重建 UI ──
+        # ── 重建 UI（build_main_page 只看到 local wrappers） ──
         self._rebuild_monitor_ui_after_rescan()
+
+        # ── 重建完成後，重新插入遠端螢幕 widgets ──
+        self._reinsert_remote_widgets()
+        # 合併遠端 wrappers 到主列表
+        self.monitor_wrappers.extend(self._remote_wrappers)
 
         # ── 重新載入設定中的範圍 ──
         self._reload_monitor_ranges_from_settings()
@@ -3104,16 +3108,24 @@ class MainWindow(QtWidgets.QWidget):
         print("===== 重新偵測完成 =====")
 
     def _rebuild_monitor_ui_after_rescan(self):
-        """完全重建 main page（呼叫 build_main_page），保留 settings page。"""
-        # 清理舊的 monitor widgets 列表
+        """完全重建 main page（呼叫 build_main_page），保留 settings page。
+        保留 remote wrappers（純 Python 物件），只清除已刪除的 C++ widget。"""
+        # 清理舊的 local monitor widgets
         for w in list(self.monitor_widgets):
             try:
                 w.deleteLater()
             except Exception:
                 pass
         self.monitor_widgets.clear()
-        # 注意：monitor_range_widgets 屬於 settings page，此處不清除
-        #（下次使用者開啟 settings 頁面時，若需要完整重建可重啟程式）
+
+        # 清理舊的遠端 widget（C++ 物件已隨舊 main_page 刪除），但保留 wrapper 資料
+        for w in list(self._remote_widgets):
+            try:
+                w.deleteLater()
+            except Exception:
+                pass
+        self._remote_widgets.clear()
+        self.remote_servers_map.clear()
 
         # 記錄當前頁面
         showing_settings = self.stack.currentWidget() is self.settings_page
@@ -3242,14 +3254,18 @@ class MainWindow(QtWidgets.QWidget):
         self.refresh_tray_display()
 
     def _sync_remote_widget(self, widget, wrapper):
-        brightness, contrast = wrapper.read_current_levels()
-        if brightness is None:
-            brightness = widget.b_slider.slider.value()
-        if contrast is None:
-            contrast = 0 if not wrapper.contrast_supported else widget.c_slider.slider.value()
-        widget.sync_sliders(brightness, contrast)
-        link_value = link_value_from_levels(wrapper, brightness, contrast)
-        set_slider_object_value(widget.link_slider, link_value)
+        try:
+            brightness, contrast = wrapper.read_current_levels()
+            if brightness is None:
+                brightness = widget.b_slider.slider.value()
+            if contrast is None:
+                contrast = 0 if not wrapper.contrast_supported else widget.c_slider.slider.value()
+            widget.sync_sliders(brightness, contrast)
+            link_value = link_value_from_levels(wrapper, brightness, contrast)
+            set_slider_object_value(widget.link_slider, link_value)
+        except RuntimeError:
+            # widget 已被刪除（UI 重建後遺留的舊參考），跳過
+            pass
 
     def _broadcast_monitor_state_if_server_enabled(self):
         if not self._network_server_enabled or not getattr(self, "_net_server", None):
@@ -3354,6 +3370,17 @@ class MainWindow(QtWidgets.QWidget):
         self.refresh_tray_display()
         self.trigger_save()
         self._broadcast_monitor_state_if_server_enabled()
+
+    def _reinsert_remote_widgets(self):
+        """UI 重建後，從現有 remote wrappers 重新建立 remote widget 並插入 layout。"""
+        for wrapper in list(self._remote_wrappers):
+            key = (wrapper._server_name, wrapper.name)
+            widget = MonitorWidget(wrapper, self.threadpool)
+            self._sync_remote_widget(widget, wrapper)
+            widget.value_changed.connect(self._on_remote_monitor_link_changed)
+            self._remote_widgets.append(widget)
+            self.remote_servers_map[key] = widget
+        self._rebuild_remote_widgets()
 
     def _clear_remote_wrappers(self):
         for w in self._remote_wrappers:
