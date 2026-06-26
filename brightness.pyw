@@ -916,6 +916,8 @@ class MonitorWrapper:
         self.available = monitor is not None
         self.wmi_supported = _wmi_brightness_supported()
         self.name = name or f"Display {index + 1}"
+        self._cached_brightness: int | None = None
+        self._cached_contrast: int | None = None
 
         if monitor is None:
             # 如果傳入了名稱但無效，使用預設
@@ -936,12 +938,14 @@ class MonitorWrapper:
                     self.contrast_supported = 0x12 in supported_vcp
 
                 try:
-                    int(monitor.get_luminance())
+                    val = int(monitor.get_luminance())
+                    self._cached_brightness = val
                     self.brightness_supported = True
                 except Exception:
                     pass
                 try:
-                    int(monitor.get_contrast())
+                    val = int(monitor.get_contrast())
+                    self._cached_contrast = val
                     self.contrast_supported = True
                 except Exception:
                     pass
@@ -986,6 +990,12 @@ class MonitorWrapper:
                 )
         except Exception:
             pass
+
+        # 若 DDC 讀取失敗，回退到建構時的快取值（跨執行緒場景特別有用）
+        if brightness is None:
+            brightness = self._cached_brightness
+        if contrast is None:
+            contrast = self._cached_contrast
 
         if brightness is None:
             brightness = _wmi_get_brightness()
@@ -3136,8 +3146,6 @@ class MainWindow(QtWidgets.QWidget):
 
         # ── 重建完成後，重新插入遠端螢幕 widgets ──
         self._reinsert_remote_widgets()
-        # 合併遠端 wrappers 到主列表
-        self.monitor_wrappers.extend(self._remote_wrappers)
 
         # ── 重新載入設定中的範圍 ──
         self._reload_monitor_ranges_from_settings()
@@ -3147,8 +3155,12 @@ class MainWindow(QtWidgets.QWidget):
         self._init_screen_analyzers()
         self._sync_screen_analyzer_enabled()
 
-        # ── 同步 UI 狀態 ──
+        # ── 同步 UI 狀態（必須在合併遠端 wrappers 之前，否則長度不匹配） ──
         self.sync_ui_with_current_monitor_levels()
+
+        # 合併遠端 wrappers 到主列表（供其他查詢用，不影響 UI 重建與同步）
+        self.monitor_wrappers.extend(self._remote_wrappers)
+
         self.refresh_tray_display()
         self.trigger_save()
 
