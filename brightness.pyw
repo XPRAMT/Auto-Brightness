@@ -1524,8 +1524,15 @@ class _CaptureThread(QtCore.QThread):
 
     @classmethod
     def reset_dxgi(cls):
-        """完全重設 DXGI 狀態（釋放所有 camera，清除快取）。"""
+        """完全重設 DXGI 狀態：停止 + 釋放所有 camera 並清除快取。"""
         with cls._dxgi_lock:
+            for key, cam in list(cls._dxgi_cameras.items()):
+                try:
+                    if cam.is_capturing:
+                        cam.stop()
+                    cam.release()
+                except Exception:
+                    pass
             cls._dxgi_cameras = {}
             cls._dxgi_disabled = False
 
@@ -2617,6 +2624,10 @@ class MainWindow(QtWidgets.QWidget):
         self._hotplug_watcher = _MonitorHotplugWatcher(self)
         self._hotplug_watcher.monitors_changed.connect(self._on_hotplug_event)
         self._hotplug_watcher.start(poll_interval_ms=5000)
+        # 熱插拔防彈跳：連續事件只在最後一次後等待 1.5 秒才觸發 refresh
+        self._hotplug_debounce_timer = QtCore.QTimer(self)
+        self._hotplug_debounce_timer.setSingleShot(True)
+        self._hotplug_debounce_timer.timeout.connect(self._do_hotplug_refresh)
 
         root_layout = QtWidgets.QVBoxLayout()
         root_layout.setContentsMargins(10, 10, 10, 10)
@@ -2682,11 +2693,15 @@ class MainWindow(QtWidgets.QWidget):
             pass
 
     def _on_hotplug_event(self):
-        """收到熱插拔事件或 WMI 通知時，執行完整重新偵測（等同 refresh_monitors）。
-        因為 refresh_monitors 有 _refresh_in_progress 防重複，可直接呼叫。"""
-        if self._loading_settings or self._is_quitting:
+        """收到熱插拔事件 → 重設計時器等待 1.5 秒，避免連環觸發。"""
+        if self._loading_settings or self._is_quitting or getattr(self, "_refresh_in_progress", False):
             return
-        # 先輕量檢查數量是否真正改變，避免頻繁重建 UI
+        self._hotplug_debounce_timer.start(1500)
+
+    def _do_hotplug_refresh(self):
+        """防彈跳計時器到期後，檢查螢幕數量是否改變並執行 refresh。"""
+        if self._is_quitting:
+            return
         try:
             current_count = _run_ddc_with_timeout(
                 lambda: len(list(get_monitors())),
@@ -4094,6 +4109,8 @@ class MainWindow(QtWidgets.QWidget):
             self.global_hook.stop()
         if hasattr(self, "_hotplug_watcher"):
             self._hotplug_watcher.stop()
+        if hasattr(self, "_hotplug_debounce_timer"):
+            self._hotplug_debounce_timer.stop()
         if hasattr(self, "_refresh_thread") and self._refresh_thread is not None:
             self._refresh_thread.quit()
             self._refresh_thread = None
