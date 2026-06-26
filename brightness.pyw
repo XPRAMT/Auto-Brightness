@@ -3230,9 +3230,11 @@ class MainWindow(QtWidgets.QWidget):
     def _restore_shortcut_rows(self):
         """重建 settings page 後，從 self.level_shortcuts 重新填入快捷鍵行。
         兩條路徑（init / refresh）共用。"""
-        # 清除新 layout 中由 build_settings_page 建立的空預設行
+        # 先保存資料（clear_shortcut_rows 會觸發 on_level_shortcuts_changed
+        # 從而清空 self.level_shortcuts）
+        saved = list(self.level_shortcuts) or []
         self.clear_shortcut_rows()
-        items = list(self.level_shortcuts) or []
+        items = saved
         if not items:
             items = [dict(item) for item in DEFAULT_LEVEL_SHORTCUTS]
         for shortcut_item in items:
@@ -4070,7 +4072,7 @@ class MainWindow(QtWidgets.QWidget):
         self._broadcast_monitor_state_if_server_enabled()
 
     def update_global_link(self, value):
-        """ 統一更新介面、圖示與所有螢幕的聯動值 """
+        """ 統一更新介面、圖示與所有本機螢幕的聯動值（不控制遠端螢幕）。 """
         if self._updating_global_link:
             return
 
@@ -4079,16 +4081,7 @@ class MainWindow(QtWidgets.QWidget):
         self._updating_global_link = True
         try:
             for wrapper, w in zip(self.monitor_wrappers, self.monitor_widgets):
-                if not getattr(wrapper, "available", False):
-                    continue
-                try:
-                    set_slider_object_value(w.link_slider, value)
-                    w.on_link(value) # 確保發送 DDC 指令
-                except RuntimeError:
-                    # widget 已被刪除（熱插拔後），跳過
-                    pass
-            for wrapper, w in zip(self._remote_wrappers, self._remote_widgets):
-                if not getattr(wrapper, "available", False):
+                if not getattr(wrapper, "available", False) or isinstance(wrapper, RemoteMonitorWrapper):
                     continue
                 try:
                     set_slider_object_value(w.link_slider, value)
