@@ -2830,12 +2830,19 @@ class MainWindow(QtWidgets.QWidget):
         if not self.monitor_wrappers:
             layout.addWidget(QtWidgets.QLabel("未偵測到可控制的螢幕"))
 
+        # 監視器容器：固定位置，內部 widget 重建時不影響外層 layout
+        self.monitor_container = QtWidgets.QWidget()
+        self.monitor_container_layout = QtWidgets.QVBoxLayout()
+        self.monitor_container_layout.setContentsMargins(0, 0, 0, 0)
+        self.monitor_container_layout.setSpacing(5)
+        self.monitor_container.setLayout(self.monitor_container_layout)
         for wrapper in self.monitor_wrappers:
             monitor_widget = MonitorWidget(wrapper, self.threadpool)
             monitor_widget.value_changed.connect(self.on_monitor_link_changed)
             monitor_widget.set_available(wrapper.available)
             self.monitor_widgets.append(monitor_widget)
-            layout.addWidget(monitor_widget)
+            self.monitor_container_layout.addWidget(monitor_widget)
+        layout.addWidget(self.monitor_container)
 
         layout.addStretch()
         page.setLayout(layout)
@@ -3182,48 +3189,25 @@ class MainWindow(QtWidgets.QWidget):
         print("===== 重新偵測完成 =====")
 
     def _rebuild_monitor_widgets(self):
-        """重建 main page 中的螢幕 widget（只替換 MonitorWidget 區域）。"""
-        # 清理舊 widget
+        """重建 container 內的螢幕 widget（容器本身在 layout 中位置固定，不跳動）。"""
+        # 清理舊 widget（從 container 移除）
         for w in list(self.monitor_widgets):
             try:
+                self.monitor_container_layout.removeWidget(w)
                 w.deleteLater()
             except Exception:
                 pass
         self.monitor_widgets.clear()
 
-        # 從 main_page layout 移除所有 MonitorWidget 實例
-        if hasattr(self, "main_page") and self.main_page is not None:
-            layout = self.main_page.layout()
-            if layout is not None:
-                for i in reversed(range(layout.count())):
-                    item = layout.itemAt(i)
-                    if item and item.widget() and isinstance(item.widget(), MonitorWidget):
-                        layout.removeWidget(item.widget())
-
-        # 建立新 widget 並插入到 spacer 之前
+        # 填入新 widget
         local_wrappers = [w for w in self.monitor_wrappers if not isinstance(w, RemoteMonitorWrapper)]
-        if not local_wrappers:
-            return
-
         for wrapper in local_wrappers:
             widget = MonitorWidget(wrapper, self.threadpool)
             widget.value_changed.connect(self.on_monitor_link_changed)
             widget.set_available(wrapper.available)
             widget.set_ranges(wrapper.brightness_range, wrapper.contrast_range)
             self.monitor_widgets.append(widget)
-
-        if hasattr(self, "main_page") and self.main_page is not None:
-            layout = self.main_page.layout()
-            if layout is not None:
-                insert_idx = layout.count()
-                for i in range(layout.count()):
-                    item = layout.itemAt(i)
-                    if item and item.spacerItem() is not None:
-                        insert_idx = i
-                        break
-                for widget in self.monitor_widgets:
-                    layout.insertWidget(insert_idx, widget)
-                    insert_idx += 1
+            self.monitor_container_layout.addWidget(widget)
 
     def _rebuild_range_widgets(self):
         """重建 settings page → Monitors tab 中的範圍 widget。"""
