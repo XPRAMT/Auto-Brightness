@@ -2610,6 +2610,9 @@ class MainWindow(QtWidgets.QWidget):
         if not self.monitor_wrappers:
             self._restore_known_monitors_from_settings()
 
+        # 在建 UI 之前先套用已儲存的範圍（與 refresh_monitors 流程一致）
+        self._reload_monitor_ranges_from_settings()
+
         self.monitor_widgets = []
         self.monitor_range_widgets = []
         self.shortcut_rows = []
@@ -3139,19 +3142,19 @@ class MainWindow(QtWidgets.QWidget):
 
         self._prev_raw_monitor_count = detected_count
 
-        # ── 組合 wrappers（先 local，遠端由 _reinsert_remote_widgets 獨立處理） ──
+        # ── 設定 wrappers（worker 已保留舊範圍，但尚未套用孤兒降級） ──
         self.monitor_wrappers = list(fresh_wrappers)
 
         print(f"  完成: {len(fresh_wrappers)} 台可用螢幕, {len(self._remote_wrappers)} 台遠端")
 
-        # ── 重建 UI（build_main_page 只看到 local wrappers） ──
-        self._rebuild_monitor_ui_after_rescan()
+        # ── 從設定檔載入範圍到 wrapper（含孤兒降級），再建 UI ──
+        self._reload_monitor_ranges_from_settings()
+
+        # ── 重建 UI（兩頁都重建，所有 widget 建構時自動讀取 wrapper 範圍） ──
+        self._rebuild_all_ui()
 
         # ── 重建完成後，重新插入遠端螢幕 widgets ──
         self._reinsert_remote_widgets()
-
-        # ── 重新載入設定中的範圍 ──
-        self._reload_monitor_ranges_from_settings()
 
         # ── 重新初始化分析器（先重設 DXGI 狀態） ──
         _CaptureThread.reset_dxgi()
@@ -3174,18 +3177,19 @@ class MainWindow(QtWidgets.QWidget):
 
         print("===== 重新偵測完成 =====")
 
-    def _rebuild_monitor_ui_after_rescan(self):
-        """完全重建 main page（呼叫 build_main_page），保留 settings page。
-        保留 remote wrappers（純 Python 物件），只清除已刪除的 C++ widget。"""
-        # 清理舊的 local monitor widgets
+    def _rebuild_all_ui(self):
+        """完全重建 main page 與 settings page（呼叫 build_main_page / build_settings_page）。
+        所有 widget 從頭建立，直接綁定當前的 monitor_wrappers，不需後續 patch。"""
+        # 清理舊的 monitor widgets 列表
         for w in list(self.monitor_widgets):
             try:
                 w.deleteLater()
             except Exception:
                 pass
         self.monitor_widgets.clear()
+        self.monitor_range_widgets.clear()
 
-        # 清理舊的遠端 widget（C++ 物件已隨舊 main_page 刪除），但保留 wrapper 資料
+        # 清理舊的遠端 widget
         for w in list(self._remote_widgets):
             try:
                 w.deleteLater()
@@ -3199,18 +3203,27 @@ class MainWindow(QtWidgets.QWidget):
 
         # 重建 main page
         new_main = self.build_main_page()
+        # 重建 settings page
+        new_settings = self.build_settings_page()
+        new_settings.setMinimumWidth(600)
+
+        # 在 stack 中替換兩頁
         self.stack.removeWidget(self.main_page)
+        self.stack.removeWidget(self.settings_page)
         if self.main_page is not None:
             self.main_page.deleteLater()
+        if self.settings_page is not None:
+            self.settings_page.deleteLater()
         self.main_page = new_main
-        self.stack.insertWidget(0, self.main_page)
+        self.settings_page = new_settings
+        self.stack.addWidget(self.main_page)
+        self.stack.addWidget(self.settings_page)
 
         # 恢復頁面
         self.stack.setCurrentWidget(self.settings_page if showing_settings else self.main_page)
 
     def _reload_monitor_ranges_from_settings(self):
-        """從設定檔載入儲存的監視器範圍（按名稱配對），
-        同時同步到已建立的 MonitorWidget 與 MonitorRangeWidget。"""
+        """從設定檔載入儲存的監視器範圍到 wrapper（widget 在建構時已自動讀取）。"""
         try:
             with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
                 saved = json.load(f)
@@ -3222,69 +3235,13 @@ class MainWindow(QtWidgets.QWidget):
                            if not isinstance(w, RemoteMonitorWrapper)]
             range_map = self._build_range_map(monitors_data, local_names)
 
-            # 更新所有 wrapper 的範圍
             for wrapper in self.monitor_wrappers:
                 if isinstance(wrapper, RemoteMonitorWrapper):
                     continue
                 pair = range_map.get(wrapper.name)
                 if pair is None:
                     continue
-                b_range, c_range = pair
-                wrapper.brightness_range = b_range
-                wrapper.contrast_range = c_range
-
-            # 同步到 MonitorWidget
-            for widget in self.monitor_widgets:
-                try:
-                    name = widget.monitor.name
-                except RuntimeError:
-                    continue
-                pair = range_map.get(name)
-                if pair is None:
-                    continue
-                b_range, c_range = pair
-                try:
-                    widget.set_ranges(b_range, c_range)
-                except RuntimeError:
-                    pass
-
-            # 同步到 MonitorRangeWidget，同時更新 rw.monitor 指向新 wrapper
-            # rw.monitor 可能是舊 wrapper（名稱不同於當前偵測名稱），但範圍以新名稱為準
-            name_to_wrapper = {w.name: w for w in self.monitor_wrappers
-                               if not isinstance(w, RemoteMonitorWrapper)}
-
-            def _find_range_for_rw(rw) -> tuple | None:
-                try:
-                    name = rw.monitor.name
-                except RuntimeError:
-                    return None
-                # 1. 精確匹配新名稱
-                pair = range_map.get(name)
-                if pair is not None:
-                    return pair
-                # 2. 在 monitors_data 中找舊名稱的直接配對
-                saved = monitors_data.get(name)
-                if saved is not None and isinstance(saved, dict):
-                    pair = (
-                        list(saved.get("b_range", [0, 100])),
-                        list(saved.get("c_range", [0, 100])),
-                    )
-                    range_map[name] = pair
-                    return pair
-                return None
-
-            for rw in self.monitor_range_widgets:
-                pair = _find_range_for_rw(rw)
-                if pair is None:
-                    continue
-                b_range, c_range = pair
-                try:
-                    rw.set_ranges(b_range, c_range, emit_signal=False)
-                except RuntimeError:
-                    pass
-                name = getattr(rw.monitor, "name", "")
-                if name in name_to_wrapper and rw.monitor is not name_to_wrapper[name]:
-                    rw.monitor = name_to_wrapper[name]
+                wrapper.brightness_range, wrapper.contrast_range = pair
         except Exception:
             pass
 
