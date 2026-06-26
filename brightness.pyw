@@ -3147,7 +3147,7 @@ class MainWindow(QtWidgets.QWidget):
 
         print(f"  完成: {len(fresh_wrappers)} 台可用螢幕, {len(self._remote_wrappers)} 台遠端")
 
-        # ── 從設定檔載入範圍到 wrapper（含孤兒降級），再建 UI ──
+        # ── 從設定檔載入範圍到 wrapper ──
         self._reload_monitor_ranges_from_settings()
 
         # ── 重建 UI（兩頁都重建，所有 widget 建構時自動讀取 wrapper 範圍） ──
@@ -3163,10 +3163,13 @@ class MainWindow(QtWidgets.QWidget):
         self._init_screen_analyzers()
         self._sync_screen_analyzer_enabled()
 
-        # ── 同步 UI 狀態（必須在合併遠端 wrappers 之前，否則長度不匹配） ──
+        # ── 同步 UI 狀態 ──
+        self._update_analyzer_levels()
         self.sync_ui_with_current_monitor_levels()
+        self._update_auto_adjust_info()
+        self._update_auto_formula_label()
 
-        # 合併遠端 wrappers 到主列表（供其他查詢用，不影響 UI 重建與同步）
+        # 合併遠端 wrappers 到主列表
         self.monitor_wrappers.extend(self._remote_wrappers)
 
         self.refresh_tray_display()
