@@ -1607,6 +1607,8 @@ class ScreenAnalyzer(QtCore.QObject):
         self._adjust_timer.stop()
 
     def set_current_ddc(self, value):
+        if self._direction != 0:
+            return
         self._current_ddc = int(value)
         self._current_ddc_float = float(value)
 
@@ -1745,8 +1747,7 @@ class ScreenAnalyzer(QtCore.QObject):
             return
 
         # 平方根曲線（方案 D）：step = sign(remaining) × sqrt(abs(remaining)) × k
-        k = 0.8
-        step = math.copysign(1.0, remaining) * math.sqrt(abs(remaining)) * k
+        step = math.copysign(1.0, remaining) * math.sqrt(abs(remaining)) * self._k
         # 最低步階，避免停滯
         if 0 < abs(step) < 0.5:
             step = 0.5 if step > 0 else -0.5
@@ -1759,9 +1760,15 @@ class ScreenAnalyzer(QtCore.QObject):
             self._adjust_timer.stop()
             return
 
-        # 不樂觀前進 _current_ddc_float，由 MainWindow 的 set_current_ddc 回寫。
-        # 避免樂觀值與 feedback 整數值不一致造成的累積誤差與跳動。
+        # 樂觀前進內部記數器，讓剩餘值自然遞減、步階逐步收斂
+        self._current_ddc_float += step
+        self._current_ddc = int(round(self._current_ddc_float))
+
         self.adjust_requested.emit(step)
+
+        if abs(self._desired_ddc - self._current_ddc_float) <= 1e-6:
+            self._direction = 0
+            self._adjust_timer.stop()
 
 
 # =========================
