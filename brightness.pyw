@@ -1712,16 +1712,7 @@ class ScreenAnalyzer(QtCore.QObject):
         # target = (avg*c + backlight*w) / (c+w)
         # backlight = ((c+w)*target - avg*c) / w
         desired = ((c + w) * self.target - lum * c) / w
-        old_desired = self._desired_ddc
         self._desired_ddc = max(0.0, min(100.0, desired))
-
-        # 抗跳動：調整中途（direction != 0）只允許把目標推得更遠，
-        # 避免截圖抵達時背光正在移動，導致目標反覆重算（chase effect）。
-        # 保留方向翻轉（內容真的改變）的空間。
-        if self._direction == 1:  # 正在往上調
-            self._desired_ddc = max(self._desired_ddc, old_desired)
-        elif self._direction == -1:  # 正在往下調
-            self._desired_ddc = min(self._desired_ddc, old_desired)
 
         if self._desired_ddc > self._current_ddc_float:
             self._direction = 1
@@ -1763,23 +1754,14 @@ class ScreenAnalyzer(QtCore.QObject):
         if abs(step) > abs(remaining):
             step = remaining
 
-        next_ddc_float = max(0.0, min(100.0, self._current_ddc_float + step))
-        delta_percent = next_ddc_float - self._current_ddc_float
-
-        if abs(delta_percent) <= 1e-9:
+        if abs(step) <= 1e-9:
             self._direction = 0
             self._adjust_timer.stop()
             return
 
-        # 樂觀前進目前位置，讓下一 tick 用新的剩餘值計算正確步階
-        self._current_ddc_float = next_ddc_float
-        self._current_ddc = int(round(next_ddc_float))
-
-        self.adjust_requested.emit(delta_percent)
-
-        if abs(self._desired_ddc - self._current_ddc_float) <= 1e-6:
-            self._direction = 0
-            self._adjust_timer.stop()
+        # 不樂觀前進 _current_ddc_float，由 MainWindow 的 set_current_ddc 回寫。
+        # 避免樂觀值與 feedback 整數值不一致造成的累積誤差與跳動。
+        self.adjust_requested.emit(step)
 
 
 # =========================
