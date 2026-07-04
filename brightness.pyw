@@ -3752,6 +3752,7 @@ class MainWindow(QtWidgets.QWidget):
         self._update_auto_adjust_info()
         if trigger_save:
             self.trigger_save()
+        self._broadcast_monitor_state_if_server_enabled()
         self._sync_app_state_to_remote_servers(auto_target=value)
 
     def adjust_auto_adjust_target(self, delta):
