@@ -1570,7 +1570,7 @@ class ScreenAnalyzer(QtCore.QObject):
         self.enabled = False
         self._last_source = "—"
         self.target = 50        # 目標畫面亮度 0-100
-        self.threshold = 5      # 反應門檻
+        self._k = 0.8           # 平方根曲線係數
         self.weight = AUTO_BRIGHTNESS_WEIGHT_DEFAULT  # 背光權重
         # 調整步階由平方根曲線自動決定
         self.total_levels = 100 # 由 MainWindow 更新
@@ -1626,6 +1626,18 @@ class ScreenAnalyzer(QtCore.QObject):
         ms = max(10, min(2000, int(ms)))
         self.tick_interval_ms = ms
         self._adjust_timer.setInterval(ms)
+
+    def set_k(self, k):
+        self._k = max(0.1, min(5.0, float(k)))
+
+    def _auto_threshold(self, c, w):
+        """由平方根曲線參數自動推導反應門檻（effective 亮度空間）。
+        保留擴充點：未來可加入自適應滯環偵測（方向反覆翻轉時動態放寬門檻）。"""
+        min_step = 0.5
+        # DDC 空間中可解析的最小步階
+        ddc_deadband = (min_step / max(self._k, 0.01)) ** 2
+        # 轉換到 effective 空間
+        return ddc_deadband * w / (c + w)
 
     def reset_dynamic_capture_interval(self):
         self._current_capture_interval_seconds = self._base_capture_interval_seconds
@@ -1691,7 +1703,7 @@ class ScreenAnalyzer(QtCore.QObject):
         effective = (lum * c + self._current_ddc * w) / (c + w)
         diff = self.target - effective
 
-        if abs(diff) <= self.threshold:
+        if abs(diff) <= self._auto_threshold(c, w):
             self._direction = 0
             self._adjust_timer.stop()
             return
@@ -1721,7 +1733,7 @@ class ScreenAnalyzer(QtCore.QObject):
             w = max(0.01, float(self.weight))
             c = get_dynamic_content_coeff(self._last_luminance)
             effective = (self._last_luminance * c + self._current_ddc_float * w) / (c + w)
-            if abs(self.target - effective) <= self.threshold:
+            if abs(self.target - effective) <= self._auto_threshold(c, w):
                 self._direction = 0
                 self._adjust_timer.stop()
                 return
@@ -2500,7 +2512,7 @@ class MainWindow(QtWidgets.QWidget):
         # 畫面自動調整
         self.auto_adjust_enabled = False
         self.auto_adjust_target = 50
-        self.auto_adjust_threshold = 5
+        self.auto_adjust_k = 0.8
         self.auto_adjust_weight = AUTO_BRIGHTNESS_WEIGHT_DEFAULT
         self.auto_adjust_capture_interval = 1.0
         self.auto_adjust_tick_interval = 200
@@ -2663,7 +2675,7 @@ class MainWindow(QtWidgets.QWidget):
     def _configure_screen_analyzer(self, analyzer):
         analyzer.enabled = self.auto_adjust_enabled
         analyzer.target = self.auto_adjust_target
-        analyzer.threshold = self.auto_adjust_threshold
+        analyzer.set_k(self.auto_adjust_k)
         analyzer.weight = self.auto_adjust_weight
         analyzer.set_capture_interval_seconds(self.auto_adjust_capture_interval)
         analyzer.set_tick_interval_ms(self.auto_adjust_tick_interval)
@@ -2924,12 +2936,13 @@ class MainWindow(QtWidgets.QWidget):
         self.auto_adjust_checkbox.setChecked(self.auto_adjust_enabled)
         self.auto_adjust_checkbox.toggled.connect(self.on_auto_adjust_toggled)
 
-        self.auto_adjust_threshold_spin = QtWidgets.QSpinBox()
-        self.auto_adjust_threshold_spin.setRange(1, 50)
-        self.auto_adjust_threshold_spin.setValue(self.auto_adjust_threshold)
-        self.auto_adjust_threshold_spin.setSuffix(" %")
-        self.auto_adjust_threshold_spin.setToolTip("畫面亮度與目標差距超過此值才觸發調整")
-        self.auto_adjust_threshold_spin.valueChanged.connect(self.on_auto_adjust_settings_changed)
+        self.auto_adjust_k_spin = QtWidgets.QDoubleSpinBox()
+        self.auto_adjust_k_spin.setRange(0.1, 5.0)
+        self.auto_adjust_k_spin.setSingleStep(0.1)
+        self.auto_adjust_k_spin.setDecimals(2)
+        self.auto_adjust_k_spin.setValue(self.auto_adjust_k)
+        self.auto_adjust_k_spin.setToolTip("平方根曲線係數，越大越快。預設 0.8")
+        self.auto_adjust_k_spin.valueChanged.connect(self.on_auto_adjust_settings_changed)
 
         self.auto_adjust_weight_spin = QtWidgets.QDoubleSpinBox()
         self.auto_adjust_weight_spin.setRange(0.1, 10.0)
@@ -2978,8 +2991,8 @@ class MainWindow(QtWidgets.QWidget):
         auto_grid.addWidget(self.auto_adjust_checkbox, 0, 0, 1, 4)
         auto_grid.addWidget(QtWidgets.QLabel("截圖間隔"), 1, 0)
         auto_grid.addWidget(self.auto_adjust_capture_interval_spin, 1, 1)
-        auto_grid.addWidget(QtWidgets.QLabel("反應門檻"), 1, 2)
-        auto_grid.addWidget(self.auto_adjust_threshold_spin, 1, 3)
+        auto_grid.addWidget(QtWidgets.QLabel("曲線係數 k"), 1, 2)
+        auto_grid.addWidget(self.auto_adjust_k_spin, 1, 3)
         auto_grid.addWidget(QtWidgets.QLabel("背光權重"), 2, 0)
         auto_grid.addWidget(QtWidgets.QLabel("背光權重"), 2, 2)
         auto_grid.addWidget(self.auto_adjust_weight_spin, 2, 3)
@@ -3717,7 +3730,7 @@ class MainWindow(QtWidgets.QWidget):
         self._sync_app_state_to_remote_servers(auto_enabled=self.auto_adjust_enabled)
 
     def on_auto_adjust_settings_changed(self):
-        self.auto_adjust_threshold = int(self.auto_adjust_threshold_spin.value())
+        self.auto_adjust_k = float(self.auto_adjust_k_spin.value())
         self.auto_adjust_weight = float(self.auto_adjust_weight_spin.value())
         self.auto_adjust_capture_interval = float(self.auto_adjust_capture_interval_spin.value())
         self.auto_adjust_tick_interval = int(self.auto_adjust_tick_interval_spin.value())
@@ -4195,7 +4208,7 @@ class MainWindow(QtWidgets.QWidget):
             "auto_adjust": {
                 "enabled": self.auto_adjust_enabled,
                 "target": self.auto_adjust_target,
-                "threshold": self.auto_adjust_threshold,
+                "k": self.auto_adjust_k,
                 "weight": self.auto_adjust_weight,
                 "capture_interval": self.auto_adjust_capture_interval,
                 "tick_interval": self.auto_adjust_tick_interval,
@@ -4339,14 +4352,16 @@ class MainWindow(QtWidgets.QWidget):
 
             # 載入畫面自動調整設定
             self.auto_adjust_target = int(auto_adjust_data.get("target", 50))
-            self.auto_adjust_threshold = int(auto_adjust_data.get("threshold", 5))
+            self.auto_adjust_k = float(auto_adjust_data.get("k", 0.8))
+            # 相容舊版 threshold — 不再使用，保留讀取避免警告
+            _old_threshold = auto_adjust_data.get("threshold", None)
             self.auto_adjust_weight = float(auto_adjust_data.get("weight", AUTO_BRIGHTNESS_WEIGHT_DEFAULT))
             self.auto_adjust_capture_interval = float(auto_adjust_data.get("capture_interval", 1.0))
             self.auto_adjust_tick_interval = int(auto_adjust_data.get("tick_interval", 200))
             self.auto_adjust_resource_saving_enabled = bool(auto_adjust_data.get("resource_saving_enabled", True))
             self.auto_adjust_resource_saving_idle_seconds = float(auto_adjust_data.get("resource_saving_idle_seconds", 5.0))
             self.auto_adjust_capture_interval = max(0.1, min(5.0, self.auto_adjust_capture_interval))
-            self.auto_adjust_tick_interval = max(10, min(2000, self.auto_adjust_tick_interval))
+            self.auto_adjust_k = max(0.1, min(5.0, self.auto_adjust_k))
             self.auto_adjust_resource_saving_idle_seconds = max(0.1, min(60.0, self.auto_adjust_resource_saving_idle_seconds))
             if hasattr(self, "network_debug_checkbox"):
                 self.network_debug_checkbox.blockSignals(True)
@@ -4355,7 +4370,7 @@ class MainWindow(QtWidgets.QWidget):
             self.auto_adjust_checkbox.blockSignals(True)
             if hasattr(self, "main_auto_adjust_checkbox"):
                 self.main_auto_adjust_checkbox.blockSignals(True)
-            self.auto_adjust_threshold_spin.blockSignals(True)
+            self.auto_adjust_k_spin.blockSignals(True)
             self.auto_adjust_weight_spin.blockSignals(True)
             self.auto_adjust_capture_interval_spin.blockSignals(True)
             self.auto_adjust_tick_interval_spin.blockSignals(True)
@@ -4364,7 +4379,7 @@ class MainWindow(QtWidgets.QWidget):
             self.auto_adjust_checkbox.setChecked(self.auto_adjust_enabled)
             if hasattr(self, "main_auto_adjust_checkbox"):
                 self.main_auto_adjust_checkbox.setChecked(self.auto_adjust_enabled)
-            self.auto_adjust_threshold_spin.setValue(self.auto_adjust_threshold)
+            self.auto_adjust_k_spin.setValue(self.auto_adjust_k)
             self.auto_adjust_weight_spin.setValue(self.auto_adjust_weight)
             self.auto_adjust_capture_interval_spin.setValue(self.auto_adjust_capture_interval)
             self.auto_adjust_tick_interval_spin.setValue(self.auto_adjust_tick_interval)
@@ -4373,7 +4388,7 @@ class MainWindow(QtWidgets.QWidget):
             self.auto_adjust_checkbox.blockSignals(False)
             if hasattr(self, "main_auto_adjust_checkbox"):
                 self.main_auto_adjust_checkbox.blockSignals(False)
-            self.auto_adjust_threshold_spin.blockSignals(False)
+            self.auto_adjust_k_spin.blockSignals(False)
             self.auto_adjust_weight_spin.blockSignals(False)
             self.auto_adjust_capture_interval_spin.blockSignals(False)
             self.auto_adjust_tick_interval_spin.blockSignals(False)
