@@ -1607,6 +1607,8 @@ class ScreenAnalyzer(QtCore.QObject):
         self._adjust_timer.stop()
 
     def set_current_ddc(self, value):
+        if self._direction != 0:
+            return
         self._current_ddc = int(value)
         self._current_ddc_float = float(value)
 
@@ -3876,6 +3878,8 @@ class MainWindow(QtWidgets.QWidget):
             return
 
         self._sync_global_link_from_available_monitors()
+        if monitor_index < len(self.screen_analyzers) and self.screen_analyzers[monitor_index] is not None:
+            self.screen_analyzers[monitor_index].set_current_ddc(link_value)
         self._update_auto_adjust_info(monitor_index)
         self._broadcast_monitor_state_if_server_enabled()
 
