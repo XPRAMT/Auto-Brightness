@@ -15,14 +15,13 @@ Auto Brightness is a Windows desktop utility for controlling monitor brightness 
 - Run from the Windows system tray with a live brightness icon.
 - Optional DDC over LAN mode using TCP and mDNS discovery.
 - Optional DXGI capture acceleration through `dxcam` and `numpy`.
-- Optional VapourSynth input through the `BRIGHTNESS_VS_SCRIPT` environment variable.
 
 ## Requirements
 
 - Windows.
 - Python 3.10 or newer is recommended.
 - Monitors that support DDC/CI for external brightness and contrast control.
-- Python packages: `PyQt6`, `monitorcontrol`, `zeroconf`, `numpy`, `dxcam`, `wmi`, `vapoursynth`.
+- Python packages: `PyQt6`, `monitorcontrol`, `zeroconf`, `numpy`, `dxcam`, `wmi`.
 
 ## Installation
 
@@ -30,9 +29,9 @@ Auto Brightness is a Windows desktop utility for controlling monitor brightness 
 git clone https://github.com/XPRAMT/Auto-Brightness.git
 cd Auto-Brightness
 python -m venv .venv
-.\.venv\Scripts\Activate.ps1
+.\venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-python -m pip install PyQt6 monitorcontrol zeroconf numpy dxcam wmi vapoursynth
+python -m pip install PyQt6 monitorcontrol zeroconf numpy dxcam wmi
 ```
 
 All listed packages are imported at startup. If one is missing, the app exits immediately so the missing dependency can be installed before use.
@@ -61,7 +60,7 @@ Enable either Server or Client from the app's Network tab. Make sure Windows Fir
 
 Automatic brightness samples screen luminance and gradually adjusts monitor backlight toward the configured target. You can tune the target brightness, threshold, weight, capture interval, step percentage, and resource-saving idle behavior in the settings UI.
 
-The app uses `dxcam` and `numpy` for DXGI capture. If `BRIGHTNESS_VS_SCRIPT` points to a `.vpy` file, VapourSynth can be used as the capture source.
+The app uses `dxcam` and `numpy` for DXGI screen capture.
 
 ## Notes
 

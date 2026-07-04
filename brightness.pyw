@@ -16,17 +16,12 @@ from monitorcontrol import get_monitors
 from zeroconf import Zeroconf, ServiceInfo, ServiceBrowser
 import numpy as np
 import dxcam
-import vapoursynth as vs
 import wmi
 
 try:
     import winreg
 except ImportError:
     winreg = None
-
-# 可選：指定 VapourSynth 腳本 (.vpy) 後，優先使用該管線抓取畫面亮度
-# PowerShell 範例：$env:BRIGHTNESS_VS_SCRIPT='C:\path\to\source.vpy'
-VAPOURSYNTH_SCRIPT_PATH = os.environ.get("BRIGHTNESS_VS_SCRIPT", "").strip()
 
 SETTINGS_FILE = "settings.json"
 SETTINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), SETTINGS_FILE)
@@ -1435,87 +1430,16 @@ class KeyCaptureButton(QtWidgets.QPushButton):
         super().focusOutEvent(event)
 
 
-# =========================
-# Screen Auto Brightness Analyzer
-# =========================
-
-class _VapourSynthCapture:
-    """VapourSynth 逐幀亮度擷取（原型）。"""
-
-    def __init__(self, script_path):
-        if not script_path:
-            raise RuntimeError("未設定 VapourSynth 腳本路徑")
-        if not os.path.isfile(script_path):
-            raise FileNotFoundError(f"找不到 VapourSynth 腳本: {script_path}")
-
-        self.script_path = script_path
-        self._frame_index = 0
-        self._frame_lock = threading.Lock()
-
-        core = vs.core
-        context = {"vs": vs, "core": core}
-        with open(script_path, "r", encoding="utf-8") as f:
-            code = compile(f.read(), script_path, "exec")
-        exec(code, context, context)
-
-        clip = None
-        get_outputs = getattr(vs, "get_outputs", None)
-        if callable(get_outputs):
-            outputs = get_outputs()
-            if outputs:
-                first_output = next(iter(outputs.values()))
-                clip = getattr(first_output, "clip", first_output)
-
-        if clip is None:
-            clip = context.get("clip") or context.get("video")
-
-        if clip is None:
-            raise RuntimeError(".vpy 需透過 set_output() 輸出 clip，或定義 `clip` / `video`")
-        if getattr(clip, "num_frames", 0) <= 0:
-            raise RuntimeError("VapourSynth clip 沒有可讀取影格")
-
-        if clip.format is None:
-            raise RuntimeError("VapourSynth clip 格式未知")
-
-        if clip.format.color_family == vs.GRAY:
-            luma_clip = clip
-        elif clip.format.color_family == vs.YUV:
-            luma_clip = core.std.ShufflePlanes(clip, 0, vs.GRAY)
-        else:
-            # RGB / 其他格式先轉灰階
-            luma_clip = core.resize.Bicubic(clip, format=vs.GRAY8, matrix_s="709")
-
-        self._stats_clip = core.std.PlaneStats(luma_clip)
-        self._num_frames = int(self._stats_clip.num_frames)
-
-    def capture_luminance(self):
-        with self._frame_lock:
-            frame_index = max(0, min(self._frame_index, self._num_frames - 1))
-            frame = self._stats_clip.get_frame(frame_index)
-            avg = frame.props.get("PlaneStatsAverage")
-            self._frame_index += 1
-            if self._frame_index >= self._num_frames:
-                self._frame_index = 0
-
-        if avg is None:
-            return None
-        return max(0.0, min(100.0, float(avg) * 100.0))
-
-
 class _CaptureThread(QtCore.QThread):
-    result_ready = QtCore.pyqtSignal(float, str)  # (亮度 0-100, 來源: "VPY"/"VS"/"DXGI")
+    result_ready = QtCore.pyqtSignal(float, str)  # (亮度 0-100, 來源: "DXGI" / "—")
 
     _dxgi_cameras = {}
     _dxgi_lock = threading.Lock()
     _dxgi_disabled = False
-    _vs_capture = None
-    _vs_lock = threading.Lock()
-    _vs_disabled = False
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.use_dxgi = True
-        self.use_vapoursynth = bool(VAPOURSYNTH_SCRIPT_PATH)
 
     @classmethod
     def initialize_dxgi(cls) -> list:
@@ -1569,34 +1493,6 @@ class _CaptureThread(QtCore.QThread):
             else:
                 cls._dxgi_cameras.pop((int(device_idx), int(output_idx)), None)
 
-    @classmethod
-    def _get_vapoursynth_capture(cls):
-        if cls._vs_disabled or not VAPOURSYNTH_SCRIPT_PATH:
-            return None
-        with cls._vs_lock:
-            if cls._vs_capture is None:
-                cls._vs_capture = _VapourSynthCapture(VAPOURSYNTH_SCRIPT_PATH)
-            return cls._vs_capture
-
-    @classmethod
-    def _disable_vapoursynth(cls):
-        with cls._vs_lock:
-            cls._vs_disabled = True
-            cls._vs_capture = None
-
-    def _capture_vapoursynth(self):
-        """使用 VapourSynth 方式逐幀擷取（原型）"""
-        try:
-            capture = self._get_vapoursynth_capture()
-            if capture is None:
-                return None
-            return capture.capture_luminance()
-        except Exception as e:
-            print(f"VapourSynth 擷取錯誤: {e}")
-            self._disable_vapoursynth()
-            self.use_vapoursynth = False
-            return None
-
     def _capture_dxgi(self):
         """使用 DXGI 方式截圖（高效）"""
         device_idx = 0
@@ -1631,16 +1527,9 @@ class _CaptureThread(QtCore.QThread):
         result = None
         source = "—"
 
-        if result is None and self.use_vapoursynth:
-            result = self._capture_vapoursynth()
-            if result is not None:
-                source = "VS"
-
-        # VS 不可用時回退 DXGI
-        if result is None:
-            result = self._capture_dxgi()
-            if result is not None:
-                source = "DXGI"
+        result = self._capture_dxgi()
+        if result is not None:
+            source = "DXGI"
 
         if result is not None:
             self.result_ready.emit(result, source)
@@ -1649,7 +1538,7 @@ class _CaptureThread(QtCore.QThread):
 class ScreenAnalyzer(QtCore.QObject):
     adjust_requested = QtCore.pyqtSignal(float)  # 每 tick 建議調整的百分比（可正可負）
     luminance_updated = QtCore.pyqtSignal(float)  # 即時畫面亮度 0-100
-    luminance_source_updated = QtCore.pyqtSignal(str)  # 亮度來源："VPY" / "VS" / "DXGI" / "—"
+    luminance_source_updated = QtCore.pyqtSignal(str)  # 亮度來源："DXGI" / "—"
 
     def __init__(self, parent=None, output_idx=0, dxgi_target=None):
         super().__init__(parent)
