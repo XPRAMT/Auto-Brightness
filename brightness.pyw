@@ -1654,6 +1654,8 @@ class ScreenAnalyzer(QtCore.QObject):
             self._direction = -1
         else:
             self._direction = 0
+        if self._direction != 0 and not self._adjust_timer.isActive():
+            self._adjust_timer.start()
 
     def reset_dynamic_capture_interval(self):
         self._current_capture_interval_seconds = self._base_capture_interval_seconds
