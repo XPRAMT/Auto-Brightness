@@ -1641,6 +1641,20 @@ class ScreenAnalyzer(QtCore.QObject):
         # 轉換到 effective 空間
         return ddc_deadband * w / (c + w)
 
+    def recalculate_desired_from_last_luminance(self):
+        if self._last_luminance is None:
+            return
+        w = max(0.01, float(self.weight))
+        c = get_dynamic_content_coeff(self._last_luminance)
+        desired = ((c + w) * self.target - self._last_luminance * c) / w
+        self._desired_ddc = max(0.0, min(100.0, desired))
+        if self._desired_ddc > self._current_ddc_float:
+            self._direction = 1
+        elif self._desired_ddc < self._current_ddc_float:
+            self._direction = -1
+        else:
+            self._direction = 0
+
     def reset_dynamic_capture_interval(self):
         self._current_capture_interval_seconds = self._base_capture_interval_seconds
         self._capture_timer.setInterval(int(round(self._current_capture_interval_seconds * 1000)))
@@ -3792,6 +3806,7 @@ class MainWindow(QtWidgets.QWidget):
         value = int(round(value))
         self.auto_adjust_target = value
         self._for_each_screen_analyzer(lambda analyzer: setattr(analyzer, "target", value))
+        self._for_each_screen_analyzer(lambda analyzer: analyzer.recalculate_desired_from_last_luminance())
         if hasattr(self, "auto_target_slider"):
             self.auto_target_slider.blockSignals(True)
             self.auto_target_slider.setValue(value)
