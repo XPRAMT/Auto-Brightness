@@ -1606,8 +1606,8 @@ class ScreenAnalyzer(QtCore.QObject):
         self._capture_timer.stop()
         self._adjust_timer.stop()
 
-    def set_current_ddc(self, value):
-        if self._direction != 0:
+    def set_current_ddc(self, value, force=False):
+        if not force and self._direction != 0:
             return
         self._current_ddc = int(value)
         self._current_ddc_float = float(value)
@@ -3807,8 +3807,14 @@ class MainWindow(QtWidgets.QWidget):
         value = max(0, min(100, self.snap_to_step(value)))
         value = int(round(value))
         self.auto_adjust_target = value
-        self._for_each_screen_analyzer(lambda analyzer: setattr(analyzer, "target", value))
-        self._for_each_screen_analyzer(lambda analyzer: analyzer.recalculate_desired_from_last_luminance())
+        # 強制同步 analyzer 內部狀態與實際 slider 值，避免手動 step 在調整中用舊基數計算
+        for idx, analyzer in enumerate(getattr(self, "screen_analyzers", [])):
+            if analyzer is None:
+                continue
+            if idx < len(self.monitor_widgets):
+                analyzer.set_current_ddc(self.monitor_widgets[idx].link_slider.slider.value(), force=True)
+        self._for_each_screen_analyzer(lambda a: setattr(a, "target", value))
+        self._for_each_screen_analyzer(lambda a: a.recalculate_desired_from_last_luminance())
         if hasattr(self, "auto_target_slider"):
             self.auto_target_slider.blockSignals(True)
             self.auto_target_slider.setValue(value)
