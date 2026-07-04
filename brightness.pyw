@@ -1585,6 +1585,7 @@ class ScreenAnalyzer(QtCore.QObject):
         self._current_ddc_float = 50.0
         self._desired_ddc = 50.0
         self._direction = 0     # -1=降低 0=停止 1=提高
+        self._last_manual_interaction = 0.0  # time.time() 手動步階時間戳
         self._capture_thread = None
         self.capture_interval_seconds = 1.0
         self.tick_interval_ms = 200
@@ -1716,6 +1717,10 @@ class ScreenAnalyzer(QtCore.QObject):
         # 當前亮度 = (平均 + 背光*權重) / (2 + 權重 - 1) = (平均 + 背光*權重) / (1 + 權重)
         # 這裡以可調係數泛化：
         # effective = (avg*c + backlight*w) / (c+w)
+        # 手動步階後 2 秒內不觸發自動調整，讓螢幕完成硬體變化
+        if time.time() - self._last_manual_interaction < 2.0:
+            return
+
         w = max(0.01, float(self.weight))
         c = get_dynamic_content_coeff(lum)
         effective = (lum * c + self._current_ddc * w) / (c + w)
@@ -4123,10 +4128,12 @@ class MainWindow(QtWidgets.QWidget):
         if self.auto_adjust_enabled:
             new_target = max(0, min(100, self.snap_to_step(self.auto_adjust_target + step)))
             self.set_auto_adjust_target(new_target, trigger_save=False, no_recalc=True)
+            now = time.time()
             for a in self.screen_analyzers:
                 if a is not None:
                     a._direction = 0
                     a._adjust_timer.stop()
+                    a._last_manual_interaction = now
 
     def on_global_hook_level(self, value):
         # 絕對值快捷鍵：不管模式，同時更新目標亮度與背光亮度
