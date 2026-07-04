@@ -1123,6 +1123,7 @@ class MonitorWidget(QtWidgets.QGroupBox):
         if not self.monitor.available:
             return
         brightness, contrast = levels_from_link_value(self.monitor, percent)
+        print(f"[ON_LINK] {self.monitor.name}: link={percent:.1f}% -> b={brightness}, c={contrast}  (b_range={self.monitor.brightness_range}, c_range={self.monitor.contrast_range}, contrast_supported={self.monitor.contrast_supported})")
         self.pending_brightness = brightness
         self.pending_contrast = contrast
         self.sync_sliders(brightness, contrast)
@@ -1154,6 +1155,7 @@ class MonitorWidget(QtWidgets.QGroupBox):
         if isinstance(self.monitor, RemoteMonitorWrapper):
             return
         contrast_value = 0 if not self.monitor.contrast_supported else self.pending_contrast
+        print(f"[DDC_WRITE] {self.monitor.name}: brightness={self.pending_brightness}, contrast={contrast_value}")
         worker = DDCWorker(
             self.monitor.monitor,
             self.monitor.lock,
@@ -4117,11 +4119,10 @@ class MainWindow(QtWidgets.QWidget):
     def on_global_hook_step(self, delta):
         step = delta * self.get_step_value()
         if self.auto_adjust_enabled:
-            # 自動模式：step 只改目標，analyzer 自然調整亮度
             new_target = max(0, min(100, self.snap_to_step(self.auto_adjust_target + step)))
             self.set_auto_adjust_target(new_target, trigger_save=False)
         else:
-            # 手動模式：固定 step 直接調亮度，不經 analyzer
+            print(f"[MANUAL_STEP] step={step:+.1f}  current_link={self.global_link_value:.1f}  new_link={max(0,min(100,self.snap_to_step(self.global_link_value + step))):.1f}")
             self.adjust_global_link(step)
 
     def on_global_hook_level(self, value):
