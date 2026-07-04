@@ -3783,24 +3783,32 @@ class MainWindow(QtWidgets.QWidget):
             if not getattr(wrapper, "available", False):
                 continue
             try:
-                values.append(("local", idx, int(widget.link_slider.slider.value())))
+                v = int(widget.link_slider.slider.value())
+                values.append(("local", idx, v))
+                print(f"[DEBUG_LINK_VALUES] local[{idx}] {wrapper.name}={v}")
             except RuntimeError:
                 pass
         for idx, (wrapper, widget) in enumerate(zip(self._remote_wrappers, self._remote_widgets)):
             if not getattr(wrapper, "available", False):
                 continue
             try:
-                values.append(("remote", idx, int(widget.link_slider.slider.value())))
+                v = int(widget.link_slider.slider.value())
+                values.append(("remote", idx, v))
+                print(f"[DEBUG_LINK_VALUES] remote[{idx}] {wrapper.name}={v}")
             except RuntimeError:
                 pass
         return values
 
     def _sync_global_link_from_available_monitors(self):
         values = self._available_global_link_values()
-        if not values:
+        local_values = [v for v in values if v[0] == "local"]
+        if not local_values:
             return
-        self.global_link_value = int(round(sum(value for _kind, _idx, value in values) / len(values)))
-        for kind, idx, value in values:
+        local_vals = [value for _kind, _idx, value in local_values]
+        avg = int(round(sum(local_vals) / len(local_vals)))
+        print(f"[DEBUG_SYNC_LINK] local_values={local_vals} avg={avg} old_global_link={self.global_link_value}")
+        self.global_link_value = avg
+        for kind, idx, value in local_values:
             if kind == "local" and idx < len(self.screen_analyzers) and self.screen_analyzers[idx] is not None:
                 self.screen_analyzers[idx].set_current_ddc(value)
         self._sync_main_global_link_controls()
@@ -4122,7 +4130,8 @@ class MainWindow(QtWidgets.QWidget):
             new_target = max(0, min(100, self.snap_to_step(self.auto_adjust_target + step)))
             self.set_auto_adjust_target(new_target, trigger_save=False)
         else:
-            print(f"[MANUAL_STEP] step={step:+.1f}  current_link={self.global_link_value:.1f}  new_link={max(0,min(100,self.snap_to_step(self.global_link_value + step))):.1f}")
+            new_val = max(0, min(100, self.snap_to_step(self.global_link_value + step)))
+            print(f"[DEBUG_STEP] delta={delta:+d} step={step:+.1f} old_global_link={self.global_link_value:.1f} new_val={new_val:.1f}")
             self.adjust_global_link(step)
 
     def on_global_hook_level(self, value):
@@ -4165,6 +4174,7 @@ class MainWindow(QtWidgets.QWidget):
             return
 
         value = int(self.snap_to_step(value))
+        print(f"[DEBUG_UPDATE_GL] entering: value={value}, current_global_link={self.global_link_value}")
 
         self._updating_global_link = True
         try:
@@ -4179,6 +4189,7 @@ class MainWindow(QtWidgets.QWidget):
             self._sync_global_link_from_available_monitors()
             self._update_auto_adjust_info()
             self._broadcast_monitor_state_if_server_enabled()
+            print(f"[DEBUG_UPDATE_GL] after sync: global_link={self.global_link_value}")
         finally:
             self._updating_global_link = False
 
