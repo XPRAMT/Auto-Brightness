@@ -4115,11 +4115,13 @@ class MainWindow(QtWidgets.QWidget):
             self.tray.setToolTip(f"全域聯動: {self.global_link_value}%")
 
     def on_global_hook_step(self, delta):
-        # Step 快捷鍵：自動模式→修改目標亮度；非自動模式→直接修改背光
+        step = delta * self.get_step_value()
+        # 先直接調整亮度（固定 step，不經 analyzer）
+        self.adjust_global_link(step)
+        # 自動模式下同步更新目標值
         if self.auto_adjust_enabled:
-            self.adjust_auto_adjust_target(delta * self.get_step_value())
-        else:
-            self.adjust_global_link(delta * self.get_step_value())
+            new_target = max(0, min(100, self.snap_to_step(self.auto_adjust_target + step)))
+            self.set_auto_adjust_target(new_target, trigger_save=False)
 
     def on_global_hook_level(self, value):
         # 絕對值快捷鍵：不管模式，同時更新目標亮度與背光亮度
