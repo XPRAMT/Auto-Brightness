@@ -3304,6 +3304,7 @@ class MainWindow(QtWidgets.QWidget):
 
         self.monitor_wrappers = [w for w in self.monitor_wrappers if not isinstance(w, RemoteMonitorWrapper)]
 
+        rebuild_needed = False
         seen_keys = set()
         for data in monitors:
             srv = data.get("_remote_name", "")
@@ -3317,12 +3318,12 @@ class MainWindow(QtWidgets.QWidget):
                 if widget:
                     self._sync_remote_widget(widget, existing)
                 else:
-                    # wrapper 存在但 widget 已被重建刪除 → 重新建立
                     widget = MonitorWidget(existing, self.threadpool)
                     self._sync_remote_widget(widget, existing)
                     widget.value_changed.connect(self._on_remote_monitor_link_changed)
                     self._remote_widgets.append(widget)
                     self.remote_servers_map[key] = widget
+                    rebuild_needed = True
             else:
                 wrapper = RemoteMonitorWrapper(data, srv)
                 self._remote_wrappers.append(wrapper)
@@ -3331,6 +3332,7 @@ class MainWindow(QtWidgets.QWidget):
                 widget.value_changed.connect(self._on_remote_monitor_link_changed)
                 self._remote_widgets.append(widget)
                 self.remote_servers_map[key] = widget
+                rebuild_needed = True
 
         for wrapper in list(self._remote_wrappers):
             key = (wrapper._server_name, wrapper.name)
@@ -3342,8 +3344,10 @@ class MainWindow(QtWidgets.QWidget):
                 self._remote_widgets.remove(widget)
                 widget.deleteLater()
             self.remote_servers_map.pop(key, None)
+            rebuild_needed = True
 
-        self._rebuild_remote_widgets()
+        if rebuild_needed:
+            self._rebuild_remote_widgets()
         self._sync_global_link_from_available_monitors()
         self.refresh_tray_display()
 
