@@ -1,4 +1,5 @@
 import sys
+import math
 import json
 import threading
 import ctypes
@@ -1571,7 +1572,7 @@ class ScreenAnalyzer(QtCore.QObject):
         self.target = 50        # 目標畫面亮度 0-100
         self.threshold = 5      # 反應門檻
         self.weight = AUTO_BRIGHTNESS_WEIGHT_DEFAULT  # 背光權重
-        self.adjust_step_percent = 0.5  # 每個調整週期允許改變的百分比
+        # 調整步階由平方根曲線自動決定
         self.total_levels = 100 # 由 MainWindow 更新
         self.resource_saving_enabled = True
         self.resource_saving_idle_seconds = 5.0
@@ -1620,10 +1621,6 @@ class ScreenAnalyzer(QtCore.QObject):
         self.resource_saving_idle_seconds = max(0.1, min(60.0, float(idle_seconds)))
         if not self.resource_saving_enabled:
             self.reset_dynamic_capture_interval()
-
-    def set_adjust_step_percent(self, percent):
-        percent = max(0.01, min(100.0, float(percent)))
-        self.adjust_step_percent = percent
 
     def set_tick_interval_ms(self, ms):
         ms = max(10, min(2000, int(ms)))
@@ -1735,16 +1732,27 @@ class ScreenAnalyzer(QtCore.QObject):
             self._adjust_timer.stop()
             return
 
-        # 每 tick 只提出一個調整量；實際背光狀態由 MainWindow 套用後回寫。
-        step = min(abs(remaining), self.adjust_step_percent)
-        delta_percent = step if remaining > 0 else -step
-        next_ddc_float = max(0.0, min(100.0, self._current_ddc_float + delta_percent))
+        # 平方根曲線（方案 D）：step = sign(remaining) × sqrt(abs(remaining)) × k
+        k = 0.8
+        step = math.copysign(1.0, remaining) * math.sqrt(abs(remaining)) * k
+        # 最低步階，避免停滯
+        if 0 < abs(step) < 0.5:
+            step = 0.5 if step > 0 else -0.5
+        # 不 overshoot
+        if abs(step) > abs(remaining):
+            step = remaining
+
+        next_ddc_float = max(0.0, min(100.0, self._current_ddc_float + step))
         delta_percent = next_ddc_float - self._current_ddc_float
 
         if abs(delta_percent) <= 1e-9:
             self._direction = 0
             self._adjust_timer.stop()
             return
+
+        # 樂觀前進目前位置，讓下一 tick 用新的剩餘值計算正確步階
+        self._current_ddc_float = next_ddc_float
+        self._current_ddc = int(round(next_ddc_float))
 
         self.adjust_requested.emit(delta_percent)
 
@@ -2495,7 +2503,6 @@ class MainWindow(QtWidgets.QWidget):
         self.auto_adjust_threshold = 5
         self.auto_adjust_weight = AUTO_BRIGHTNESS_WEIGHT_DEFAULT
         self.auto_adjust_capture_interval = 1.0
-        self.auto_adjust_step_percent = 0.5
         self.auto_adjust_tick_interval = 200
         self.auto_adjust_resource_saving_enabled = True
         self.auto_adjust_resource_saving_idle_seconds = 5.0
@@ -2659,7 +2666,6 @@ class MainWindow(QtWidgets.QWidget):
         analyzer.threshold = self.auto_adjust_threshold
         analyzer.weight = self.auto_adjust_weight
         analyzer.set_capture_interval_seconds(self.auto_adjust_capture_interval)
-        analyzer.set_adjust_step_percent(self.auto_adjust_step_percent)
         analyzer.set_tick_interval_ms(self.auto_adjust_tick_interval)
         analyzer.set_resource_saving(
             self.auto_adjust_resource_saving_enabled,
@@ -2942,15 +2948,6 @@ class MainWindow(QtWidgets.QWidget):
         self.auto_adjust_capture_interval_spin.setToolTip("畫面截圖分析週期")
         self.auto_adjust_capture_interval_spin.valueChanged.connect(self.on_auto_adjust_settings_changed)
 
-        self.auto_adjust_step_percent_spin = QtWidgets.QDoubleSpinBox()
-        self.auto_adjust_step_percent_spin.setRange(0.01, 100.0)
-        self.auto_adjust_step_percent_spin.setSingleStep(0.1)
-        self.auto_adjust_step_percent_spin.setDecimals(2)
-        self.auto_adjust_step_percent_spin.setValue(self.auto_adjust_step_percent)
-        self.auto_adjust_step_percent_spin.setSuffix(" %")
-        self.auto_adjust_step_percent_spin.setToolTip("每個調整時間間隔最多可變更的亮度百分比")
-        self.auto_adjust_step_percent_spin.valueChanged.connect(self.on_auto_adjust_settings_changed)
-
         self.auto_adjust_resource_saving_checkbox = QtWidgets.QCheckBox("啟用資源節省模式")
         self.auto_adjust_resource_saving_checkbox.setChecked(self.auto_adjust_resource_saving_enabled)
         self.auto_adjust_resource_saving_checkbox.toggled.connect(self.on_auto_adjust_settings_changed)
@@ -2983,8 +2980,7 @@ class MainWindow(QtWidgets.QWidget):
         auto_grid.addWidget(self.auto_adjust_capture_interval_spin, 1, 1)
         auto_grid.addWidget(QtWidgets.QLabel("反應門檻"), 1, 2)
         auto_grid.addWidget(self.auto_adjust_threshold_spin, 1, 3)
-        auto_grid.addWidget(QtWidgets.QLabel("調整級距"), 2, 0)
-        auto_grid.addWidget(self.auto_adjust_step_percent_spin, 2, 1)
+        auto_grid.addWidget(QtWidgets.QLabel("背光權重"), 2, 0)
         auto_grid.addWidget(QtWidgets.QLabel("背光權重"), 2, 2)
         auto_grid.addWidget(self.auto_adjust_weight_spin, 2, 3)
         auto_grid.addWidget(self.auto_adjust_resource_saving_checkbox, 3, 0, 1, 2)
@@ -3724,7 +3720,6 @@ class MainWindow(QtWidgets.QWidget):
         self.auto_adjust_threshold = int(self.auto_adjust_threshold_spin.value())
         self.auto_adjust_weight = float(self.auto_adjust_weight_spin.value())
         self.auto_adjust_capture_interval = float(self.auto_adjust_capture_interval_spin.value())
-        self.auto_adjust_step_percent = float(self.auto_adjust_step_percent_spin.value())
         self.auto_adjust_tick_interval = int(self.auto_adjust_tick_interval_spin.value())
         self.auto_adjust_resource_saving_enabled = bool(self.auto_adjust_resource_saving_checkbox.isChecked())
         self.auto_adjust_resource_saving_idle_seconds = float(self.auto_adjust_resource_saving_idle_spin.value())
@@ -4203,7 +4198,6 @@ class MainWindow(QtWidgets.QWidget):
                 "threshold": self.auto_adjust_threshold,
                 "weight": self.auto_adjust_weight,
                 "capture_interval": self.auto_adjust_capture_interval,
-                "step_percent": self.auto_adjust_step_percent,
                 "tick_interval": self.auto_adjust_tick_interval,
                 "resource_saving_enabled": self.auto_adjust_resource_saving_enabled,
                 "resource_saving_idle_seconds": self.auto_adjust_resource_saving_idle_seconds,
@@ -4348,12 +4342,10 @@ class MainWindow(QtWidgets.QWidget):
             self.auto_adjust_threshold = int(auto_adjust_data.get("threshold", 5))
             self.auto_adjust_weight = float(auto_adjust_data.get("weight", AUTO_BRIGHTNESS_WEIGHT_DEFAULT))
             self.auto_adjust_capture_interval = float(auto_adjust_data.get("capture_interval", 1.0))
-            self.auto_adjust_step_percent = float(auto_adjust_data.get("step_percent", 0.5))
             self.auto_adjust_tick_interval = int(auto_adjust_data.get("tick_interval", 200))
             self.auto_adjust_resource_saving_enabled = bool(auto_adjust_data.get("resource_saving_enabled", True))
             self.auto_adjust_resource_saving_idle_seconds = float(auto_adjust_data.get("resource_saving_idle_seconds", 5.0))
             self.auto_adjust_capture_interval = max(0.1, min(5.0, self.auto_adjust_capture_interval))
-            self.auto_adjust_step_percent = max(0.01, min(100.0, self.auto_adjust_step_percent))
             self.auto_adjust_tick_interval = max(10, min(2000, self.auto_adjust_tick_interval))
             self.auto_adjust_resource_saving_idle_seconds = max(0.1, min(60.0, self.auto_adjust_resource_saving_idle_seconds))
             if hasattr(self, "network_debug_checkbox"):
@@ -4366,7 +4358,6 @@ class MainWindow(QtWidgets.QWidget):
             self.auto_adjust_threshold_spin.blockSignals(True)
             self.auto_adjust_weight_spin.blockSignals(True)
             self.auto_adjust_capture_interval_spin.blockSignals(True)
-            self.auto_adjust_step_percent_spin.blockSignals(True)
             self.auto_adjust_tick_interval_spin.blockSignals(True)
             self.auto_adjust_resource_saving_checkbox.blockSignals(True)
             self.auto_adjust_resource_saving_idle_spin.blockSignals(True)
@@ -4376,7 +4367,6 @@ class MainWindow(QtWidgets.QWidget):
             self.auto_adjust_threshold_spin.setValue(self.auto_adjust_threshold)
             self.auto_adjust_weight_spin.setValue(self.auto_adjust_weight)
             self.auto_adjust_capture_interval_spin.setValue(self.auto_adjust_capture_interval)
-            self.auto_adjust_step_percent_spin.setValue(self.auto_adjust_step_percent)
             self.auto_adjust_tick_interval_spin.setValue(self.auto_adjust_tick_interval)
             self.auto_adjust_resource_saving_checkbox.setChecked(self.auto_adjust_resource_saving_enabled)
             self.auto_adjust_resource_saving_idle_spin.setValue(self.auto_adjust_resource_saving_idle_seconds)
@@ -4386,7 +4376,6 @@ class MainWindow(QtWidgets.QWidget):
             self.auto_adjust_threshold_spin.blockSignals(False)
             self.auto_adjust_weight_spin.blockSignals(False)
             self.auto_adjust_capture_interval_spin.blockSignals(False)
-            self.auto_adjust_step_percent_spin.blockSignals(False)
             self.auto_adjust_tick_interval_spin.blockSignals(False)
             self.auto_adjust_resource_saving_checkbox.blockSignals(False)
             self.auto_adjust_resource_saving_idle_spin.blockSignals(False)
