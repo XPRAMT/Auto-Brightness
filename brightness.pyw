@@ -1488,10 +1488,25 @@ class _CaptureThread(QtCore.QThread):
     def _disable_dxgi(cls, device_idx=None, output_idx=None):
         with cls._dxgi_lock:
             if device_idx is None or output_idx is None:
+                for key, cam in list(cls._dxgi_cameras.items()):
+                    try:
+                        if cam.is_capturing:
+                            cam.stop()
+                        cam.release()
+                    except Exception:
+                        pass
                 cls._dxgi_disabled = True
                 cls._dxgi_cameras = {}
             else:
-                cls._dxgi_cameras.pop((int(device_idx), int(output_idx)), None)
+                key = (int(device_idx), int(output_idx))
+                cam = cls._dxgi_cameras.pop(key, None)
+                if cam is not None:
+                    try:
+                        if cam.is_capturing:
+                            cam.stop()
+                        cam.release()
+                    except Exception:
+                        pass
 
     def _capture_dxgi(self):
         """使用 DXGI 方式截圖（高效）"""
@@ -1519,8 +1534,12 @@ class _CaptureThread(QtCore.QThread):
             return avg / 255.0 * 100.0
         except Exception as e:
             print(f"DXGI 截圖錯誤 (device={device_idx}, output={output_idx}): {e}")
-            self._disable_dxgi(device_idx, output_idx)
-            self.use_dxgi = False
+            if "0x887A0026" in str(e):
+                # 螢幕切換/休眠後輸出變更 → 完全重設 DXGI，下次 tick 可重建 camera
+                self.__class__.reset_dxgi()
+            else:
+                self._disable_dxgi(device_idx, output_idx)
+                self.use_dxgi = False
             return None
 
     def run(self):
