@@ -34,6 +34,7 @@ AUTO_BRIGHTNESS_CONTENT_COEFF_MIN_FACTOR = 0.5
 AUTO_BRIGHTNESS_CONTENT_COEFF_MAX_FACTOR = 1.5
 AUTO_BRIGHTNESS_WEIGHT_DEFAULT = 1.0
 NETWORK_DEBUG_LOG_ENABLED = False
+DEBUG_LOG_ENABLED = False
 
 MODIFIER_ORDER = ["Alt", "Ctrl", "Shift", "Win"]
 SHORTCUT_MODIFIER_OPTIONS = ["None"] + MODIFIER_ORDER
@@ -1123,7 +1124,8 @@ class MonitorWidget(QtWidgets.QGroupBox):
         if not self.monitor.available:
             return
         brightness, contrast = levels_from_link_value(self.monitor, percent)
-        print(f"[ON_LINK] {self.monitor.name}: link={percent:.1f}% -> b={brightness}, c={contrast}  (b_range={self.monitor.brightness_range}, c_range={self.monitor.contrast_range}, contrast_supported={self.monitor.contrast_supported})")
+        if DEBUG_LOG_ENABLED:
+            print(f"[ON_LINK] {self.monitor.name}: link={percent:.1f}% -> b={brightness}, c={contrast}  (b_range={self.monitor.brightness_range}, c_range={self.monitor.contrast_range}, contrast_supported={self.monitor.contrast_supported})")
         self.pending_brightness = brightness
         self.pending_contrast = contrast
         self.sync_sliders(brightness, contrast)
@@ -1155,7 +1157,8 @@ class MonitorWidget(QtWidgets.QGroupBox):
         if isinstance(self.monitor, RemoteMonitorWrapper):
             return
         contrast_value = 0 if not self.monitor.contrast_supported else self.pending_contrast
-        print(f"[DDC_WRITE] {self.monitor.name}: brightness={self.pending_brightness}, contrast={contrast_value}")
+        if DEBUG_LOG_ENABLED:
+            print(f"[DDC_WRITE] {self.monitor.name}: brightness={self.pending_brightness}, contrast={contrast_value}")
         worker = DDCWorker(
             self.monitor.monitor,
             self.monitor.lock,
@@ -2511,6 +2514,7 @@ class MainWindow(QtWidgets.QWidget):
         self.shortcut_key3 = "None"
         self.auto_start_enabled = False
         self.network_debug_enabled = False
+        self.debug_log_enabled = False
         self.level_shortcuts = [dict(item) for item in DEFAULT_LEVEL_SHORTCUTS]
         self.global_hook = None
         self._loading_settings = False
@@ -2602,17 +2606,16 @@ class MainWindow(QtWidgets.QWidget):
         self._hotplug_debounce_timer.timeout.connect(self._do_hotplug_refresh)
 
         root_layout = QtWidgets.QVBoxLayout()
-        root_layout.setContentsMargins(10, 10, 10, 10)
-        root_layout.setSpacing(5)
-        root_layout.setSizeConstraint(QtWidgets.QLayout.SizeConstraint.SetMinimumSize)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
 
-        self.stack = QtWidgets.QStackedWidget()
+        self.tab_widget = QtWidgets.QTabWidget()
         self.main_page = self.build_main_page()
         self.settings_page = self.build_settings_page()
         self.settings_page.setMinimumWidth(600)
-        self.stack.addWidget(self.main_page)
-        self.stack.addWidget(self.settings_page)
-        root_layout.addWidget(self.stack)
+        self.tab_widget.addTab(self.main_page, "主頁")
+        self.tab_widget.addTab(self.settings_page, "設定")
+        root_layout.addWidget(self.tab_widget)
         self.setLayout(root_layout)
 
         self.init_tray()
@@ -2764,9 +2767,6 @@ class MainWindow(QtWidgets.QWidget):
         refresh_button = QtWidgets.QPushButton("重新偵測")
         refresh_button.clicked.connect(self.refresh_monitors)
         top_bar.addWidget(refresh_button)
-        settings_button = QtWidgets.QPushButton("設定")
-        settings_button.clicked.connect(self.show_settings_page)
-        top_bar.addWidget(settings_button)
         layout.addLayout(top_bar)
 
         self.auto_target_group = QtWidgets.QGroupBox("自動調整目標亮度")
@@ -2830,13 +2830,6 @@ class MainWindow(QtWidgets.QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(5)
 
-        top_bar = QtWidgets.QHBoxLayout()
-        top_bar.addStretch()
-        back_button = QtWidgets.QPushButton("返回主介面")
-        back_button.clicked.connect(self.show_main_page)
-        top_bar.addWidget(back_button)
-        layout.addLayout(top_bar)
-
         # Tab widget: General / Monitors / Network
         tabs = QtWidgets.QTabWidget()
 
@@ -2879,6 +2872,11 @@ class MainWindow(QtWidgets.QWidget):
         global_grid.addWidget(self.step_combo, 0, 1)
         global_grid.addWidget(self.autostart_checkbox, 1, 0, 1, 2)
         global_grid.addWidget(self.network_debug_checkbox, 2, 0, 1, 2)
+
+        self.link_debug_checkbox = QtWidgets.QCheckBox("Debug 螢幕狀態")
+        self.link_debug_checkbox.setChecked(self.debug_log_enabled)
+        self.link_debug_checkbox.toggled.connect(self.on_link_debug_toggled)
+        global_grid.addWidget(self.link_debug_checkbox, 3, 0, 1, 2)
         global_group.setLayout(global_grid)
         gen_layout.addWidget(global_group)
 
@@ -3073,7 +3071,7 @@ class MainWindow(QtWidgets.QWidget):
         return page
 
     def show_main_page(self):
-        self.stack.setCurrentWidget(self.main_page)
+        self.tab_widget.setCurrentIndex(0)
         self.show()
         self.raise_()
         self.activateWindow()
@@ -3661,7 +3659,7 @@ class MainWindow(QtWidgets.QWidget):
         return False
 
     def show_settings_page(self):
-        self.stack.setCurrentWidget(self.settings_page)
+        self.tab_widget.setCurrentIndex(1)
         self.show()
         self.raise_()
         self.activateWindow()
@@ -3785,7 +3783,8 @@ class MainWindow(QtWidgets.QWidget):
             try:
                 v = int(widget.link_slider.slider.value())
                 values.append(("local", idx, v))
-                print(f"[DEBUG_LINK_VALUES] local[{idx}] {wrapper.name}={v}")
+                if DEBUG_LOG_ENABLED:
+                    print(f"[DEBUG_LINK_VALUES] local[{idx}] {wrapper.name}={v}")
             except RuntimeError:
                 pass
         for idx, (wrapper, widget) in enumerate(zip(self._remote_wrappers, self._remote_widgets)):
@@ -3794,7 +3793,8 @@ class MainWindow(QtWidgets.QWidget):
             try:
                 v = int(widget.link_slider.slider.value())
                 values.append(("remote", idx, v))
-                print(f"[DEBUG_LINK_VALUES] remote[{idx}] {wrapper.name}={v}")
+                if DEBUG_LOG_ENABLED:
+                    print(f"[DEBUG_LINK_VALUES] remote[{idx}] {wrapper.name}={v}")
             except RuntimeError:
                 pass
         return values
@@ -3806,7 +3806,8 @@ class MainWindow(QtWidgets.QWidget):
             return
         local_vals = [value for _kind, _idx, value in local_values]
         avg = int(round(sum(local_vals) / len(local_vals)))
-        print(f"[DEBUG_SYNC_LINK] local_values={local_vals} avg={avg} old_global_link={self.global_link_value}")
+        if DEBUG_LOG_ENABLED:
+            print(f"[DEBUG_SYNC_LINK] local_values={local_vals} avg={avg} old_global_link={self.global_link_value}")
         self.global_link_value = avg
         for kind, idx, value in local_values:
             if kind == "local" and idx < len(self.screen_analyzers) and self.screen_analyzers[idx] is not None:
@@ -4077,6 +4078,12 @@ class MainWindow(QtWidgets.QWidget):
         NETWORK_DEBUG_LOG_ENABLED = self.network_debug_enabled
         self.trigger_save()
 
+    def on_link_debug_toggled(self, checked):
+        global DEBUG_LOG_ENABLED
+        self.debug_log_enabled = bool(checked)
+        DEBUG_LOG_ENABLED = self.debug_log_enabled
+        self.trigger_save()
+
     def create_tray_icon(self, current_value, target_value=None):
         """ 動態繪製托盤圖示；啟用自動亮度時顯示上下兩行數值 """
         pixmap = QtGui.QPixmap(32, 32)
@@ -4131,7 +4138,8 @@ class MainWindow(QtWidgets.QWidget):
             self.set_auto_adjust_target(new_target, trigger_save=False)
         else:
             new_val = max(0, min(100, self.snap_to_step(self.global_link_value + step)))
-            print(f"[DEBUG_STEP] delta={delta:+d} step={step:+.1f} old_global_link={self.global_link_value:.1f} new_val={new_val:.1f}")
+            if DEBUG_LOG_ENABLED:
+                print(f"[DEBUG_STEP] delta={delta:+d} step={step:+.1f} old_global_link={self.global_link_value:.1f} new_val={new_val:.1f}")
             self.adjust_global_link(step)
 
     def on_global_hook_level(self, value):
@@ -4174,7 +4182,8 @@ class MainWindow(QtWidgets.QWidget):
             return
 
         value = int(self.snap_to_step(value))
-        print(f"[DEBUG_UPDATE_GL] entering: value={value}, current_global_link={self.global_link_value}")
+        if DEBUG_LOG_ENABLED:
+            print(f"[DEBUG_UPDATE_GL] entering: value={value}, current_global_link={self.global_link_value}")
 
         self._updating_global_link = True
         try:
@@ -4189,7 +4198,8 @@ class MainWindow(QtWidgets.QWidget):
             self._sync_global_link_from_available_monitors()
             self._update_auto_adjust_info()
             self._broadcast_monitor_state_if_server_enabled()
-            print(f"[DEBUG_UPDATE_GL] after sync: global_link={self.global_link_value}")
+            if DEBUG_LOG_ENABLED:
+                print(f"[DEBUG_UPDATE_GL] after sync: global_link={self.global_link_value}")
         finally:
             self._updating_global_link = False
 
@@ -4235,6 +4245,7 @@ class MainWindow(QtWidgets.QWidget):
             "step": self.get_step_value(),
             "auto_start": self.auto_start_enabled,
             "network_debug": self.network_debug_enabled,
+            "debug_log": self.debug_log_enabled,
             "shortcut": {
                 "key1": self.shortcut_key1,
                 "key2": self.shortcut_key2,
@@ -4298,6 +4309,7 @@ class MainWindow(QtWidgets.QWidget):
             saved_step = data.get("step", 5) if isinstance(data, dict) else 5
             saved_auto_start = data.get("auto_start", self.is_startup_enabled()) if isinstance(data, dict) else self.is_startup_enabled()
             saved_network_debug = bool(data.get("network_debug", False)) if isinstance(data, dict) else False
+            saved_debug_log = bool(data.get("debug_log", False)) if isinstance(data, dict) else False
             shortcut = data.get("shortcut", {}) if isinstance(data, dict) else {}
             saved_level_shortcuts = data.get("level_shortcuts", [dict(item) for item in DEFAULT_LEVEL_SHORTCUTS]) if isinstance(data, dict) else [dict(item) for item in DEFAULT_LEVEL_SHORTCUTS]
             saved_trigger_keys = shortcut.get("keys") if isinstance(shortcut, dict) else None
@@ -4329,6 +4341,9 @@ class MainWindow(QtWidgets.QWidget):
             self.network_debug_enabled = saved_network_debug
             global NETWORK_DEBUG_LOG_ENABLED
             NETWORK_DEBUG_LOG_ENABLED = self.network_debug_enabled
+            self.debug_log_enabled = saved_debug_log
+            global DEBUG_LOG_ENABLED
+            DEBUG_LOG_ENABLED = self.debug_log_enabled
 
             # 先決定是否啟用自動調整，避免啟動流程誤下發 DDC 指令
             self.auto_adjust_enabled = bool(auto_adjust_data.get("enabled", False))
@@ -4403,6 +4418,10 @@ class MainWindow(QtWidgets.QWidget):
                 self.network_debug_checkbox.blockSignals(True)
                 self.network_debug_checkbox.setChecked(self.network_debug_enabled)
                 self.network_debug_checkbox.blockSignals(False)
+            if hasattr(self, "link_debug_checkbox"):
+                self.link_debug_checkbox.blockSignals(True)
+                self.link_debug_checkbox.setChecked(self.debug_log_enabled)
+                self.link_debug_checkbox.blockSignals(False)
             self.auto_adjust_checkbox.blockSignals(True)
             if hasattr(self, "main_auto_adjust_checkbox"):
                 self.main_auto_adjust_checkbox.blockSignals(True)
