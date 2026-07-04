@@ -2755,7 +2755,7 @@ class MainWindow(QtWidgets.QWidget):
     def build_main_page(self):
         page = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout()
-        layout.setContentsMargins(10, 0, 10, 0)
+        layout.setContentsMargins(3, 0, 3, 0)
         layout.setSpacing(5)
 
         top_bar = QtWidgets.QHBoxLayout()
@@ -2827,7 +2827,7 @@ class MainWindow(QtWidgets.QWidget):
     def build_settings_page(self):
         page = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout()
-        layout.setContentsMargins(10, 0, 10, 0)
+        layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(5)
 
         # Tab widget: General / Monitors / Network
