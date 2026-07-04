@@ -1712,7 +1712,16 @@ class ScreenAnalyzer(QtCore.QObject):
         # target = (avg*c + backlight*w) / (c+w)
         # backlight = ((c+w)*target - avg*c) / w
         desired = ((c + w) * self.target - lum * c) / w
+        old_desired = self._desired_ddc
         self._desired_ddc = max(0.0, min(100.0, desired))
+
+        # 抗跳動：調整中途（direction != 0）只允許把目標推得更遠，
+        # 避免截圖抵達時背光正在移動，導致目標反覆重算（chase effect）。
+        # 保留方向翻轉（內容真的改變）的空間。
+        if self._direction == 1:  # 正在往上調
+            self._desired_ddc = max(self._desired_ddc, old_desired)
+        elif self._direction == -1:  # 正在往下調
+            self._desired_ddc = min(self._desired_ddc, old_desired)
 
         if self._desired_ddc > self._current_ddc_float:
             self._direction = 1
