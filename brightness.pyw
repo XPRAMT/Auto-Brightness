@@ -1464,7 +1464,8 @@ class _CaptureThread(QtCore.QThread):
 
     @classmethod
     def reset_dxgi(cls):
-        """完全重設 DXGI 狀態：停止 + 釋放所有 camera 並清除快取。"""
+        """完全重設 DXGI 狀態：停止 + 釋放所有 camera 並清除快取，
+        同時清除 dxcam 的全域 factory，避免舊 COM 指標在 GC 時崩潰。"""
         with cls._dxgi_lock:
             for key, cam in list(cls._dxgi_cameras.items()):
                 try:
@@ -1475,6 +1476,11 @@ class _CaptureThread(QtCore.QThread):
                     pass
             cls._dxgi_cameras = {}
             cls._dxgi_disabled = False
+        # 清除 dxcam 內部快取的 factory，下次 create 時重新初始化
+        try:
+            dxcam.__dict__.pop("__factory", None)
+        except Exception:
+            pass
 
     @classmethod
     def _get_dxgi_camera(cls, device_idx=0, output_idx=0):
