@@ -4173,6 +4173,13 @@ class MainWindow(QtWidgets.QWidget):
         # 絕對值快捷鍵：不管模式，同時更新目標亮度與背光亮度
         self.set_auto_adjust_target(value, trigger_save=False)
         self.set_global_link(value)
+        # 同步 analyzer 內部狀態，避免 stale recalc 產生的 _desired_ddc 與實際亮度打架
+        for a in self.screen_analyzers:
+            if a is not None:
+                a._desired_ddc = float(value)
+                a.set_current_ddc(value, force=True)
+                a._direction = 0
+                a._adjust_timer.stop()
 
     def on_global_hook_toggle_auto(self):
         # 切換自動亮度開關
