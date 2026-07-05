@@ -36,6 +36,16 @@ AUTO_BRIGHTNESS_WEIGHT_DEFAULT = 1.0
 NETWORK_DEBUG_LOG_ENABLED = False
 DEBUG_LOG_ENABLED = False
 
+
+def log_msg(*args):
+    """統一 log 函式，自動加上 [hh:mm:ss.ms] 時間戳。"""
+    now = time.time()
+    secs = int(now)
+    millis = int((now - secs) * 1000)
+    h, m, s = secs // 3600 % 24, secs // 60 % 60, secs % 60
+    print(f"[{h:02d}:{m:02d}:{s:02d}.{millis:03d}]{' '.join(str(a) for a in args)}")
+
+
 MODIFIER_ORDER = ["Alt", "Ctrl", "Shift", "Win"]
 SHORTCUT_MODIFIER_OPTIONS = ["None"] + MODIFIER_ORDER
 SHORTCUT_KEY_OPTIONS = (
@@ -317,8 +327,7 @@ def log_network_signal(direction, content, value):
     if not NETWORK_DEBUG_LOG_ENABLED:
         return
     direction = {"發送": "->", "接收": "<-"}.get(direction, direction)
-    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    print(f"{timestamp} {direction} {content} {_network_log_value(value)}")
+    log_msg(f"{direction} {content} {_network_log_value(value)}")
 
 
 def log_network_payload(direction, payload):
@@ -1125,7 +1134,7 @@ class MonitorWidget(QtWidgets.QGroupBox):
             return
         brightness, contrast = levels_from_link_value(self.monitor, percent)
         if DEBUG_LOG_ENABLED:
-            print(f"[ON_LINK] {self.monitor.name}: link={percent:.1f}% -> b={brightness}, c={contrast}  (b_range={self.monitor.brightness_range}, c_range={self.monitor.contrast_range}, contrast_supported={self.monitor.contrast_supported})")
+            log_msg(f"[ON_LINK] {self.monitor.name}: link={percent:.1f}% -> b={brightness}, c={contrast}  (b_range={self.monitor.brightness_range}, c_range={self.monitor.contrast_range}, contrast_supported={self.monitor.contrast_supported})")
         self.pending_brightness = brightness
         self.pending_contrast = contrast
         self.sync_sliders(brightness, contrast)
@@ -1158,7 +1167,7 @@ class MonitorWidget(QtWidgets.QGroupBox):
             return
         contrast_value = 0 if not self.monitor.contrast_supported else self.pending_contrast
         if DEBUG_LOG_ENABLED:
-            print(f"[DDC_WRITE] {self.monitor.name}: brightness={self.pending_brightness}, contrast={contrast_value}")
+            log_msg(f"[DDC_WRITE] {self.monitor.name}: brightness={self.pending_brightness}, contrast={contrast_value}")
         worker = DDCWorker(
             self.monitor.monitor,
             self.monitor.lock,
@@ -2074,6 +2083,7 @@ class NetworkMonitorClient(QtCore.QObject):
         self._discovered_servers = {}  # name -> {"info": ServiceInfo, "monitors": [], "state": {}}
         self._subscriptions = {}
         self._subscriptions_lock = threading.Lock()
+        self._subscribe_attempts = {}  # name -> failed_attempts_count
         self._browser = None
         self._zeroconf = None
         self._refresh_timer = None
@@ -2217,6 +2227,7 @@ class NetworkMonitorClient(QtCore.QObject):
             self.remote_state_updated.emit(state)
 
     def _start_subscription(self, name):
+        self._subscribe_attempts.pop(name, None)
         with self._subscriptions_lock:
             existing = self._subscriptions.get(name)
             if existing and existing.get("running"):
@@ -2272,8 +2283,15 @@ class NetworkMonitorClient(QtCore.QObject):
                             self._handle_server_message(name, json.loads(line))
             except Exception as e:
                 if self._running and state.get("running"):
-                    print(f"Subscribe {name} error: {e}")
-                    time.sleep(2.0)
+                    if DEBUG_LOG_ENABLED:
+                        log_msg(f"Subscribe {name} error: {e}")
+                    attempts = self._subscribe_attempts.setdefault(name, 0) + 1
+                    self._subscribe_attempts[name] = attempts
+                    if attempts >= 12:  # 12 × 5s = 60s 後降頻
+                        delay = 60.0
+                    else:
+                        delay = 5.0
+                    time.sleep(delay)
             finally:
                 state["socket"] = None
 
@@ -3790,7 +3808,7 @@ class MainWindow(QtWidgets.QWidget):
                 v = int(widget.link_slider.slider.value())
                 values.append(("local", idx, v))
                 if DEBUG_LOG_ENABLED:
-                    print(f"[DEBUG_LINK_VALUES] local[{idx}] {wrapper.name}={v}")
+                    log_msg(f"[DEBUG_LINK_VALUES] local[{idx}] {wrapper.name}={v}")
             except RuntimeError:
                 pass
         for idx, (wrapper, widget) in enumerate(zip(self._remote_wrappers, self._remote_widgets)):
@@ -3800,7 +3818,7 @@ class MainWindow(QtWidgets.QWidget):
                 v = int(widget.link_slider.slider.value())
                 values.append(("remote", idx, v))
                 if DEBUG_LOG_ENABLED:
-                    print(f"[DEBUG_LINK_VALUES] remote[{idx}] {wrapper.name}={v}")
+                    log_msg(f"[DEBUG_LINK_VALUES] remote[{idx}] {wrapper.name}={v}")
             except RuntimeError:
                 pass
         return values
@@ -3813,7 +3831,7 @@ class MainWindow(QtWidgets.QWidget):
         local_vals = [value for _kind, _idx, value in local_values]
         avg = int(round(sum(local_vals) / len(local_vals)))
         if DEBUG_LOG_ENABLED:
-            print(f"[DEBUG_SYNC_LINK] local_values={local_vals} avg={avg} old_global_link={self.global_link_value}")
+            log_msg(f"[DEBUG_SYNC_LINK] local_values={local_vals} avg={avg} old_global_link={self.global_link_value}")
         self.global_link_value = avg
         for kind, idx, value in local_values:
             if kind == "local" and idx < len(self.screen_analyzers) and self.screen_analyzers[idx] is not None:
@@ -4145,7 +4163,7 @@ class MainWindow(QtWidgets.QWidget):
         else:
             new_val = max(0, min(100, self.snap_to_step(self.global_link_value + step)))
             if DEBUG_LOG_ENABLED:
-                print(f"[DEBUG_STEP] delta={delta:+d} step={step:+.1f} old_global_link={self.global_link_value:.1f} new_val={new_val:.1f}")
+                log_msg(f"[DEBUG_STEP] delta={delta:+d} step={step:+.1f} old_global_link={self.global_link_value:.1f} new_val={new_val:.1f}")
             self.adjust_global_link(step)
 
     def on_global_hook_level(self, value):
@@ -4189,7 +4207,7 @@ class MainWindow(QtWidgets.QWidget):
 
         value = int(self.snap_to_step(value))
         if DEBUG_LOG_ENABLED:
-            print(f"[DEBUG_UPDATE_GL] entering: value={value}, current_global_link={self.global_link_value}")
+            log_msg(f"[DEBUG_UPDATE_GL] entering: value={value}, current_global_link={self.global_link_value}")
 
         self._updating_global_link = True
         try:
@@ -4205,7 +4223,7 @@ class MainWindow(QtWidgets.QWidget):
             self._update_auto_adjust_info()
             self._broadcast_monitor_state_if_server_enabled()
             if DEBUG_LOG_ENABLED:
-                print(f"[DEBUG_UPDATE_GL] after sync: global_link={self.global_link_value}")
+                log_msg(f"[DEBUG_UPDATE_GL] after sync: global_link={self.global_link_value}")
         finally:
             self._updating_global_link = False
 
