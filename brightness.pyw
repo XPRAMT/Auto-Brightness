@@ -1482,11 +1482,8 @@ class _CaptureThread(QtCore.QThread):
                 cam.release()
             cls._dxgi_cameras = {}
             cls._dxgi_disabled = False
-        # 清除 dxcam 內部快取的 factory，下次 create 時重新初始化
-        try:
-            dxcam.__dict__.pop("__factory", None)
-        except Exception:
-            pass
+        # 清除 dxcam 內部快取的 factory（設為 None，不 pop，避免 dxcam 內部用到 __factory 名稱）
+        dxcam.__factory = None
 
     @classmethod
     def _get_dxgi_camera(cls, device_idx=0, output_idx=0):
