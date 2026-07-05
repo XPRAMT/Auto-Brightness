@@ -1477,12 +1477,9 @@ class _CaptureThread(QtCore.QThread):
         同時清除 dxcam 的全域 factory，避免舊 COM 指標在 GC 時崩潰。"""
         with cls._dxgi_lock:
             for key, cam in list(cls._dxgi_cameras.items()):
-                try:
-                    if cam.is_capturing:
-                        cam.stop()
-                    cam.release()
-                except Exception:
-                    pass
+                if cam.is_capturing:
+                    cam.stop()
+                cam.release()
             cls._dxgi_cameras = {}
             cls._dxgi_disabled = False
         # 清除 dxcam 內部快取的 factory，下次 create 時重新初始化
@@ -1510,24 +1507,18 @@ class _CaptureThread(QtCore.QThread):
         with cls._dxgi_lock:
             if device_idx is None or output_idx is None:
                 for key, cam in list(cls._dxgi_cameras.items()):
-                    try:
-                        if cam.is_capturing:
-                            cam.stop()
-                        cam.release()
-                    except Exception:
-                        pass
+                    if cam.is_capturing:
+                        cam.stop()
+                    cam.release()
                 cls._dxgi_disabled = True
                 cls._dxgi_cameras = {}
             else:
                 key = (int(device_idx), int(output_idx))
                 cam = cls._dxgi_cameras.pop(key, None)
                 if cam is not None:
-                    try:
-                        if cam.is_capturing:
-                            cam.stop()
-                        cam.release()
-                    except Exception:
-                        pass
+                    if cam.is_capturing:
+                        cam.stop()
+                    cam.release()
 
     def _capture_dxgi(self):
         """使用 DXGI 方式截圖（高效）"""
@@ -2326,7 +2317,7 @@ class NetworkMonitorClient(QtCore.QObject):
                         ok = bool(resp.get("ok"))
                         return ok
         except Exception as e:
-            print(f"Remote set error: {e}")
+            log_msg(f"Remote set error: {e}")
         return False
 
     def remote_set_state(self, server_name, auto_target=None, auto_enabled=None):
@@ -2359,7 +2350,7 @@ class NetworkMonitorClient(QtCore.QObject):
                         ok = bool(resp.get("ok"))
                         return ok
         except Exception as e:
-            print(f"Remote set state error: {e}")
+            log_msg(f"Remote set state error: {e}")
         return False
 
 
@@ -3529,7 +3520,18 @@ class MainWindow(QtWidgets.QWidget):
     def _sync_app_state_to_remote_servers(self, auto_target=None, auto_enabled=None):
         if self._applying_remote_network_state or not self._network_client_enabled:
             return
-        for server_name in list(getattr(self._net_client, "_discovered_servers", {}).keys()):
+        servers = list(getattr(self._net_client, "_discovered_servers", {}).keys())
+        if not servers:
+            return
+        # 背景執行緒 RPC，避免 UI 凍結
+        threading.Thread(
+            target=self._sync_app_state_worker,
+            args=(servers, auto_target, auto_enabled),
+            daemon=True,
+        ).start()
+
+    def _sync_app_state_worker(self, servers, auto_target, auto_enabled):
+        for server_name in servers:
             self._net_client.remote_set_state(server_name, auto_target=auto_target, auto_enabled=auto_enabled)
 
     def _on_remote_set_applied(self, name, brightness, contrast):
@@ -3581,7 +3583,7 @@ class MainWindow(QtWidgets.QWidget):
         if self.monitor_widgets:
             sep = QtWidgets.QLabel("─── 遠端螢幕 ───")
             sep.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-            sep.setStyleSheet("color: gray; font-size: 10px; padding: 4px;")
+            sep.setStyleSheet("color: gray; font-size: 10px; padding: 0; margin: 0;")
             layout.addWidget(sep)
             self._remote_separator = sep
         # 插入遠端 widget
