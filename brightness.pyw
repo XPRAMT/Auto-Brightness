@@ -2724,6 +2724,10 @@ class MainWindow(QtWidgets.QWidget):
                 analyzer.stop()
 
         dxgi_targets = get_dxgi_display_targets()
+        if not dxgi_targets:
+            # 重置後 factory 已被清除 → 先重新初始化，再試一次
+            _CaptureThread.initialize_dxgi()
+            dxgi_targets = get_dxgi_display_targets()
         if dxgi_targets:
             target_text = ", ".join(
                 f"{i}:D{t['device_idx']}O{t['output_idx']}{'*' if t.get('primary') else ''}"
