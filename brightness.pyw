@@ -1521,6 +1521,7 @@ class _CaptureThread(QtCore.QThread):
         """使用 DXGI 方式截圖（高效）"""
         device_idx = 0
         output_idx = 0
+        camera = None
         try:
             parent = self.parent()
             device_idx = int(getattr(parent, "dxgi_device_idx", 0) or 0)
@@ -1546,6 +1547,8 @@ class _CaptureThread(QtCore.QThread):
             if "0x887A0026" in str(e):
                 # 螢幕切換/休眠後輸出變更 → 完全重設 DXGI，下次 tick 可重建 camera
                 self.__class__.reset_dxgi()
+                # 釋放區域變數引用，避免 GC 對已釋放的 COM 指標重複 Release() 造成 access violation
+                camera = None
             else:
                 self._disable_dxgi(device_idx, output_idx)
                 self.use_dxgi = False
