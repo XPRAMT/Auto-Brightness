@@ -1235,6 +1235,21 @@ class DDCWorker(QtCore.QRunnable):
                 print(f"DDC Error ({self.wrapper._ddc_error_count}/{self.wrapper.MAX_DDC_FAILURES}): {e}")
 
 
+class LevelReadSignals(QtCore.QObject):
+    result = QtCore.pyqtSignal(object, object, object)
+
+
+class LevelReadWorker(QtCore.QRunnable):
+    def __init__(self, wrapper):
+        super().__init__()
+        self.wrapper = wrapper
+        self.signals = LevelReadSignals()
+
+    def run(self):
+        brightness, contrast = self.wrapper.read_current_levels()
+        self.signals.result.emit(self.wrapper, brightness, contrast)
+
+
 def _test_ddc_capabilities(monitor):
     """測試 DDC 連線並回傳 capability dict，失敗回傳 None。"""
     with monitor as m:
@@ -1277,6 +1292,13 @@ class MonitorWrapper:
             return
 
         self.name = monitor.name
+
+        if isinstance(monitor, WinPhysicalMonitor):
+            self.supported = True
+            self.available = True
+            self.brightness_supported = True
+            self.contrast_supported = True
+            return
 
         # ── 嘗試 DDC 連線 ──
         caps = None
@@ -2921,6 +2943,9 @@ class MainWindow(QtWidgets.QWidget):
         self.level_shortcuts = [dict(item) for item in DEFAULT_LEVEL_SHORTCUTS]
         self.global_hook = None
         self._loading_settings = False
+        self._initializing_ui = True
+        self._auto_adjust_ready = False
+        self._pending_level_reads = set()
 
         # 網路功能
         self._network_server_enabled = False
@@ -3031,6 +3056,9 @@ class MainWindow(QtWidgets.QWidget):
         self.show_main_page()
         # 立即啟動畫面分析器（使用 inline 偵測到的螢幕）
         self._init_screen_analyzers()
+        self.print_monitor_detection_log()
+        if self._initializing_ui and not self._pending_level_reads:
+            QtCore.QTimer.singleShot(0, self.finish_initial_ui_ready)
         # 若沒抓到可用螢幕，3 秒後完整重試（背景重試仍會載入設定）
         if not self._has_available_local_monitor():
             QtCore.QTimer.singleShot(3000, self.refresh_monitors)
@@ -3040,6 +3068,53 @@ class MainWindow(QtWidgets.QWidget):
             getattr(wrapper, "available", False) and not isinstance(wrapper, RemoteMonitorWrapper)
             for wrapper in self.monitor_wrappers
         )
+
+    def _format_detection_line(self, label, names):
+        names = [str(name) for name in names if _is_valid_monitor_name(str(name))]
+        if names:
+            return f"{label}: {len(names)}台, " + ", ".join(names)
+        return f"{label}: 0台"
+
+    def _format_dxgi_targets(self):
+        dxgi_targets = get_dxgi_display_targets()
+        if not dxgi_targets:
+            return "DXGI targets: 0台"
+        target_text = ", ".join(
+            f"{i}:D{target['device_idx']}O{target['output_idx']}{'*' if target.get('primary') else ''}"
+            for i, target in enumerate(dxgi_targets)
+        )
+        return f"DXGI targets: {target_text}"
+
+    def print_monitor_detection_log(self, local_wrappers=None):
+        local_wrappers = list(local_wrappers if local_wrappers is not None else [
+            wrapper for wrapper in self.monitor_wrappers if not isinstance(wrapper, RemoteMonitorWrapper)
+        ])
+        ddc_names = [
+            wrapper.name
+            for wrapper in local_wrappers
+            if (
+                getattr(wrapper, "available", False)
+                and isinstance(getattr(wrapper, "monitor", None), WinPhysicalMonitor)
+            )
+        ]
+        wmi_names = [
+            wrapper.name
+            for wrapper in local_wrappers
+            if (
+                getattr(wrapper, "available", False)
+                and not isinstance(getattr(wrapper, "monitor", None), WinPhysicalMonitor)
+                and getattr(wrapper, "wmi_supported", False)
+                and getattr(wrapper, "brightness_supported", False)
+            )
+        ]
+        remote_names = [wrapper.name for wrapper in getattr(self, "_remote_wrappers", [])]
+
+        print("===== 重新偵測螢幕 =====")
+        print(self._format_detection_line("DDC", ddc_names))
+        print(self._format_detection_line("WMI", wmi_names))
+        print(self._format_detection_line("遠端", remote_names))
+        print(self._format_dxgi_targets())
+        print("========================")
 
     def _restore_known_monitors_from_settings(self):
         """從設定檔恢復已知螢幕名稱，建立不可用的 MonitorWrapper 佔位"""
@@ -3122,13 +3197,6 @@ class MainWindow(QtWidgets.QWidget):
             # 重置後 factory 已被清除 → 先重新初始化，再試一次
             _CaptureThread.initialize_dxgi()
             dxgi_targets = get_dxgi_display_targets()
-        if dxgi_targets:
-            target_text = ", ".join(
-                f"{i}:D{t['device_idx']}O{t['output_idx']}{'*' if t.get('primary') else ''}"
-                for i, t in enumerate(dxgi_targets)
-            )
-            print(f"DXGI targets: {target_text}")
-
         self.screen_analyzers = []
         self._monitor_auto_states = []
         for idx, wrapper in enumerate(self.monitor_wrappers):
@@ -3170,7 +3238,11 @@ class MainWindow(QtWidgets.QWidget):
         for idx, analyzer in enumerate(getattr(self, "screen_analyzers", [])):
             if analyzer is not None:
                 wrapper = self.monitor_wrappers[idx] if idx < len(self.monitor_wrappers) else None
-                analyzer.enabled = self.auto_adjust_enabled and bool(getattr(wrapper, "available", False))
+                analyzer.enabled = (
+                    bool(getattr(self, "_auto_adjust_ready", True))
+                    and self.auto_adjust_enabled
+                    and bool(getattr(wrapper, "available", False))
+                )
 
     def build_main_page(self):
         page = QtWidgets.QWidget()
@@ -3509,7 +3581,9 @@ class MainWindow(QtWidgets.QWidget):
             print("  重新偵測已在進行中，跳過")
             return
         self._refresh_in_progress = True
-        print("===== 重新偵測螢幕（完整重建） =====")
+        self._initializing_ui = True
+        self._auto_adjust_ready = False
+        self._pending_level_reads.clear()
 
         # ── 第 0 步：先存檔，確保使用者的最新設定不會遺失 ──
         self.save_settings()
@@ -3553,8 +3627,6 @@ class MainWindow(QtWidgets.QWidget):
         # ── 設定 wrappers（worker 已保留舊範圍，但尚未套用孤兒降級） ──
         self.monitor_wrappers = list(fresh_wrappers)
 
-        print(f"  完成: {len(fresh_wrappers)} 台可用螢幕, {len(self._remote_wrappers)} 台遠端")
-
         # ── 從設定檔載入範圍到 wrapper ──
         self._reload_monitor_ranges_from_settings()
 
@@ -3568,6 +3640,7 @@ class MainWindow(QtWidgets.QWidget):
         # ── 重新初始化分析器（先重設 DXGI 狀態） ──
         _CaptureThread.reset_dxgi()
         self._init_screen_analyzers()
+        self.print_monitor_detection_log(local_wrappers=fresh_wrappers)
         self._sync_screen_analyzer_enabled()
 
         # ── 同步 UI 狀態 ──
@@ -3586,8 +3659,6 @@ class MainWindow(QtWidgets.QWidget):
         if hasattr(self, "_refresh_thread") and self._refresh_thread is not None:
             self._refresh_thread.quit()
             self._refresh_thread = None
-
-        print("===== 重新偵測完成 =====")
 
     def _rebuild_monitor_widgets(self):
         """重建 container 內的螢幕 widget（含遠端）。
@@ -4125,23 +4196,19 @@ class MainWindow(QtWidgets.QWidget):
         if len(self.monitor_wrappers) != len(self.monitor_widgets):
             return
 
-        link_values = []
         for wrapper, widget in zip(self.monitor_wrappers, self.monitor_widgets):
             try:
-                if isinstance(wrapper.monitor, WinPhysicalMonitor):
-                    brightness, contrast = None, None
-                else:
-                    brightness, contrast = wrapper.read_current_levels()
+                brightness = wrapper._cached_brightness
+                contrast = wrapper._cached_contrast
                 if brightness is None:
                     brightness = widget.b_slider.slider.value()
                 if contrast is None:
-                    contrast = widget.c_slider.slider.value()
+                    contrast = 0 if not wrapper.contrast_supported else widget.c_slider.slider.value()
 
                 widget.sync_sliders(brightness, contrast)
 
                 link_value = link_value_from_levels(wrapper, brightness, contrast)
                 set_slider_object_value(widget.link_slider, link_value)
-                link_values.append(link_value)
             except RuntimeError:
                 # widget 已被刪除，跳過
                 pass
@@ -4150,6 +4217,76 @@ class MainWindow(QtWidgets.QWidget):
         self._update_auto_adjust_info()
         self._sync_main_global_link_controls()
         self.refresh_tray_display()
+        self.refresh_monitor_levels_async()
+
+    def refresh_monitor_levels_async(self):
+        started_any = False
+        for wrapper in list(self.monitor_wrappers):
+            if isinstance(wrapper, RemoteMonitorWrapper) or not getattr(wrapper, "available", False):
+                continue
+            if getattr(wrapper, "_level_read_in_progress", False):
+                continue
+            wrapper._level_read_in_progress = True
+            self._pending_level_reads.add(wrapper)
+            started_any = True
+            worker = LevelReadWorker(wrapper)
+            worker.signals.result.connect(self.on_monitor_levels_read)
+            self.threadpool.start(worker)
+        if self._initializing_ui:
+            if not started_any and not self._pending_level_reads:
+                self.finish_initial_ui_ready()
+            else:
+                QtCore.QTimer.singleShot(800, self.finish_initial_ui_ready)
+
+    def on_monitor_levels_read(self, wrapper, brightness, contrast):
+        wrapper._level_read_in_progress = False
+        self._pending_level_reads.discard(wrapper)
+        if self._is_quitting or wrapper not in self.monitor_wrappers:
+            if self._initializing_ui and not self._pending_level_reads:
+                self.finish_initial_ui_ready()
+            return
+        try:
+            idx = self.monitor_wrappers.index(wrapper)
+        except ValueError:
+            return
+        if idx >= len(self.monitor_widgets):
+            return
+        widget = self.monitor_widgets[idx]
+        if brightness is None:
+            brightness = widget.b_slider.slider.value()
+        else:
+            wrapper._cached_brightness = int(brightness)
+        if contrast is None:
+            contrast = 0 if not wrapper.contrast_supported else widget.c_slider.slider.value()
+        else:
+            wrapper._cached_contrast = int(contrast)
+        try:
+            widget.sync_sliders(brightness, contrast)
+            link_value = link_value_from_levels(wrapper, brightness, contrast)
+            set_slider_object_value(widget.link_slider, link_value)
+        except RuntimeError:
+            return
+        self._sync_global_link_from_available_monitors()
+        self._update_auto_adjust_info()
+        self._sync_main_global_link_controls()
+        self.refresh_tray_display()
+        if self._initializing_ui and not self._pending_level_reads:
+            self.finish_initial_ui_ready()
+
+    def finish_initial_ui_ready(self):
+        if not getattr(self, "_initializing_ui", False):
+            return
+        self._pending_level_reads.clear()
+        self._initializing_ui = False
+        self._auto_adjust_ready = True
+        for idx, analyzer in enumerate(getattr(self, "screen_analyzers", [])):
+            if analyzer is None or idx >= len(self.monitor_widgets):
+                continue
+            try:
+                analyzer.set_current_ddc(self.monitor_widgets[idx].link_slider.slider.value(), force=True)
+            except Exception:
+                pass
+        self._sync_screen_analyzer_enabled()
 
     def init_global_hook(self):
         if sys.platform != "win32":
@@ -4917,11 +5054,9 @@ class MainWindow(QtWidgets.QWidget):
             self._for_each_screen_analyzer(self._configure_screen_analyzer)
             self._sync_screen_analyzer_enabled()
 
-            # 啟動時：未勾選自動調整則只讀取當前螢幕值更新 UI，不主動寫入 DDC。
-            if self.auto_adjust_enabled:
-                self.update_global_link(saved_link)
-            else:
-                self.sync_ui_with_current_monitor_levels()
+            # 啟動時只同步 UI 與背景讀值，不主動下發 DDC；自動亮度等初始畫面完成後才啟用。
+            self.global_link_value = int(self.snap_to_step(saved_link))
+            self.sync_ui_with_current_monitor_levels()
 
             self._update_auto_adjust_info()
         except FileNotFoundError:
