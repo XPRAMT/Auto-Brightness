@@ -216,7 +216,7 @@ def _run_ddc_with_timeout(func, timeout_sec: float = 3.0, default=None):
     return result[0]
 
 
-# _MonitorDetectWorker 已移除，統一由 _RefreshDetectWorker + refresh_monitors() 處理。
+# 螢幕偵測統一由 MainWindow 的初始化流程處理，手動重新偵測只先清理舊物件。
 
 
 def _rect_to_tuple(rect):
@@ -1214,6 +1214,8 @@ class DDCWorker(QtCore.QRunnable):
         self.contrast_supported = contrast_supported
 
     def run(self):
+        if not self.wrapper.available:
+            return
         try:
             with self.lock:
                 with self.monitor as m:
@@ -1221,18 +1223,11 @@ class DDCWorker(QtCore.QRunnable):
                         m.set_luminance(int(self.brightness))
                     if self.contrast_supported and self.contrast is not None:
                         m.set_contrast(int(self.contrast))
-            # 成功寫入 → 歸零錯誤計數
-            self.wrapper._ddc_error_count = 0
             return
         except Exception as e:
             if self.brightness is not None and _wmi_set_brightness(self.brightness):
-                self.wrapper._ddc_error_count = 0
                 return
-            self.wrapper.flag_ddc_failure()
-            if self.wrapper._ddc_error_count >= self.wrapper.MAX_DDC_FAILURES:
-                print(f"DDC 已停用（連續 {self.wrapper.MAX_DDC_FAILURES} 次失敗）: {self.wrapper.name}")
-            else:
-                print(f"DDC Error ({self.wrapper._ddc_error_count}/{self.wrapper.MAX_DDC_FAILURES}): {e}")
+            log_msg(f"DDC Error: {self.wrapper.name}: {e}")
 
 
 class LevelReadSignals(QtCore.QObject):
@@ -1248,20 +1243,6 @@ class LevelReadWorker(QtCore.QRunnable):
     def run(self):
         brightness, contrast = self.wrapper.read_current_levels()
         self.signals.result.emit(self.wrapper, brightness, contrast)
-
-
-def _test_ddc_capabilities(monitor):
-    """測試 DDC 連線並回傳 capability dict，失敗回傳 None。"""
-    with monitor as m:
-        try:
-            caps = m.get_vcp_capabilities()
-            return caps
-        except Exception:
-            # get_vcp_capabilities 失敗，嘗試 get_luminance
-            val = int(m.get_luminance())
-            if val >= 0:
-                return {"vcp": {0x10: True}, "model": monitor.name}
-            raise
 
 
 # =========================
@@ -1282,70 +1263,43 @@ class MonitorWrapper:
         self.name = name or f"Display {index + 1}"
         self._cached_brightness: int | None = None
         self._cached_contrast: int | None = None
-        self._ddc_error_count = 0
-        self.MAX_DDC_FAILURES = 5
 
         if monitor is None:
-            # 如果傳入了名稱但無效，使用預設
             if name and not _is_valid_monitor_name(self.name):
                 self.name = f"Display {index + 1}"
             return
 
         self.name = monitor.name
+        self.supported = True
+        self.available = True
 
-        if isinstance(monitor, WinPhysicalMonitor):
-            self.supported = True
-            self.available = True
-            self.brightness_supported = True
-            self.contrast_supported = True
-            return
-
-        # ── 嘗試 DDC 連線 ──
-        caps = None
+        # 用 get_luminance() 測試 DDC 可用性
+        # 成功 → DDC 螢幕；失敗（如 VDD by MTT）→ WMI 備援
+        ddc_ok = False
         try:
             with self.lock:
-                caps = _test_ddc_capabilities(monitor)
+                with monitor as m:
+                    val = int(m.get_luminance())
+                    self._cached_brightness = val
+                    self.brightness_supported = True
+                    try:
+                        self._cached_contrast = int(m.get_contrast())
+                        self.contrast_supported = True
+                    except Exception:
+                        pass
+                    ddc_ok = True
         except Exception:
-            caps = None
+            pass
 
-        if isinstance(caps, dict):
-            supported_vcp = caps.get("vcp", {}) or caps.get("cmds", {})
-            if isinstance(supported_vcp, dict):
-                self.brightness_supported = 0x10 in supported_vcp
-                self.contrast_supported = 0x12 in supported_vcp
+        if ddc_ok:
+            return
 
-            try:
-                with self.lock:
-                    with monitor as m:
-                        try:
-                            val = int(m.get_luminance())
-                            self._cached_brightness = val
-                            self.brightness_supported = True
-                        except Exception:
-                            pass
-                        try:
-                            self._cached_contrast = int(m.get_contrast())
-                        except Exception:
-                            pass
-            except Exception:
-                pass
-
-            self.supported = self.brightness_supported or self.contrast_supported
-            self.available = self.supported
-
-        if not self.supported:
-            # ── DDC 失敗 → WMI 備援 ──
-            if self.wmi_supported:
-                self.supported = True
-                self.available = True
-                self.brightness_supported = True
-                self.contrast_supported = False
-
-    def flag_ddc_failure(self):
-        self._ddc_error_count += 1
-        if self._ddc_error_count >= self.MAX_DDC_FAILURES:
+        # DDC 失敗 → WMI 備援
+        if self.wmi_supported:
+            self.brightness_supported = True
+            self.contrast_supported = False
+        else:
             self.supported = False
-            self.brightness_supported = False
             self.available = False
 
     def read_current_levels(self):
@@ -1863,8 +1817,7 @@ class _CaptureThread(QtCore.QThread):
 
     @classmethod
     def reset_dxgi(cls):
-        """完全重設 DXGI 狀態：停止 + 釋放所有 camera 並清除快取，
-        同時清除 dxcam 的全域 factory，避免舊 COM 指標在 GC 時崩潰。"""
+        """完全重設 DXGI 狀態：停止 + 釋放所有 camera，重新初始化 factory。"""
         with cls._dxgi_lock:
             for key, cam in list(cls._dxgi_cameras.items()):
                 if cam.is_capturing:
@@ -1872,8 +1825,7 @@ class _CaptureThread(QtCore.QThread):
                 cam.release()
             cls._dxgi_cameras = {}
             cls._dxgi_disabled = False
-        # 清除 dxcam 內部快取的 factory（設為 None，不 pop，避免 dxcam 內部用到 __factory 名稱）
-        dxcam.__factory = None
+        cls.initialize_dxgi()
 
     @classmethod
     def _get_dxgi_camera(cls, device_idx=0, output_idx=0):
@@ -2072,13 +2024,12 @@ class ScreenAnalyzer(QtCore.QObject):
         self._last_captured_luminance = None
 
     def _tick_capture(self):
+        if self._capture_thread is not None and self._capture_thread.isRunning():
+            return
         if not self.enabled:
             self._direction = 0
             self._adjust_timer.stop()
             self.reset_dynamic_capture_interval()
-            return
-        if self._capture_thread is not None and self._capture_thread.isRunning():
-            return
         self._capture_thread = _CaptureThread(self)
         self._capture_thread.result_ready.connect(self._on_captured)
         self._capture_thread.start()
@@ -2109,7 +2060,7 @@ class ScreenAnalyzer(QtCore.QObject):
 
         self.luminance_updated.emit(lum)
 
-        # 廣播亮度給已連線的 TCP clients（若 server 已啟用）
+        # 廣播亮度給已連線的 TCP clients（不論 enabled 狀態）
         try:
             parent = self.parent()
             if parent and getattr(parent, "_network_server_enabled", False) and getattr(parent, "_net_server", None):
@@ -2119,6 +2070,9 @@ class ScreenAnalyzer(QtCore.QObject):
                     pass
         except Exception:
             pass
+
+        if not self.enabled:
+            return
 
         # 使用者指定公式（可調權重）：
         # 當前亮度 = (平均 + 背光*權重) / (2 + 權重 - 1) = (平均 + 背光*權重) / (1 + 權重)
@@ -2774,118 +2728,6 @@ class _ServiceListener:
         self.add_service(zeroconf, type_, name)
 
 
-class _RefreshDetectWorker(QtCore.QObject):
-    """在背景執行完整螢幕偵測（DDC 操作），完成後以 signal 回傳結果。"""
-    detection_complete = QtCore.pyqtSignal(object)  # dict with detection results
-
-    def __init__(self, old_wrappers: list):
-        super().__init__()
-        self._old_wrappers = old_wrappers
-
-    def run(self):
-        """在背景執行緒執行。"""
-        result = {
-            "fresh_wrappers": [],
-            "detected_monitors": [],
-            "count": 0,
-            "error": None,
-        }
-
-        try:
-            # ── 關閉所有舊的 DDC 連線 ──
-            for w in self._old_wrappers:
-                if isinstance(w, RemoteMonitorWrapper):
-                    continue
-                try:
-                    with w.lock:
-                        if w.monitor is not None:
-                            try:
-                                close_monitor = getattr(w.monitor, "close", None)
-                                if callable(close_monitor):
-                                    close_monitor()
-                            except Exception:
-                                pass
-                            try:
-                                w.monitor.__exit__(None, None, None)
-                            except Exception:
-                                pass
-                            try:
-                                del w.monitor
-                            except Exception:
-                                pass
-                            w.monitor = None
-                except Exception:
-                    pass
-
-            import gc
-            gc.collect()
-
-            # ── 多次重試 Windows DXVA2 Physical Monitor 掃描 ──
-            detected_monitors = []
-            for attempt in range(5):
-                try:
-                    detected_monitors = _run_ddc_with_timeout(
-                        get_local_ddc_monitors,
-                        timeout_sec=3.0,
-                        default=[],
-                    )
-                    if detected_monitors:
-                        break
-                except Exception:
-                    pass
-                if attempt < 4:
-                    import time as _time
-                    _time.sleep(0.5 * (attempt + 1))
-
-            # ── 保留舊範圍 ──
-            preserved_ranges = {}
-            for w in self._old_wrappers:
-                if isinstance(w, RemoteMonitorWrapper):
-                    continue
-                if _is_valid_monitor_name(w.name):
-                    preserved_ranges[w.name] = (
-                        list(w.brightness_range),
-                        list(w.contrast_range),
-                    )
-
-            # ── 建立新 wrappers ──
-            fresh_wrappers = []
-            for i, m in enumerate(detected_monitors):
-                try:
-                    w = _run_ddc_with_timeout(
-                        lambda m=m, i=i: MonitorWrapper(m, i),
-                        timeout_sec=3.0,
-                        default=None,
-                    )
-                    if w is not None:
-                        name = w.name
-                        if name in preserved_ranges:
-                            b_range, c_range = preserved_ranges[name]
-                            w.brightness_range = list(b_range)
-                            w.contrast_range = list(c_range)
-                        fresh_wrappers.append(w)
-                except Exception:
-                    pass
-
-            append_missing_windows_display_placeholders(fresh_wrappers, preserved_ranges)
-
-            # 若無偵測到可用螢幕，保留舊不可用 wrapper 作為佔位
-            if not fresh_wrappers:
-                for w in self._old_wrappers:
-                    if not isinstance(w, RemoteMonitorWrapper):
-                        w.available = False
-                        w.monitor = None
-                        fresh_wrappers.append(w)
-
-            result["fresh_wrappers"] = fresh_wrappers
-            result["count"] = len(detected_monitors)
-
-        except Exception as e:
-            result["error"] = str(e)
-
-        self.detection_complete.emit(result)
-
-
 class RemoteMonitorWrapper:
     """遠端螢幕的 MonitorWrapper 等價物件（唯讀/可遠端設定）。"""
     def __init__(self, data, server_name):
@@ -2992,30 +2834,8 @@ class MainWindow(QtWidgets.QWidget):
         self._remote_widgets = []   # 遠端螢幕的 MonitorWidget
         self._remote_monitor_data = []  # 原始資料（用於 remote_set）
 
-        # 初始螢幕偵測 — 給足夠時間（5s）讓 DDC 列舉完成
-        self.monitor_wrappers = []
-        try:
-            detected = _run_ddc_with_timeout(get_local_ddc_monitors, timeout_sec=5.0, default=[])
-        except Exception:
-            detected = []
-        for i, m in enumerate(detected):
-            try:
-                w = _run_ddc_with_timeout(lambda m=m, i=i: MonitorWrapper(m, i), timeout_sec=3.0, default=None)
-                if w is not None:
-                    self.monitor_wrappers.append(w)
-            except Exception:
-                pass
-
-        append_missing_windows_display_placeholders(self.monitor_wrappers)
-
-        self._prev_raw_monitor_count = max(len(detected), len(get_windows_active_monitor_names()))
-
-        # 完全沒偵測到時，從設定恢復已知螢幕佔位
-        if not self.monitor_wrappers:
-            self._restore_known_monitors_from_settings()
-
-        # 在建 UI 之前先套用已儲存的範圍（與 refresh_monitors 流程一致）
-        self._reload_monitor_ranges_from_settings()
+        # 初始螢幕偵測；手動重新偵測也共用同一條流程。
+        self._load_initial_monitor_wrappers()
 
         self.monitor_widgets = []
         self.monitor_range_widgets = []
@@ -3056,9 +2876,8 @@ class MainWindow(QtWidgets.QWidget):
         self.show_main_page()
         # 立即啟動畫面分析器（使用 inline 偵測到的螢幕）
         self._init_screen_analyzers()
-        self.print_monitor_detection_log()
         if self._initializing_ui and not self._pending_level_reads:
-            QtCore.QTimer.singleShot(0, self.finish_initial_ui_ready)
+            QtCore.QTimer.singleShot(3000, self.finish_initial_ui_ready)
         # 若沒抓到可用螢幕，3 秒後完整重試（背景重試仍會載入設定）
         if not self._has_available_local_monitor():
             QtCore.QTimer.singleShot(3000, self.refresh_monitors)
@@ -3068,6 +2887,57 @@ class MainWindow(QtWidgets.QWidget):
             getattr(wrapper, "available", False) and not isinstance(wrapper, RemoteMonitorWrapper)
             for wrapper in self.monitor_wrappers
         )
+
+    def _load_initial_monitor_wrappers(self):
+        """使用啟動時同一條流程偵測本地螢幕，並套用設定檔中的範圍。"""
+        self.monitor_wrappers = []
+        try:
+            detected = list(get_local_ddc_monitors())
+        except Exception:
+            detected = []
+        for i, m in enumerate(detected):
+            try:
+                w = MonitorWrapper(m, i)
+                if w is not None:
+                    self.monitor_wrappers.append(w)
+            except Exception:
+                pass
+
+        append_missing_windows_display_placeholders(self.monitor_wrappers)
+        self._prev_raw_monitor_count = max(len(detected), len(get_windows_active_monitor_names()))
+
+        if not self.monitor_wrappers:
+            self._restore_known_monitors_from_settings()
+
+        self._reload_monitor_ranges_from_settings()
+
+    def _close_local_monitor_wrappers(self, wrappers):
+        for wrapper in list(wrappers):
+            if isinstance(wrapper, RemoteMonitorWrapper):
+                continue
+            try:
+                with wrapper.lock:
+                    monitor = getattr(wrapper, "monitor", None)
+                    if monitor is None:
+                        continue
+                    try:
+                        close_monitor = getattr(monitor, "close", None)
+                        if callable(close_monitor):
+                            close_monitor()
+                    except Exception:
+                        pass
+                    try:
+                        monitor.__exit__(None, None, None)
+                    except Exception:
+                        pass
+                    wrapper.monitor = None
+            except Exception:
+                pass
+        try:
+            import gc
+            gc.collect()
+        except Exception:
+            pass
 
     def _format_detection_line(self, label, names):
         names = [str(name) for name in names if _is_valid_monitor_name(str(name))]
@@ -3083,7 +2953,25 @@ class MainWindow(QtWidgets.QWidget):
             f"{i}:D{target['device_idx']}O{target['output_idx']}{'*' if target.get('primary') else ''}"
             for i, target in enumerate(dxgi_targets)
         )
-        return f"DXGI targets: {target_text}"
+        # 快速擷取測試
+        brightness_values = []
+        for target in dxgi_targets:
+            try:
+                cam = _CaptureThread._get_dxgi_camera(target["device_idx"], target["output_idx"])
+                if cam is None:
+                    brightness_values.append("?")
+                    continue
+                frame = cam.grab()
+                if frame is None:
+                    brightness_values.append("?")
+                    continue
+                gray = 0.299 * frame[:, :, 0] + 0.587 * frame[:, :, 1] + 0.114 * frame[:, :, 2]
+                avg = float(np.mean(gray[::8, ::8])) / 255.0 * 100.0
+                brightness_values.append(f"{avg:.0f}%")
+            except Exception:
+                brightness_values.append("?")
+        brightness_text = ", ".join(brightness_values)
+        return f"DXGI targets: {target_text}  brightness: {brightness_text}"
 
     def print_monitor_detection_log(self, local_wrappers=None):
         local_wrappers = list(local_wrappers if local_wrappers is not None else [
@@ -3094,7 +2982,7 @@ class MainWindow(QtWidgets.QWidget):
             for wrapper in local_wrappers
             if (
                 getattr(wrapper, "available", False)
-                and isinstance(getattr(wrapper, "monitor", None), WinPhysicalMonitor)
+                and getattr(wrapper, "_cached_brightness", None) is not None
             )
         ]
         wmi_names = [
@@ -3110,6 +2998,7 @@ class MainWindow(QtWidgets.QWidget):
         remote_names = [wrapper.name for wrapper in getattr(self, "_remote_wrappers", [])]
 
         print("===== 重新偵測螢幕 =====")
+        log_msg("")
         print(self._format_detection_line("DDC", ddc_names))
         print(self._format_detection_line("WMI", wmi_names))
         print(self._format_detection_line("遠端", remote_names))
@@ -3199,32 +3088,37 @@ class MainWindow(QtWidgets.QWidget):
             dxgi_targets = get_dxgi_display_targets()
         self.screen_analyzers = []
         self._monitor_auto_states = []
-        for idx, wrapper in enumerate(self.monitor_wrappers):
-            self._monitor_auto_states.append({"avg": None, "source": "—", "current": None})
-            if isinstance(wrapper, RemoteMonitorWrapper):
+        # 只對可用的本地螢幕建立 analyzer，依序配對 DXGI targets
+        dxgi_idx = 0
+        for wrapper in self.monitor_wrappers:
+            if isinstance(wrapper, RemoteMonitorWrapper) or not getattr(wrapper, "available", False):
+                self._monitor_auto_states.append({"avg": None, "source": "—", "current": None})
                 self.screen_analyzers.append(None)
                 continue
 
-            if not dxgi_targets or idx >= len(dxgi_targets):
-                print(f"DXGI target missing for monitor {idx}: {wrapper.name}")
+            dxgi_target = dxgi_targets[dxgi_idx] if dxgi_targets and dxgi_idx < len(dxgi_targets) else None
+            if dxgi_target is None:
+                print(f"DXGI target missing for monitor {wrapper.name}")
+                self._monitor_auto_states.append({"avg": None, "source": "—", "current": None})
                 self.screen_analyzers.append(None)
+                dxgi_idx += 1
                 continue
 
-            dxgi_target = dxgi_targets[idx]
-            analyzer = ScreenAnalyzer(self, output_idx=idx, dxgi_target=dxgi_target)
+            analyzer = ScreenAnalyzer(self, output_idx=dxgi_idx, dxgi_target=dxgi_target)
             self._configure_screen_analyzer(analyzer)
-            # 從 widget slider 同步 analyzer 內部狀態，使其與真實背光一致
-            if idx < len(self.monitor_widgets):
+            if dxgi_idx < len(self.monitor_widgets):
                 try:
-                    actual = int(self.monitor_widgets[idx].link_slider.slider.value())
+                    actual = int(self.monitor_widgets[dxgi_idx].link_slider.slider.value())
                     analyzer.set_current_ddc(actual, force=True)
                 except Exception:
                     pass
-            analyzer.adjust_requested.connect(lambda delta, i=idx: self.on_screen_adjust_requested(i, delta))
-            analyzer.luminance_updated.connect(lambda lum, i=idx: self.on_luminance_updated(i, lum))
-            analyzer.luminance_source_updated.connect(lambda source, i=idx: self._on_luminance_source_updated(i, source))
+            analyzer.adjust_requested.connect(lambda delta, i=dxgi_idx: self.on_screen_adjust_requested(i, delta))
+            analyzer.luminance_updated.connect(lambda lum, i=dxgi_idx: self.on_luminance_updated(i, lum))
+            analyzer.luminance_source_updated.connect(lambda source, i=dxgi_idx: self._on_luminance_source_updated(i, source))
             analyzer.start()
             self.screen_analyzers.append(analyzer)
+            self._monitor_auto_states.append({"avg": None, "source": "—", "current": None})
+            dxgi_idx += 1
 
         self.screen_analyzer = next((a for a in self.screen_analyzers if a is not None), None)
         self._sync_screen_analyzer_enabled()
@@ -3575,90 +3469,47 @@ class MainWindow(QtWidgets.QWidget):
         self.activateWindow()
 
     def refresh_monitors(self):
-        """完整重啟偵測流程：釋放舊資源、多次重試、完全重建 UI。
-        等同於軟重啟，解決大多數熱插拔問題而不需關閉程式。"""
+        """釋放舊資源後，使用與程式啟動相同的流程重新偵測螢幕。"""
         if getattr(self, "_refresh_in_progress", False):
             print("  重新偵測已在進行中，跳過")
             return
         self._refresh_in_progress = True
-        self._initializing_ui = True
-        self._auto_adjust_ready = False
-        self._pending_level_reads.clear()
+        try:
+            self._initializing_ui = True
+            self._auto_adjust_ready = False
+            self._pending_level_reads.clear()
 
-        # ── 第 0 步：先存檔，確保使用者的最新設定不會遺失 ──
-        self.save_settings()
+            # 先存檔，確保使用者的最新設定不會遺失。
+            self.save_settings()
 
-        # ── 第 1 步：停止所有分析器（主執行緒安全） ──
-        self._for_each_screen_analyzer(lambda a: a.stop())
-        self.screen_analyzers = []
-        self.screen_analyzer = None
-        self._monitor_auto_states = []
+            # 清除既有分析器與 DDC 物件，之後走初始化偵測流程。
+            self._for_each_screen_analyzer(lambda a: a.stop())
+            self.screen_analyzers = []
+            self.screen_analyzer = None
+            self._monitor_auto_states = []
+            self._close_local_monitor_wrappers(self.monitor_wrappers)
 
-        # ── 第 2~4 步：背景執行緒執行 DDC 操作 ──
-        self._refresh_worker = _RefreshDetectWorker(
-            old_wrappers=list(self.monitor_wrappers),
-        )
-        self._refresh_worker.detection_complete.connect(self._on_refresh_complete)
-        thread = QtCore.QThread(self)
-        self._refresh_worker.moveToThread(thread)
-        thread.started.connect(self._refresh_worker.run)
-        thread.finished.connect(thread.deleteLater)
-        thread.start()
-        self._refresh_thread = thread
+            self._load_initial_monitor_wrappers()
+            self._rebuild_monitor_widgets()
+            self._rebuild_range_widgets()
+            self._reinsert_remote_widgets()
 
-    def _on_refresh_complete(self, result):
-        """背景偵測完成後，在主執行緒更新 UI。
-        合併當前 live 的遠端 wrappers（由 NetworkMonitorClient 管理），
-        取代 worker 中捕捉的過時舊資料。"""
-        self._refresh_in_progress = False
+            _CaptureThread.reset_dxgi()
+            self._init_screen_analyzers()
+            self._sync_screen_analyzer_enabled()
 
-        if self._is_quitting:
-            return
+            self._update_analyzer_levels()
+            self.sync_ui_with_current_monitor_levels()
+            self._update_auto_adjust_info()
+            self._update_auto_formula_label()
 
-        if result.get("error"):
-            print(f"  重新偵測失敗: {result['error']}")
-            return
-
-        fresh_wrappers = result.get("fresh_wrappers", [])
-        detected_count = result.get("count", 0)
-
-        self._prev_raw_monitor_count = max(detected_count, len(get_windows_active_monitor_names()))
-
-        # ── 設定 wrappers（worker 已保留舊範圍，但尚未套用孤兒降級） ──
-        self.monitor_wrappers = list(fresh_wrappers)
-
-        # ── 從設定檔載入範圍到 wrapper ──
-        self._reload_monitor_ranges_from_settings()
-
-        # ── 重建螢幕 UI（main page 的 monitor widget + settings page 的範圍設定） ──
-        self._rebuild_monitor_widgets()
-        self._rebuild_range_widgets()
-
-        # ── 重建完成後，重新插入遠端螢幕 widgets ──
-        self._reinsert_remote_widgets()
-
-        # ── 重新初始化分析器（先重設 DXGI 狀態） ──
-        _CaptureThread.reset_dxgi()
-        self._init_screen_analyzers()
-        self.print_monitor_detection_log(local_wrappers=fresh_wrappers)
-        self._sync_screen_analyzer_enabled()
-
-        # ── 同步 UI 狀態 ──
-        self._update_analyzer_levels()
-        self.sync_ui_with_current_monitor_levels()
-        self._update_auto_adjust_info()
-        self._update_auto_formula_label()
-
-        # 合併遠端 wrappers 到主列表
-        self.monitor_wrappers.extend(self._remote_wrappers)
-
-        self.refresh_tray_display()
-        self.trigger_save()
-
-        # 清理 thread reference
-        if hasattr(self, "_refresh_thread") and self._refresh_thread is not None:
-            self._refresh_thread.quit()
-            self._refresh_thread = None
+            self.monitor_wrappers.extend(self._remote_wrappers)
+            self.refresh_tray_display()
+            self.trigger_save()
+            if self._initializing_ui and not self._pending_level_reads:
+                self.finish_initial_ui_ready()
+        finally:
+            self._refresh_in_progress = False
 
     def _rebuild_monitor_widgets(self):
         """重建 container 內的螢幕 widget（含遠端）。
@@ -4236,7 +4087,7 @@ class MainWindow(QtWidgets.QWidget):
             if not started_any and not self._pending_level_reads:
                 self.finish_initial_ui_ready()
             else:
-                QtCore.QTimer.singleShot(800, self.finish_initial_ui_ready)
+                QtCore.QTimer.singleShot(3000, self.finish_initial_ui_ready)
 
     def on_monitor_levels_read(self, wrapper, brightness, contrast):
         wrapper._level_read_in_progress = False
@@ -4279,6 +4130,7 @@ class MainWindow(QtWidgets.QWidget):
         self._pending_level_reads.clear()
         self._initializing_ui = False
         self._auto_adjust_ready = True
+        self.print_monitor_detection_log()
         for idx, analyzer in enumerate(getattr(self, "screen_analyzers", [])):
             if analyzer is None or idx >= len(self.monitor_widgets):
                 continue
@@ -4803,9 +4655,6 @@ class MainWindow(QtWidgets.QWidget):
             self._hotplug_watcher.stop()
         if hasattr(self, "_hotplug_debounce_timer"):
             self._hotplug_debounce_timer.stop()
-        if hasattr(self, "_refresh_thread") and self._refresh_thread is not None:
-            self._refresh_thread.quit()
-            self._refresh_thread = None
         for wrapper in list(getattr(self, "monitor_wrappers", [])):
             if isinstance(wrapper, RemoteMonitorWrapper):
                 continue
