@@ -2,7 +2,7 @@
 
 [English](README.md) | 繁體中文
 
-Auto Brightness 是一個 Windows 桌面工具，以精簡的 PyQt6 系統匣應用程式控制螢幕亮度與對比。它支援 DDC/CI 外接螢幕、相容內建螢幕的 WMI 亮度備援、全域快捷鍵、依畫面內容自動調整亮度，以及區域網路遠端控制螢幕。
+Auto Brightness 是一個 Windows 桌面工具，以精簡的 PyQt6 系統匣應用程式控制螢幕亮度與對比。它透過 Windows 原生 DXVA2 API 支援 DDC/CI 外接螢幕、相容內建螢幕的 WMI 亮度備援、全域快捷鍵、依畫面內容自動調整亮度，以及區域網路遠端控制螢幕。
 
 ## 功能
 
@@ -21,7 +21,7 @@ Auto Brightness 是一個 Windows 桌面工具，以精簡的 PyQt6 系統匣應
 - Windows。
 - 建議使用 Python 3.10 或更新版本。
 - 外接螢幕需支援 DDC/CI 才能控制亮度與對比。
-- Python 套件：`PyQt6`、`monitorcontrol`、`zeroconf`、`numpy`、`dxcam`、`wmi`。
+- Python 套件：`PyQt6`、`zeroconf`、`numpy`、`dxcam`、`wmi`。
 
 ## 安裝
 
@@ -31,7 +31,7 @@ cd Auto-Brightness
 python -m venv .venv
 .\venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-python -m pip install PyQt6 monitorcontrol zeroconf numpy dxcam wmi
+python -m pip install PyQt6 zeroconf numpy dxcam wmi
 ```
 
 所有列出的套件都會在啟動時匯入。若缺少任一套件，程式會直接結束，方便先安裝缺少的依賴。

@@ -2,7 +2,7 @@
 
 English | [繁體中文](README_TW.md)
 
-Auto Brightness is a Windows desktop utility for controlling monitor brightness and contrast from a compact PyQt6 tray app. It supports DDC/CI external displays, WMI brightness fallback for compatible built-in displays, global hotkeys, content-aware automatic brightness, and LAN-based remote monitor control.
+Auto Brightness is a Windows desktop utility for controlling monitor brightness and contrast from a compact PyQt6 tray app. It supports DDC/CI external displays through native Windows DXVA2 APIs, WMI brightness fallback for compatible built-in displays, global hotkeys, content-aware automatic brightness, and LAN-based remote monitor control.
 
 ## Features
 
@@ -21,7 +21,7 @@ Auto Brightness is a Windows desktop utility for controlling monitor brightness 
 - Windows.
 - Python 3.10 or newer is recommended.
 - Monitors that support DDC/CI for external brightness and contrast control.
-- Python packages: `PyQt6`, `monitorcontrol`, `zeroconf`, `numpy`, `dxcam`, `wmi`.
+- Python packages: `PyQt6`, `zeroconf`, `numpy`, `dxcam`, `wmi`.
 
 ## Installation
 
@@ -31,7 +31,7 @@ cd Auto-Brightness
 python -m venv .venv
 .\venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-python -m pip install PyQt6 monitorcontrol zeroconf numpy dxcam wmi
+python -m pip install PyQt6 zeroconf numpy dxcam wmi
 ```
 
 All listed packages are imported at startup. If one is missing, the app exits immediately so the missing dependency can be installed before use.
