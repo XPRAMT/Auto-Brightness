@@ -1204,28 +1204,50 @@ class GlobalHotkeyWheelHook(QtCore.QObject):
 # Worker Thread
 # =========================
 class DDCWorker(QtCore.QRunnable):
-    def __init__(self, monitor, lock, brightness=None, contrast=None, contrast_supported=True):
+    def __init__(self, wrapper, brightness=None, contrast=None, contrast_supported=True):
         super().__init__()
-        self.monitor = monitor
-        self.lock = lock
+        self.wrapper = wrapper
+        self.monitor = wrapper.monitor
+        self.lock = wrapper.lock
         self.brightness = brightness
         self.contrast = contrast
         self.contrast_supported = contrast_supported
 
     def run(self):
         try:
-            # 同一台螢幕序列化送出 DDC 指令，避免 context manager 狀態互相覆蓋
             with self.lock:
                 with self.monitor as m:
                     if self.brightness is not None:
                         m.set_luminance(int(self.brightness))
                     if self.contrast_supported and self.contrast is not None:
                         m.set_contrast(int(self.contrast))
+            # 成功寫入 → 歸零錯誤計數
+            self.wrapper._ddc_error_count = 0
             return
         except Exception as e:
             if self.brightness is not None and _wmi_set_brightness(self.brightness):
+                self.wrapper._ddc_error_count = 0
                 return
-            print("DDC Error:", e)
+            self.wrapper.flag_ddc_failure()
+            if self.wrapper._ddc_error_count >= self.wrapper.MAX_DDC_FAILURES:
+                print(f"DDC 已停用（連續 {self.wrapper.MAX_DDC_FAILURES} 次失敗）: {self.wrapper.name}")
+            else:
+                print(f"DDC Error ({self.wrapper._ddc_error_count}/{self.wrapper.MAX_DDC_FAILURES}): {e}")
+
+
+def _test_ddc_capabilities(monitor):
+    """測試 DDC 連線並回傳 capability dict，失敗回傳 None。"""
+    with monitor as m:
+        try:
+            caps = m.get_vcp_capabilities()
+            return caps
+        except Exception:
+            # get_vcp_capabilities 失敗，嘗試 get_luminance
+            val = int(m.get_luminance())
+            if val >= 0:
+                return {"vcp": {0x10: True}, "model": monitor.name}
+            raise
+
 
 # =========================
 # Monitor Wrapper
@@ -1237,14 +1259,16 @@ class MonitorWrapper:
         self.index = index
         self.brightness_range = list(b_range or [0, 100])
         self.contrast_range = list(c_range or [0, 100])
-        self.supported = monitor is not None
-        self.brightness_supported = monitor is not None
-        self.contrast_supported = monitor is not None
-        self.available = monitor is not None
+        self.supported = False
+        self.brightness_supported = False
+        self.contrast_supported = False
+        self.available = False
         self.wmi_supported = _wmi_brightness_supported()
         self.name = name or f"Display {index + 1}"
         self._cached_brightness: int | None = None
         self._cached_contrast: int | None = None
+        self._ddc_error_count = 0
+        self.MAX_DDC_FAILURES = 5
 
         if monitor is None:
             # 如果傳入了名稱但無效，使用預設
@@ -1252,50 +1276,55 @@ class MonitorWrapper:
                 self.name = f"Display {index + 1}"
             return
 
-        if isinstance(monitor, WinPhysicalMonitor):
-            self.name = monitor.name
-            self.supported = True
-            self.available = True
-            self.brightness_supported = True
-            self.contrast_supported = True
-            return
+        self.name = monitor.name
 
+        # ── 嘗試 DDC 連線 ──
         caps = None
         try:
-            with monitor:
-                caps = monitor.get_vcp_capabilities()
-                supported_vcp = {}
-                if isinstance(caps, dict):
-                    supported_vcp = caps.get("vcp", {}) or caps.get("cmds", {})
-
-                if isinstance(supported_vcp, dict):
-                    self.brightness_supported = 0x10 in supported_vcp
-                    self.contrast_supported = 0x12 in supported_vcp
-
-                try:
-                    val = int(monitor.get_luminance())
-                    self._cached_brightness = val
-                    self.brightness_supported = True
-                except Exception:
-                    pass
-                try:
-                    val = int(monitor.get_contrast())
-                    self._cached_contrast = val
-                    self.contrast_supported = True
-                except Exception:
-                    pass
-
-                self.supported = self.brightness_supported or self.contrast_supported or self.wmi_supported
-                self.available = self.supported
-                if self.wmi_supported and not self.contrast_supported:
-                    self.contrast_supported = False
+            with self.lock:
+                caps = _test_ddc_capabilities(monitor)
         except Exception:
-            # DDC 通訊失敗 → 若 WMI 可用則回退到筆電亮度控制；否則標記為不可用
-            self.supported = self.wmi_supported
-            self.brightness_supported = self.wmi_supported
-            self.contrast_supported = False
-            self.available = self.wmi_supported
-        self.name = get_monitor_display_name(monitor, index, caps)
+            caps = None
+
+        if isinstance(caps, dict):
+            supported_vcp = caps.get("vcp", {}) or caps.get("cmds", {})
+            if isinstance(supported_vcp, dict):
+                self.brightness_supported = 0x10 in supported_vcp
+                self.contrast_supported = 0x12 in supported_vcp
+
+            try:
+                with self.lock:
+                    with monitor as m:
+                        try:
+                            val = int(m.get_luminance())
+                            self._cached_brightness = val
+                            self.brightness_supported = True
+                        except Exception:
+                            pass
+                        try:
+                            self._cached_contrast = int(m.get_contrast())
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+            self.supported = self.brightness_supported or self.contrast_supported
+            self.available = self.supported
+
+        if not self.supported:
+            # ── DDC 失敗 → WMI 備援 ──
+            if self.wmi_supported:
+                self.supported = True
+                self.available = True
+                self.brightness_supported = True
+                self.contrast_supported = False
+
+    def flag_ddc_failure(self):
+        self._ddc_error_count += 1
+        if self._ddc_error_count >= self.MAX_DDC_FAILURES:
+            self.supported = False
+            self.brightness_supported = False
+            self.available = False
 
     def read_current_levels(self):
         if not self.available or self.monitor is None:
@@ -1426,8 +1455,13 @@ class MonitorWidget(QtWidgets.QGroupBox):
         self.b_slider.slider.setRange(b_min, b_max)
         self.c_slider.slider.setRange(c_min, c_max)
 
-        b_val = max(b_min, min(b_max, self.b_slider.slider.value()))
-        c_val = max(c_min, min(c_max, self.c_slider.slider.value()))
+        # 優先使用建構時從螢幕讀取到的實際值，否則保留 slider 當前值
+        b_val = self.monitor._cached_brightness
+        if b_val is None:
+            b_val = max(b_min, min(b_max, self.b_slider.slider.value()))
+        c_val = self.monitor._cached_contrast
+        if c_val is None:
+            c_val = max(c_min, min(c_max, self.c_slider.slider.value()))
         self.b_slider.slider.setValue(b_val)
         self.c_slider.slider.setValue(c_val)
         self.b_slider.value_label.setText(str(b_val))
@@ -1498,13 +1532,18 @@ class MonitorWidget(QtWidgets.QGroupBox):
         if DEBUG_LOG_ENABLED:
             log_msg(f"[DDC_WRITE] {self.monitor.name}: brightness={self.pending_brightness}, contrast={contrast_value}")
         worker = DDCWorker(
-            self.monitor.monitor,
-            self.monitor.lock,
+            self.monitor,
             self.pending_brightness,
             contrast_value,
             contrast_supported=self.monitor.contrast_supported,
         )
         self.threadpool.start(worker)
+        # 延遲檢查：若 DDCWorker 已將螢幕標記為不可用，更新 UI
+        QtCore.QTimer.singleShot(200, self._check_ddc_availability)
+
+    def _check_ddc_availability(self):
+        if not self.monitor.available:
+            self.set_available(False)
 
     def set_available(self, available):
         """灰階/恢復顯示，可用時啟用滑桿，不可用時鎖定"""
@@ -1910,9 +1949,10 @@ class ScreenAnalyzer(QtCore.QObject):
         self.enabled = False
         self._last_source = "—"
         self.target = 50        # 目標畫面亮度 0-100
-        self._k = 0.8           # 平方根曲線係數
+        self._k = 0.8           # 曲線係數（sqrt: 步階係數，linear: 每 tick 比例）
+        self._mode = "sqrt"    # "sqrt" 或 "linear"
         self.weight = AUTO_BRIGHTNESS_WEIGHT_DEFAULT  # 背光權重
-        # 調整步階由平方根曲線自動決定
+        # 調整步階由所選模式決定
         self.total_levels = 100 # 由 MainWindow 更新
         self.resource_saving_enabled = True
         self.resource_saving_idle_seconds = 5.0
@@ -1970,15 +2010,21 @@ class ScreenAnalyzer(QtCore.QObject):
         self._adjust_timer.setInterval(ms)
 
     def set_k(self, k):
-        self._k = max(0.1, min(5.0, float(k)))
+        self._k = max(0.01, min(5.0, float(k)))
+
+    def set_mode(self, mode):
+        if mode in ("sqrt", "linear"):
+            self._mode = mode
 
     def _auto_threshold(self, c, w):
-        """由平方根曲線參數自動推導反應門檻（effective 亮度空間）。
-        保留擴充點：未來可加入自適應滯環偵測（方向反覆翻轉時動態放寬門檻）。"""
+        """由所選模式參數自動推導反應門檻（effective 亮度空間）。"""
         min_step = 0.5
-        # DDC 空間中可解析的最小步階
-        ddc_deadband = (min_step / max(self._k, 0.01)) ** 2
-        # 轉換到 effective 空間
+        if self._mode == "linear":
+            # 線性模式：step = remaining × k，step < min_step 時停
+            ddc_deadband = min_step / max(self._k, 0.01)
+        else:
+            # sqrt 模式
+            ddc_deadband = (min_step / max(self._k, 0.01)) ** 2
         return ddc_deadband * w / (c + w)
 
     def recalculate_desired_from_last_luminance(self):
@@ -2102,8 +2148,13 @@ class ScreenAnalyzer(QtCore.QObject):
             self._adjust_timer.stop()
             return
 
-        # 平方根曲線（方案 D）：step = sign(remaining) × sqrt(abs(remaining)) × k
-        step = math.copysign(1.0, remaining) * math.sqrt(abs(remaining)) * self._k
+        # 依所選模式計算步階
+        if self._mode == "linear":
+            # 線性模式：step = remaining × k（k=0.1 即 remaining/10）
+            step = remaining * self._k
+        else:
+            # 平方根曲線（方案 D）：step = sign(remaining) × sqrt(abs(remaining)) × k
+            step = math.copysign(1.0, remaining) * math.sqrt(abs(remaining)) * self._k
         # 最低步階，避免停滯
         if 0 < abs(step) < 0.5:
             step = 0.5 if step > 0 else -0.5
@@ -2884,6 +2935,7 @@ class MainWindow(QtWidgets.QWidget):
         # 畫面自動調整
         self.auto_adjust_enabled = False
         self.auto_adjust_target = 50
+        self.auto_adjust_mode = "sqrt"
         self.auto_adjust_k = 0.8
         self.auto_adjust_weight = AUTO_BRIGHTNESS_WEIGHT_DEFAULT
         self.auto_adjust_capture_interval = 1.0
@@ -3050,6 +3102,7 @@ class MainWindow(QtWidgets.QWidget):
     def _configure_screen_analyzer(self, analyzer):
         analyzer.enabled = self.auto_adjust_enabled
         analyzer.target = self.auto_adjust_target
+        analyzer.set_mode(self.auto_adjust_mode)
         analyzer.set_k(self.auto_adjust_k)
         analyzer.weight = self.auto_adjust_weight
         analyzer.set_capture_interval_seconds(self.auto_adjust_capture_interval)
@@ -3092,6 +3145,13 @@ class MainWindow(QtWidgets.QWidget):
             dxgi_target = dxgi_targets[idx]
             analyzer = ScreenAnalyzer(self, output_idx=idx, dxgi_target=dxgi_target)
             self._configure_screen_analyzer(analyzer)
+            # 從 widget slider 同步 analyzer 內部狀態，使其與真實背光一致
+            if idx < len(self.monitor_widgets):
+                try:
+                    actual = int(self.monitor_widgets[idx].link_slider.slider.value())
+                    analyzer.set_current_ddc(actual, force=True)
+                except Exception:
+                    pass
             analyzer.adjust_requested.connect(lambda delta, i=idx: self.on_screen_adjust_requested(i, delta))
             analyzer.luminance_updated.connect(lambda lum, i=idx: self.on_luminance_updated(i, lum))
             analyzer.luminance_source_updated.connect(lambda source, i=idx: self._on_luminance_source_updated(i, source))
@@ -3311,12 +3371,17 @@ class MainWindow(QtWidgets.QWidget):
         self.auto_adjust_checkbox.toggled.connect(self.on_auto_adjust_toggled)
 
         self.auto_adjust_k_spin = QtWidgets.QDoubleSpinBox()
-        self.auto_adjust_k_spin.setRange(0.1, 5.0)
-        self.auto_adjust_k_spin.setSingleStep(0.1)
+        self.auto_adjust_k_spin.setRange(0.01, 5.0)
+        self.auto_adjust_k_spin.setSingleStep(0.05)
         self.auto_adjust_k_spin.setDecimals(2)
         self.auto_adjust_k_spin.setValue(self.auto_adjust_k)
         self.auto_adjust_k_spin.setToolTip("平方根曲線係數，越大越快。預設 0.8")
         self.auto_adjust_k_spin.valueChanged.connect(self.on_auto_adjust_settings_changed)
+
+        self.auto_adjust_mode_combo = QtWidgets.QComboBox()
+        self.auto_adjust_mode_combo.addItems(["曲線 (sqrt)", "線性"])
+        self.auto_adjust_mode_combo.setCurrentIndex({"sqrt": 0, "linear": 1}.get(self.auto_adjust_mode, 0))
+        self.auto_adjust_mode_combo.currentIndexChanged.connect(self.on_auto_adjust_settings_changed)
 
         self.auto_adjust_weight_spin = QtWidgets.QDoubleSpinBox()
         self.auto_adjust_weight_spin.setRange(0.1, 10.0)
@@ -3365,16 +3430,17 @@ class MainWindow(QtWidgets.QWidget):
         auto_grid.addWidget(self.auto_adjust_checkbox, 0, 0, 1, 4)
         auto_grid.addWidget(QtWidgets.QLabel("截圖間隔"), 1, 0)
         auto_grid.addWidget(self.auto_adjust_capture_interval_spin, 1, 1)
-        auto_grid.addWidget(QtWidgets.QLabel("曲線係數 k"), 1, 2)
-        auto_grid.addWidget(self.auto_adjust_k_spin, 1, 3)
-        auto_grid.addWidget(QtWidgets.QLabel("背光權重"), 2, 0)
-        auto_grid.addWidget(QtWidgets.QLabel("背光權重"), 2, 2)
-        auto_grid.addWidget(self.auto_adjust_weight_spin, 2, 3)
-        auto_grid.addWidget(self.auto_adjust_resource_saving_checkbox, 3, 0, 1, 2)
-        auto_grid.addWidget(QtWidgets.QLabel("靜止門檻"), 3, 2)
-        auto_grid.addWidget(self.auto_adjust_resource_saving_idle_spin, 3, 3)
-        auto_grid.addWidget(QtWidgets.QLabel("調整間隔"), 4, 0)
-        auto_grid.addWidget(self.auto_adjust_tick_interval_spin, 4, 1)
+        auto_grid.addWidget(QtWidgets.QLabel("調整間隔"), 1, 2)
+        auto_grid.addWidget(self.auto_adjust_tick_interval_spin, 1, 3)
+        auto_grid.addWidget(QtWidgets.QLabel("模式"), 2, 0)
+        auto_grid.addWidget(self.auto_adjust_mode_combo, 2, 1)
+        auto_grid.addWidget(QtWidgets.QLabel("曲線係數 k"), 2, 2)
+        auto_grid.addWidget(self.auto_adjust_k_spin, 2, 3)
+        auto_grid.addWidget(QtWidgets.QLabel("背光權重"), 3, 0)
+        auto_grid.addWidget(self.auto_adjust_weight_spin, 3, 1)
+        auto_grid.addWidget(self.auto_adjust_resource_saving_checkbox, 4, 0, 1, 2)
+        auto_grid.addWidget(QtWidgets.QLabel("靜止門檻"), 4, 2)
+        auto_grid.addWidget(self.auto_adjust_resource_saving_idle_spin, 4, 3)
         auto_grid.addWidget(self.auto_formula_label, 5, 0, 1, 4)
         auto_group.setLayout(auto_grid)
         mon_layout.addWidget(auto_group)
@@ -4118,6 +4184,7 @@ class MainWindow(QtWidgets.QWidget):
         self._sync_app_state_to_remote_servers(auto_enabled=self.auto_adjust_enabled)
 
     def on_auto_adjust_settings_changed(self):
+        self.auto_adjust_mode = {"曲線 (sqrt)": "sqrt", "線性": "linear"}.get(self.auto_adjust_mode_combo.currentText(), "sqrt")
         self.auto_adjust_k = float(self.auto_adjust_k_spin.value())
         self.auto_adjust_weight = float(self.auto_adjust_weight_spin.value())
         self.auto_adjust_capture_interval = float(self.auto_adjust_capture_interval_spin.value())
@@ -4645,6 +4712,7 @@ class MainWindow(QtWidgets.QWidget):
             "auto_adjust": {
                 "enabled": self.auto_adjust_enabled,
                 "target": self.auto_adjust_target,
+                "mode": self.auto_adjust_mode,
                 "k": self.auto_adjust_k,
                 "weight": self.auto_adjust_weight,
                 "capture_interval": self.auto_adjust_capture_interval,
@@ -4793,6 +4861,9 @@ class MainWindow(QtWidgets.QWidget):
 
             # 載入畫面自動調整設定
             self.auto_adjust_target = int(auto_adjust_data.get("target", 50))
+            self.auto_adjust_mode = auto_adjust_data.get("mode", "sqrt")
+            if self.auto_adjust_mode not in ("sqrt", "linear"):
+                self.auto_adjust_mode = "sqrt"
             self.auto_adjust_k = float(auto_adjust_data.get("k", 0.8))
             # 相容舊版 threshold — 不再使用，保留讀取避免警告
             _old_threshold = auto_adjust_data.get("threshold", None)
@@ -4802,7 +4873,7 @@ class MainWindow(QtWidgets.QWidget):
             self.auto_adjust_resource_saving_enabled = bool(auto_adjust_data.get("resource_saving_enabled", True))
             self.auto_adjust_resource_saving_idle_seconds = float(auto_adjust_data.get("resource_saving_idle_seconds", 5.0))
             self.auto_adjust_capture_interval = max(0.1, min(5.0, self.auto_adjust_capture_interval))
-            self.auto_adjust_k = max(0.1, min(5.0, self.auto_adjust_k))
+            self.auto_adjust_k = max(0.01, min(5.0, self.auto_adjust_k))
             self.auto_adjust_resource_saving_idle_seconds = max(0.1, min(60.0, self.auto_adjust_resource_saving_idle_seconds))
             if hasattr(self, "network_debug_checkbox"):
                 self.network_debug_checkbox.blockSignals(True)
@@ -4816,6 +4887,7 @@ class MainWindow(QtWidgets.QWidget):
             if hasattr(self, "main_auto_adjust_checkbox"):
                 self.main_auto_adjust_checkbox.blockSignals(True)
             self.auto_adjust_k_spin.blockSignals(True)
+            self.auto_adjust_mode_combo.blockSignals(True)
             self.auto_adjust_weight_spin.blockSignals(True)
             self.auto_adjust_capture_interval_spin.blockSignals(True)
             self.auto_adjust_tick_interval_spin.blockSignals(True)
@@ -4825,6 +4897,7 @@ class MainWindow(QtWidgets.QWidget):
             if hasattr(self, "main_auto_adjust_checkbox"):
                 self.main_auto_adjust_checkbox.setChecked(self.auto_adjust_enabled)
             self.auto_adjust_k_spin.setValue(self.auto_adjust_k)
+            self.auto_adjust_mode_combo.setCurrentIndex({"sqrt": 0, "linear": 1}.get(self.auto_adjust_mode, 0))
             self.auto_adjust_weight_spin.setValue(self.auto_adjust_weight)
             self.auto_adjust_capture_interval_spin.setValue(self.auto_adjust_capture_interval)
             self.auto_adjust_tick_interval_spin.setValue(self.auto_adjust_tick_interval)
@@ -4834,6 +4907,7 @@ class MainWindow(QtWidgets.QWidget):
             if hasattr(self, "main_auto_adjust_checkbox"):
                 self.main_auto_adjust_checkbox.blockSignals(False)
             self.auto_adjust_k_spin.blockSignals(False)
+            self.auto_adjust_mode_combo.blockSignals(False)
             self.auto_adjust_weight_spin.blockSignals(False)
             self.auto_adjust_capture_interval_spin.blockSignals(False)
             self.auto_adjust_tick_interval_spin.blockSignals(False)
