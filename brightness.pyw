@@ -32,7 +32,7 @@ AUTO_BRIGHTNESS_CONTENT_COEFF = 1.0
 AUTO_BRIGHTNESS_CONTENT_COEFF_MIN_FACTOR = 0.5
 AUTO_BRIGHTNESS_CONTENT_COEFF_MAX_FACTOR = 1.5
 AUTO_BRIGHTNESS_WEIGHT_DEFAULT = 1.0
-DDC_WRITE_FAILURES_BEFORE_COOLDOWN = 2
+DDC_WRITE_FAILURES_BEFORE_COOLDOWN = 1
 DDC_WRITE_COOLDOWN_SECONDS = 30.0
 DDC_WRITE_COOLDOWN_MAX_SECONDS = 300.0
 NETWORK_DEBUG_LOG_ENABLED = False
@@ -1273,6 +1273,7 @@ class MonitorWrapper:
         self._cached_contrast: int | None = None
         self._ddc_write_error_count = 0
         self._ddc_write_cooldown_until = 0.0
+        self._ddc_write_state_lock = threading.Lock()
 
         if monitor is None:
             if name and not _is_valid_monitor_name(self.name):
@@ -1315,23 +1316,26 @@ class MonitorWrapper:
     def can_write_ddc(self):
         if not self.available or self.monitor is None:
             return False
-        return time.monotonic() >= self._ddc_write_cooldown_until
+        with self._ddc_write_state_lock:
+            return time.monotonic() >= self._ddc_write_cooldown_until
 
     def record_ddc_write_success(self):
-        self._ddc_write_error_count = 0
-        self._ddc_write_cooldown_until = 0.0
+        with self._ddc_write_state_lock:
+            self._ddc_write_error_count = 0
+            self._ddc_write_cooldown_until = 0.0
 
     def record_ddc_write_failure(self, error):
-        self._ddc_write_error_count += 1
-        if self._ddc_write_error_count < DDC_WRITE_FAILURES_BEFORE_COOLDOWN:
-            log_msg(f"DDC Error: {self.name}: {error}")
-            return
+        with self._ddc_write_state_lock:
+            self._ddc_write_error_count += 1
+            if self._ddc_write_error_count < DDC_WRITE_FAILURES_BEFORE_COOLDOWN:
+                log_msg(f"DDC Error: {self.name}: {error}")
+                return
 
-        cooldown = min(
-            DDC_WRITE_COOLDOWN_MAX_SECONDS,
-            DDC_WRITE_COOLDOWN_SECONDS * (2 ** max(0, self._ddc_write_error_count - DDC_WRITE_FAILURES_BEFORE_COOLDOWN)),
-        )
-        self._ddc_write_cooldown_until = time.monotonic() + cooldown
+            cooldown = min(
+                DDC_WRITE_COOLDOWN_MAX_SECONDS,
+                DDC_WRITE_COOLDOWN_SECONDS * (2 ** max(0, self._ddc_write_error_count - DDC_WRITE_FAILURES_BEFORE_COOLDOWN)),
+            )
+            self._ddc_write_cooldown_until = time.monotonic() + cooldown
         log_msg(f"DDC Error: {self.name}: {error}; pause DDC writes for {int(cooldown)}s")
 
     def read_current_levels(self):
