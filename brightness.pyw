@@ -32,6 +32,9 @@ AUTO_BRIGHTNESS_CONTENT_COEFF = 1.0
 AUTO_BRIGHTNESS_CONTENT_COEFF_MIN_FACTOR = 0.5
 AUTO_BRIGHTNESS_CONTENT_COEFF_MAX_FACTOR = 1.5
 AUTO_BRIGHTNESS_WEIGHT_DEFAULT = 1.0
+DDC_WRITE_FAILURES_BEFORE_COOLDOWN = 2
+DDC_WRITE_COOLDOWN_SECONDS = 30.0
+DDC_WRITE_COOLDOWN_MAX_SECONDS = 300.0
 NETWORK_DEBUG_LOG_ENABLED = False
 DEBUG_LOG_ENABLED = False
 
@@ -1214,7 +1217,10 @@ class DDCWorker(QtCore.QRunnable):
         self.contrast_supported = contrast_supported
 
     def run(self):
-        if not self.wrapper.available:
+        if not self.wrapper.available or not self.wrapper.can_write_ddc():
+            return
+        if self.monitor is None:
+            self.wrapper.record_ddc_write_failure("monitor handle is not available")
             return
         try:
             with self.lock:
@@ -1223,11 +1229,13 @@ class DDCWorker(QtCore.QRunnable):
                         m.set_luminance(int(self.brightness))
                     if self.contrast_supported and self.contrast is not None:
                         m.set_contrast(int(self.contrast))
+            self.wrapper.record_ddc_write_success()
             return
         except Exception as e:
             if self.brightness is not None and _wmi_set_brightness(self.brightness):
+                self.wrapper.record_ddc_write_success()
                 return
-            log_msg(f"DDC Error: {self.wrapper.name}: {e}")
+            self.wrapper.record_ddc_write_failure(e)
 
 
 class LevelReadSignals(QtCore.QObject):
@@ -1263,6 +1271,8 @@ class MonitorWrapper:
         self.name = name or f"Display {index + 1}"
         self._cached_brightness: int | None = None
         self._cached_contrast: int | None = None
+        self._ddc_write_error_count = 0
+        self._ddc_write_cooldown_until = 0.0
 
         if monitor is None:
             if name and not _is_valid_monitor_name(self.name):
@@ -1301,6 +1311,28 @@ class MonitorWrapper:
         else:
             self.supported = False
             self.available = False
+
+    def can_write_ddc(self):
+        if not self.available or self.monitor is None:
+            return False
+        return time.monotonic() >= self._ddc_write_cooldown_until
+
+    def record_ddc_write_success(self):
+        self._ddc_write_error_count = 0
+        self._ddc_write_cooldown_until = 0.0
+
+    def record_ddc_write_failure(self, error):
+        self._ddc_write_error_count += 1
+        if self._ddc_write_error_count < DDC_WRITE_FAILURES_BEFORE_COOLDOWN:
+            log_msg(f"DDC Error: {self.name}: {error}")
+            return
+
+        cooldown = min(
+            DDC_WRITE_COOLDOWN_MAX_SECONDS,
+            DDC_WRITE_COOLDOWN_SECONDS * (2 ** max(0, self._ddc_write_error_count - DDC_WRITE_FAILURES_BEFORE_COOLDOWN)),
+        )
+        self._ddc_write_cooldown_until = time.monotonic() + cooldown
+        log_msg(f"DDC Error: {self.name}: {error}; pause DDC writes for {int(cooldown)}s")
 
     def read_current_levels(self):
         if not self.available or self.monitor is None:
@@ -1503,6 +1535,8 @@ class MonitorWidget(QtWidgets.QGroupBox):
         if not self.monitor.available:
             return
         if isinstance(self.monitor, RemoteMonitorWrapper):
+            return
+        if not self.monitor.can_write_ddc():
             return
         contrast_value = 0 if not self.monitor.contrast_supported else self.pending_contrast
         if DEBUG_LOG_ENABLED:
@@ -4301,6 +4335,8 @@ class MainWindow(QtWidgets.QWidget):
         wrapper = self.monitor_wrappers[monitor_index]
         widget = self.monitor_widgets[monitor_index]
         if not wrapper.available or isinstance(wrapper, RemoteMonitorWrapper):
+            return
+        if not wrapper.can_write_ddc():
             return
         try:
             b_min, b_max = wrapper.brightness_range
