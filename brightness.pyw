@@ -32,7 +32,7 @@ AUTO_BRIGHTNESS_CONTENT_COEFF = 1.0
 AUTO_BRIGHTNESS_CONTENT_COEFF_MIN_FACTOR = 0.5
 AUTO_BRIGHTNESS_CONTENT_COEFF_MAX_FACTOR = 1.5
 AUTO_BRIGHTNESS_WEIGHT_DEFAULT = 1.0
-DDC_WRITE_FAILURES_BEFORE_COOLDOWN = 1
+DDC_WRITE_FAILURES_BEFORE_COOLDOWN = 3
 DDC_WRITE_COOLDOWN_SECONDS = 30.0
 DDC_WRITE_COOLDOWN_MAX_SECONDS = 300.0
 NETWORK_DEBUG_LOG_ENABLED = False
@@ -1328,7 +1328,8 @@ class MonitorWrapper:
         with self._ddc_write_state_lock:
             self._ddc_write_error_count += 1
             if self._ddc_write_error_count < DDC_WRITE_FAILURES_BEFORE_COOLDOWN:
-                log_msg(f"DDC Error: {self.name}: {error}")
+                if DEBUG_LOG_ENABLED:
+                    log_msg(f"DDC transient write error: {self.name}: {error}")
                 return
 
             cooldown = min(
