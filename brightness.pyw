@@ -1994,7 +1994,7 @@ class ScreenAnalyzer(QtCore.QObject):
         self.enabled = False
         self._last_source = "—"
         self.target = 50        # 目標畫面亮度 0-100
-        self._k = 0.8           # 曲線係數（sqrt: 步階係數，linear: 每 tick 比例）
+        self._k = 0.8           # 倍率係數（sqrt: 步階係數，linear: 每 tick 比例）
         self._mode = "sqrt"    # "sqrt" 或 "linear"
         self.weight = AUTO_BRIGHTNESS_WEIGHT_DEFAULT  # 背光權重
         # 調整步階由所選模式決定
@@ -3412,7 +3412,7 @@ class MainWindow(QtWidgets.QWidget):
         self.auto_adjust_k_spin.setSingleStep(0.05)
         self.auto_adjust_k_spin.setDecimals(2)
         self.auto_adjust_k_spin.setValue(self.auto_adjust_k)
-        self.auto_adjust_k_spin.setToolTip("平方根曲線係數，越大越快。預設 0.8")
+        self.auto_adjust_k_spin.setToolTip("倍率係數，同時作用於曲線與線性模式，越大越快。預設 0.8")
         self.auto_adjust_k_spin.valueChanged.connect(self.on_auto_adjust_settings_changed)
 
         self.auto_adjust_mode_combo = QtWidgets.QComboBox()
@@ -3471,7 +3471,7 @@ class MainWindow(QtWidgets.QWidget):
         auto_grid.addWidget(self.auto_adjust_tick_interval_spin, 1, 3)
         auto_grid.addWidget(QtWidgets.QLabel("模式"), 2, 0)
         auto_grid.addWidget(self.auto_adjust_mode_combo, 2, 1)
-        auto_grid.addWidget(QtWidgets.QLabel("曲線係數 k"), 2, 2)
+        auto_grid.addWidget(QtWidgets.QLabel("倍率係數 K"), 2, 2)
         auto_grid.addWidget(self.auto_adjust_k_spin, 2, 3)
         auto_grid.addWidget(QtWidgets.QLabel("背光權重"), 3, 0)
         auto_grid.addWidget(self.auto_adjust_weight_spin, 3, 1)
