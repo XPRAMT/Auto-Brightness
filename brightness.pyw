@@ -35,6 +35,7 @@ AUTO_BRIGHTNESS_WEIGHT_DEFAULT = 1.0
 DDC_WRITE_FAILURES_BEFORE_COOLDOWN = 3
 DDC_WRITE_COOLDOWN_SECONDS = 30.0
 DDC_WRITE_COOLDOWN_MAX_SECONDS = 300.0
+DDC_VCP_WRITE_GAP_SECONDS = 0.05
 NETWORK_DEBUG_LOG_ENABLED = False
 DEBUG_LOG_ENABLED = False
 
@@ -1222,20 +1223,51 @@ class DDCWorker(QtCore.QRunnable):
         if self.monitor is None:
             self.wrapper.record_ddc_write_failure("monitor handle is not available")
             return
+
+        desired_brightness = int(self.brightness) if self.brightness is not None else None
+        desired_contrast = (
+            int(self.contrast)
+            if self.contrast_supported and self.contrast is not None
+            else None
+        )
+        write_brightness = (
+            desired_brightness is not None
+            and desired_brightness != self.wrapper._cached_brightness
+        )
+        write_contrast = (
+            desired_contrast is not None
+            and desired_contrast != self.wrapper._cached_contrast
+        )
+        if not write_brightness and not write_contrast:
+            return
+
         try:
             with self.lock:
                 with self.monitor as m:
-                    if self.brightness is not None:
-                        m.set_luminance(int(self.brightness))
-                    if self.contrast_supported and self.contrast is not None:
-                        m.set_contrast(int(self.contrast))
+                    if write_brightness:
+                        try:
+                            m.set_luminance(desired_brightness)
+                            self.wrapper._cached_brightness = desired_brightness
+                        except Exception as e:
+                            if _wmi_set_brightness(desired_brightness):
+                                self.wrapper._cached_brightness = desired_brightness
+                                self.wrapper.record_ddc_write_success()
+                            else:
+                                self.wrapper.record_ddc_write_failure(f"VCP 0x10 brightness: {e}")
+                            return
+                    if write_brightness and write_contrast:
+                        time.sleep(DDC_VCP_WRITE_GAP_SECONDS)
+                    if write_contrast:
+                        try:
+                            m.set_contrast(desired_contrast)
+                            self.wrapper._cached_contrast = desired_contrast
+                        except Exception as e:
+                            self.wrapper.record_ddc_write_failure(f"VCP 0x12 contrast: {e}")
+                            return
             self.wrapper.record_ddc_write_success()
-            return
         except Exception as e:
-            if self.brightness is not None and _wmi_set_brightness(self.brightness):
-                self.wrapper.record_ddc_write_success()
-                return
             self.wrapper.record_ddc_write_failure(e)
+            return
 
 
 class LevelReadSignals(QtCore.QObject):
