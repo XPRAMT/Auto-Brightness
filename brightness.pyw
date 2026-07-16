@@ -3430,8 +3430,8 @@ class MainWindow(QtWidgets.QWidget):
 
         self.auto_adjust_capture_interval_spin = QtWidgets.QDoubleSpinBox()
         self.auto_adjust_capture_interval_spin.setRange(0.1, 5.0)
-        self.auto_adjust_capture_interval_spin.setSingleStep(0.1)
-        self.auto_adjust_capture_interval_spin.setDecimals(1)
+        self.auto_adjust_capture_interval_spin.setSingleStep(0.01)
+        self.auto_adjust_capture_interval_spin.setDecimals(2)
         self.auto_adjust_capture_interval_spin.setValue(self.auto_adjust_capture_interval)
         self.auto_adjust_capture_interval_spin.setSuffix(" s")
         self.auto_adjust_capture_interval_spin.setToolTip("畫面截圖分析週期")
