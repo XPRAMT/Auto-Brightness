@@ -1,3 +1,5 @@
 __pycache__/
 .codegraph/
 settings.json
+.agents/ddc_worker.py.bak
+.agents/pre-revert-brightness.patch
