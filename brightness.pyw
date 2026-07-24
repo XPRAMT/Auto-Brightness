@@ -2830,6 +2830,7 @@ class RemoteMonitorWrapper:
 class MainWindow(QtWidgets.QWidget):
     remote_set_applied = QtCore.pyqtSignal(str, object, object)
     remote_state_applied = QtCore.pyqtSignal(object, object, object)
+    client_startup_target_sync_finished = QtCore.pyqtSignal(str, bool)
     HOTKEY_OPTIONS = MODIFIER_ORDER
     HOTKEY_OPTIONAL_OPTIONS = SHORTCUT_MODIFIER_OPTIONS
     STARTUP_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -2845,6 +2846,10 @@ class MainWindow(QtWidgets.QWidget):
         self._applying_remote_network_state = False
         self._pending_network_auto_target = None
         self._pending_network_auto_enabled = None
+        self._start_client_after_initialization = False
+        self._client_startup_target_sync_pending = False
+        self._client_startup_target_sync_in_progress = False
+        self._client_startup_target_sync_sent = False
         self.global_link_value = 0
         self.step_value = 5.0
         self.shortcut_key1 = "Alt"
@@ -2901,6 +2906,7 @@ class MainWindow(QtWidgets.QWidget):
         self._net_client.remote_state_updated.connect(self._on_remote_state_updated)
         self.remote_set_applied.connect(self._on_remote_set_applied)
         self.remote_state_applied.connect(self._on_remote_state_applied)
+        self.client_startup_target_sync_finished.connect(self._on_client_startup_target_sync_finished)
         self._remote_wrappers = []  # RemoteMonitorWrapper 列表
         self._remote_widgets = []   # 遠端螢幕的 MonitorWidget
         self._remote_monitor_data = []  # 原始資料（用於 remote_set）
@@ -3750,13 +3756,26 @@ class MainWindow(QtWidgets.QWidget):
         self._sync_network_flags_from_mode()
 
         if mode == "server":
+            self._start_client_after_initialization = False
+            self._client_startup_target_sync_pending = False
+            self._client_startup_target_sync_in_progress = False
+            self._client_startup_target_sync_sent = False
             self._net_client.stop()
             self._clear_remote_wrappers()
             self._net_server.start()
         elif mode == "client":
             self._net_server.stop()
-            self._net_client.start()
+            self._start_client_after_initialization = bool(self._initializing_ui)
+            self._client_startup_target_sync_pending = self._start_client_after_initialization
+            self._client_startup_target_sync_in_progress = False
+            self._client_startup_target_sync_sent = False
+            if not self._start_client_after_initialization:
+                self._net_client.start()
         else:
+            self._start_client_after_initialization = False
+            self._client_startup_target_sync_pending = False
+            self._client_startup_target_sync_in_progress = False
+            self._client_startup_target_sync_sent = False
             self._net_server.stop()
             self._net_client.stop()
             self._clear_remote_wrappers()
@@ -3890,9 +3909,48 @@ class MainWindow(QtWidgets.QWidget):
         self.remote_state_applied.emit(global_link, auto_target, auto_enabled)
         return True
 
+    def _sync_startup_client_target_to_host(self, server_name):
+        if (
+            not self._client_startup_target_sync_pending
+            or self._client_startup_target_sync_in_progress
+            or not server_name
+        ):
+            return
+        self._client_startup_target_sync_in_progress = True
+        target = int(round(self.auto_adjust_target))
+
+        def worker():
+            ok = self._net_client.remote_set_state(server_name, auto_target=target)
+            self.client_startup_target_sync_finished.emit(server_name, bool(ok))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_client_startup_target_sync_finished(self, server_name, ok):
+        self._client_startup_target_sync_in_progress = False
+        if not self._client_startup_target_sync_pending:
+            return
+        if ok:
+            self._client_startup_target_sync_sent = True
+            return
+        # 保持 client 優先權，等待下一次 host state 後再重試。
+        if NETWORK_DEBUG_LOG_ENABLED:
+            log_msg(f"Startup target sync failed: {server_name}")
+
     def _on_remote_state_updated(self, state):
         if not isinstance(state, dict) or self._applying_remote_network_state:
             return
+        if self._client_startup_target_sync_pending:
+            remote_target = state.get("auto_target")
+            if (
+                self._client_startup_target_sync_sent
+                and remote_target is not None
+                and int(remote_target) == int(round(self.auto_adjust_target))
+            ):
+                self._client_startup_target_sync_pending = False
+                self._client_startup_target_sync_sent = False
+            else:
+                self._sync_startup_client_target_to_host(state.get("_remote_name"))
+                return
         auto_target = state.get("auto_target")
         auto_enabled = state.get("auto_enabled")
         if auto_target is None and auto_enabled is None:
@@ -4210,6 +4268,9 @@ class MainWindow(QtWidgets.QWidget):
             except Exception:
                 pass
         self._sync_screen_analyzer_enabled()
+        if self._start_client_after_initialization:
+            self._start_client_after_initialization = False
+            self._net_client.start()
 
     def init_global_hook(self):
         if sys.platform != "win32":
