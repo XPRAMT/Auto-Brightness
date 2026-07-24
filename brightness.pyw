@@ -1866,6 +1866,7 @@ class _CaptureThread(QtCore.QThread):
     _dxgi_cameras = {}
     _dxgi_lock = threading.Lock()
     _dxgi_disabled = False
+    _dxgi_reset_requested = False
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1888,15 +1889,40 @@ class _CaptureThread(QtCore.QThread):
 
     @classmethod
     def reset_dxgi(cls):
-        """完全重設 DXGI 狀態：停止 + 釋放所有 camera，重新初始化 factory。"""
+        """在沒有進行中的擷取時，釋放 camera 並重新列舉 DXGI outputs。"""
         with cls._dxgi_lock:
             for key, cam in list(cls._dxgi_cameras.items()):
-                if cam.is_capturing:
-                    cam.stop()
-                cam.release()
+                try:
+                    if cam.is_capturing:
+                        cam.stop()
+                    cam.release()
+                except Exception:
+                    pass
             cls._dxgi_cameras = {}
             cls._dxgi_disabled = False
-        cls.initialize_dxgi()
+            cls._dxgi_reset_requested = False
+
+        # dxcam 的 factory 會快取 adapter/output；顯示器拔插後必須重新列舉。
+        try:
+            factory_type = type(dxcam.DXFactory)
+            factory_type._instances.pop(dxcam.DXFactory, None)
+            dxcam.__factory = dxcam.DXFactory()
+        except Exception as e:
+            print(f"DXGI factory reset error: {e}")
+            cls._dxgi_disabled = True
+
+    @classmethod
+    def request_dxgi_reset(cls):
+        """由擷取執行緒標記恢復需求；資源釋放必須留給 UI 執行緒協調。"""
+        with cls._dxgi_lock:
+            if not cls._dxgi_reset_requested:
+                print("DXGI output changed; scheduling camera recreation.")
+            cls._dxgi_reset_requested = True
+
+    @classmethod
+    def is_dxgi_reset_requested(cls):
+        with cls._dxgi_lock:
+            return cls._dxgi_reset_requested
 
     @classmethod
     def _get_dxgi_camera(cls, device_idx=0, output_idx=0):
@@ -1946,6 +1972,7 @@ class _CaptureThread(QtCore.QThread):
             # 進行截圖（numpy array）
             frame = camera.grab()
             if frame is None:
+                self.__class__.request_dxgi_reset()
                 return None
 
             # 轉為灰度並計算平均值
@@ -1958,10 +1985,8 @@ class _CaptureThread(QtCore.QThread):
         except Exception as e:
             print(f"DXGI 截圖錯誤 (device={device_idx}, output={output_idx}): {e}")
             if "0x887A0026" in str(e):
-                # 螢幕切換/休眠後輸出變更 → 完全重設 DXGI，下次 tick 可重建 camera
-                self.__class__.reset_dxgi()
-                # 釋放區域變數引用，避免 GC 對已釋放的 COM 指標重複 Release() 造成 access violation
-                camera = None
+                # 螢幕切換/休眠時不可在 worker 內釋放其他 worker 正使用的 COM 資源。
+                self.__class__.request_dxgi_reset()
             else:
                 self._disable_dxgi(device_idx, output_idx)
                 self.use_dxgi = False
@@ -2096,6 +2121,11 @@ class ScreenAnalyzer(QtCore.QObject):
 
     def _tick_capture(self):
         if self._capture_thread is not None and self._capture_thread.isRunning():
+            return
+        if _CaptureThread.is_dxgi_reset_requested():
+            parent = self.parent()
+            if parent is not None:
+                parent.schedule_dxgi_refresh()
             return
         if not self.enabled:
             self._direction = 0
@@ -3030,25 +3060,8 @@ class MainWindow(QtWidgets.QWidget):
             f"{i}:D{target['device_idx']}O{target['output_idx']}{'*' if target.get('primary') else ''}"
             for i, target in enumerate(dxgi_targets)
         )
-        # 快速擷取測試
-        brightness_values = []
-        for target in dxgi_targets:
-            try:
-                cam = _CaptureThread._get_dxgi_camera(target["device_idx"], target["output_idx"])
-                if cam is None:
-                    brightness_values.append("?")
-                    continue
-                frame = cam.grab()
-                if frame is None:
-                    brightness_values.append("?")
-                    continue
-                gray = 0.299 * frame[:, :, 0] + 0.587 * frame[:, :, 1] + 0.114 * frame[:, :, 2]
-                avg = float(np.mean(gray[::8, ::8])) / 255.0 * 100.0
-                brightness_values.append(f"{avg:.0f}%")
-            except Exception:
-                brightness_values.append("?")
-        brightness_text = ", ".join(brightness_values)
-        return f"DXGI targets: {target_text}  brightness: {brightness_text}"
+        # 偵測紀錄不可同步呼叫 grab()；顯示器切換時這會阻塞 UI 並與 analyzer 競爭 camera。
+        return f"DXGI targets: {target_text}"
 
     def print_monitor_detection_log(self, local_wrappers=None):
         local_wrappers = list(local_wrappers if local_wrappers is not None else [
@@ -3545,6 +3558,35 @@ class MainWindow(QtWidgets.QWidget):
         self.raise_()
         self.activateWindow()
 
+    def schedule_dxgi_refresh(self):
+        """將 DXGI 重建排回 UI event loop，合併同一波拓撲變更的多個請求。"""
+        if self._is_quitting or getattr(self, "_refresh_in_progress", False):
+            return
+        if getattr(self, "_dxgi_refresh_scheduled", False):
+            return
+        self._dxgi_refresh_scheduled = True
+        QtCore.QTimer.singleShot(500, self._run_scheduled_dxgi_refresh)
+
+    def _run_scheduled_dxgi_refresh(self):
+        self._dxgi_refresh_scheduled = False
+        if not self._is_quitting:
+            self.refresh_monitors()
+
+    def _stop_screen_analyzers_for_refresh(self, wait_ms=250):
+        """停止 timer，並只在所有擷取 thread 已結束時才允許釋放 DXGI。"""
+        threads = []
+        for analyzer in getattr(self, "screen_analyzers", []):
+            if analyzer is None:
+                continue
+            analyzer.stop()
+            thread = getattr(analyzer, "_capture_thread", None)
+            if thread is not None and thread.isRunning():
+                threads.append(thread)
+
+        for thread in threads:
+            thread.wait(wait_ms)
+        return not any(thread.isRunning() for thread in threads)
+
     def refresh_monitors(self):
         """釋放舊資源後，使用與程式啟動相同的流程重新偵測螢幕。"""
         if getattr(self, "_refresh_in_progress", False):
@@ -3552,6 +3594,11 @@ class MainWindow(QtWidgets.QWidget):
             return
         self._refresh_in_progress = True
         try:
+            if not self._stop_screen_analyzers_for_refresh():
+                print("  DXGI 擷取尚在結束，稍後重試重新偵測")
+                QtCore.QTimer.singleShot(250, self.refresh_monitors)
+                return
+
             self._initializing_ui = True
             self._auto_adjust_ready = False
             self._pending_level_reads.clear()
@@ -3560,7 +3607,6 @@ class MainWindow(QtWidgets.QWidget):
             self.save_settings()
 
             # 清除既有分析器與 DDC 物件，之後走初始化偵測流程。
-            self._for_each_screen_analyzer(lambda a: a.stop())
             self.screen_analyzers = []
             self.screen_analyzer = None
             self._monitor_auto_states = []
