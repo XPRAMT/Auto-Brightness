@@ -1501,10 +1501,10 @@ class MonitorWidget(QtWidgets.QGroupBox):
         self.c_slider.slider.setRange(c_min, c_max)
 
         # 優先使用建構時從螢幕讀取到的實際值，否則保留 slider 當前值
-        b_val = self.monitor._cached_brightness
+        b_val = getattr(self.monitor, "_cached_brightness", getattr(self.monitor, "_brightness", None))
         if b_val is None:
             b_val = max(b_min, min(b_max, self.b_slider.slider.value()))
-        c_val = self.monitor._cached_contrast
+        c_val = getattr(self.monitor, "_cached_contrast", getattr(self.monitor, "_contrast", None))
         if c_val is None:
             c_val = max(c_min, min(c_max, self.c_slider.slider.value()))
         self.b_slider.slider.setValue(b_val)
