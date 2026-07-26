@@ -16,7 +16,25 @@ from PyQt6 import QtWidgets, QtCore, QtGui
 from zeroconf import Zeroconf, ServiceInfo, ServiceBrowser
 import numpy as np
 import dxcam
-import wmi
+
+from monitor_ddc import (
+    MONITORINFOEXW,
+    _rect_to_tuple,
+    run_ddc_with_timeout,
+    get_windows_active_display_entries,
+    get_windows_active_monitor_names,
+    append_missing_windows_display_placeholders,
+    get_local_ddc_monitors,
+    is_valid_monitor_name,
+    WinPhysicalMonitor,
+    MonitorWrapper,
+    DDCWorker,
+    LevelReadSignals,
+    LevelReadWorker,
+    wmi_brightness_supported,
+    wmi_set_brightness,
+    wmi_get_brightness,
+)
 
 try:
     import winreg
@@ -32,10 +50,6 @@ AUTO_BRIGHTNESS_CONTENT_COEFF = 1.0
 AUTO_BRIGHTNESS_CONTENT_COEFF_MIN_FACTOR = 0.5
 AUTO_BRIGHTNESS_CONTENT_COEFF_MAX_FACTOR = 1.5
 AUTO_BRIGHTNESS_WEIGHT_DEFAULT = 1.0
-DDC_WRITE_FAILURES_BEFORE_COOLDOWN = 3
-DDC_WRITE_COOLDOWN_SECONDS = 30.0
-DDC_WRITE_COOLDOWN_MAX_SECONDS = 300.0
-DDC_VCP_WRITE_GAP_SECONDS = 0.01
 NETWORK_DEBUG_LOG_ENABLED = False
 DEBUG_LOG_ENABLED = False
 
@@ -113,20 +127,6 @@ DEFAULT_LEVEL_SHORTCUTS = [
 ]
 
 
-class MONITORINFOEXW(ctypes.Structure):
-    _fields_ = [
-        ("cbSize", wintypes.DWORD),
-        ("rcMonitor", wintypes.RECT),
-        ("rcWork", wintypes.RECT),
-        ("dwFlags", wintypes.DWORD),
-        ("szDevice", wintypes.WCHAR * 32),
-    ]
-
-
-# =========================
-# 熱插拔監聽器 + 背景偵測 + DDC 逾時包裝
-# =========================
-
 class _MonitorHotplugWatcher(QtCore.QObject):
     """背景執行緒監聽 WMI 螢幕熱插拔事件，偵測到變動時通知 UI 執行緒重新掃描。
     若 WMI 不可用（非 Windows / 權限不足），則降級為定時輪詢（timer）模式。"""
@@ -142,15 +142,13 @@ class _MonitorHotplugWatcher(QtCore.QObject):
         if self._running:
             return
         self._running = True
-        # 先用 WMI 事件監聽（非阻塞背景執行緒）
         if sys.platform == "win32":
             try:
                 self._thread = threading.Thread(target=self._wmi_event_loop, daemon=True, name="WMIHotplug")
                 self._thread.start()
-                return  # WMI 成功啟動，不再需要 timer
+                return
             except Exception:
-                pass  # WMI 失敗則降級到 timer
-        # 降級：用 QTimer 定期輪詢
+                pass
         self._poll_timer = QtCore.QTimer(self)
         self._poll_timer.timeout.connect(self.monitors_changed.emit)
         self._poll_timer.start(poll_interval_ms)
@@ -162,20 +160,11 @@ class _MonitorHotplugWatcher(QtCore.QObject):
             self._poll_timer = None
 
     def _wmi_event_loop(self):
-        """在背景執行緒監聽 WMI 熱插拔事件（Win32_DesktopMonitor 的建立/刪除）。"""
         try:
             import wmi as wmi_mod
             wmi_conn = wmi_mod.WMI()
-            watch_creation = wmi_conn.watch_for(
-                notification_type="Creation",
-                wmi_class="Win32_DesktopMonitor",
-                delay_secs=1,
-            )
-            watch_deletion = wmi_conn.watch_for(
-                notification_type="Deletion",
-                wmi_class="Win32_DesktopMonitor",
-                delay_secs=1,
-            )
+            watch_creation = wmi_conn.watch_for(notification_type="Creation", wmi_class="Win32_DesktopMonitor", delay_secs=1)
+            watch_deletion = wmi_conn.watch_for(notification_type="Deletion", wmi_class="Win32_DesktopMonitor", delay_secs=1)
             from collections import deque
             watches = deque([watch_creation, watch_deletion])
             while self._running and watches:
@@ -191,40 +180,7 @@ class _MonitorHotplugWatcher(QtCore.QObject):
                 if self._running:
                     watches.append(watcher)
         except Exception:
-            # WMI 事件監聽失敗（權限不足等），不做任何事（主執行緒會用 timer 降級）
             pass
-
-
-def _run_ddc_with_timeout(func, timeout_sec: float = 3.0, default=None):
-    """在獨立執行緒執行 DDC 操作，若逾時則返回 default 值。避免卡死的螢幕凍結 UI。"""
-    result = [default]
-    exception = [None]
-    event = threading.Event()
-
-    def worker():
-        try:
-            result[0] = func()
-        except Exception as e:
-            exception[0] = e
-        finally:
-            event.set()
-
-    t = threading.Thread(target=worker, daemon=True)
-    t.start()
-    t.join(timeout_sec)
-    if t.is_alive():
-        print(f"[DDC] Timeout ({timeout_sec}s) — monitor may be disconnected")
-        return default
-    if exception[0]:
-        raise exception[0]
-    return result[0]
-
-
-# 螢幕偵測統一由 MainWindow 的初始化流程處理，手動重新偵測只先清理舊物件。
-
-
-def _rect_to_tuple(rect):
-    return (int(rect.left), int(rect.top), int(rect.right), int(rect.bottom))
 
 
 def get_windows_display_rects():
@@ -259,45 +215,15 @@ def get_windows_display_rects():
     return rects
 
 
-def get_windows_active_display_entries():
-    """Return visible desktop display entries ordered primary first, then by position."""
-    if sys.platform != "win32":
-        return []
 
-    user32 = ctypes.windll.user32
-    entries = []
 
-    MONITORENUMPROC = ctypes.WINFUNCTYPE(
-        wintypes.BOOL,
-        wintypes.HMONITOR,
-        wintypes.HDC,
-        ctypes.POINTER(wintypes.RECT),
-        wintypes.LPARAM,
-    )
 
-    def enum_proc(hmonitor, _hdc, _rect, _lparam):
-        info = MONITORINFOEXW()
-        info.cbSize = ctypes.sizeof(MONITORINFOEXW)
-        if user32.GetMonitorInfoW(hmonitor, ctypes.byref(info)):
-            rect = _rect_to_tuple(info.rcMonitor)
-            entries.append({
-                "hmonitor": hmonitor,
-                "display_name": str(info.szDevice),
-                "rect": rect,
-                "primary": bool(info.dwFlags & 1),
-            })
-        return True
-
-    try:
-        user32.EnumDisplayMonitors(0, 0, MONITORENUMPROC(enum_proc), 0)
-    except Exception:
-        return []
-
-    def sort_key(entry):
-        rect = entry.get("rect") or (10**9, 10**9, 10**9, 10**9)
-        return (0 if entry.get("primary") else 1, rect[1], rect[0])
-
-    return sorted(entries, key=sort_key)
+def normalize_modifiers(modifiers):
+    normalized = []
+    for modifier in modifiers:
+        if modifier in MODIFIER_ORDER and modifier not in normalized:
+            normalized.append(modifier)
+    return normalized
 
 
 def get_dxgi_display_targets():
@@ -332,14 +258,6 @@ def get_dxgi_display_targets():
     except Exception as e:
         print(f"DXGI output mapping error: {e}")
         return []
-
-
-def normalize_modifiers(modifiers):
-    normalized = []
-    for modifier in modifiers:
-        if modifier in MODIFIER_ORDER and modifier not in normalized:
-            normalized.append(modifier)
-    return normalized
 
 
 def get_dynamic_content_coeff(luminance):
@@ -404,448 +322,40 @@ def log_network_payload(direction, payload):
         log_network_signal(direction, name, value)
 
 
-def get_monitor_display_name(monitor, index, caps=None):
-    # 嘗試從 VCP capabilities dict 取得 model
-    if isinstance(caps, dict):
-        model = caps.get("model", "").strip()
-        if model and _is_valid_monitor_name(model):
-            return model
-
-    # 嘗試從 monitor 物件的各屬性取得名稱
-    for attr_name in ("name", "display_name", "description", "model", "monitor_name", "edid"):
-        value = getattr(monitor, attr_name, None)
-        if isinstance(value, str) and value.strip():
-            cleaned = value.strip()
-            if _is_valid_monitor_name(cleaned):
-                return cleaned
-
-    # 嘗試從 EDID 取得名稱
-    try:
-        edid = getattr(monitor, "edid", None) or getattr(monitor, "get_edid", lambda: None)()
-        if edid and isinstance(edid, bytes):
-            name = _parse_edid_monitor_name(edid)
-            if name:
-                return name
-    except Exception:
-        pass
-
-    for attr_name in ("manufacturer", "brand"):
-        value = getattr(monitor, attr_name, None)
-        if isinstance(value, str) and value.strip():
-            cleaned = value.strip()
-            if _is_valid_monitor_name(cleaned):
-                return f"{cleaned} {index + 1}"
-
-    return f"Display {index + 1}"
 
 
-def _is_valid_monitor_name(name: str) -> bool:
-    """檢查字串是否像有效的螢幕名稱（拒絕原始 VCP capabilities 文字）。"""
-    if not name or len(name) < 2 or len(name) > 100:
-        return False
-    # 包含 VCP 原始資料特徵（大量括號、prot()/type()/model() 等）→ 拒絕
-    suspicious = ("prot(", "type(", "model(", "vcp(", "cmds(", "mccs_ver")
-    if any(s in name.lower() for s in suspicious):
-        return False
-    # 包含控制字元或換行 → 拒絕
-    for ch in name:
-        if ord(ch) < 32 or ord(ch) == 127:
-            return False
-    return True
 
 
-def _parse_edid_monitor_name(edid: bytes) -> str | None:
-    """從 EDID 解析螢幕名稱（Descriptor Block 類型 0xFC 為 Monitor Name）。"""
-    try:
-        if len(edid) < 128:
-            return None
-        for offset in range(54, 126, 18):
-            tag = edid[offset + 3]
-            if tag == 0xFC:
-                raw = edid[offset + 5 : offset + 18]
-                name = raw.decode("utf-8", errors="replace").strip().rstrip("\n").strip()
-                if name and _is_valid_monitor_name(name):
-                    return name
-    except Exception:
-        pass
-    return None
 
 
-def get_windows_active_monitor_names():
-    """Return active monitor names reported by Windows, independent of DDC support."""
-    names = []
-
-    def add_name(name):
-        if _is_valid_monitor_name(name) and name not in names:
-            names.append(name)
-
-    for entry in get_windows_active_display_entries():
-        display_name = entry.get("display_name", "")
-        device_id = get_monitor_device_id(display_name)
-        add_name(_monitor_name_from_device_id(device_id) or display_name)
-
-    return names
 
 
-def append_missing_windows_display_placeholders(wrappers, preserved_ranges=None):
-    """Add unavailable placeholders for active Windows displays absent from DDC results."""
-    preserved_ranges = preserved_ranges or {}
-    existing = {w.name for w in wrappers if _is_valid_monitor_name(getattr(w, "name", ""))}
-    for name in get_windows_active_monitor_names():
-        if name in existing:
-            continue
-        b_range, c_range = preserved_ranges.get(name, ([0, 100], [0, 100]))
-        placeholder = MonitorWrapper(
-            monitor=None,
-            index=len(wrappers),
-            name=name,
-            b_range=list(b_range),
-            c_range=list(c_range),
-        )
-        placeholder.available = False
-        placeholder.supported = False
-        placeholder.brightness_supported = False
-        placeholder.contrast_supported = False
-        wrappers.append(placeholder)
-        existing.add(name)
 
 
-class PHYSICAL_MONITOR(ctypes.Structure):
-    _fields_ = [
-        ("hPhysicalMonitor", wintypes.HANDLE),
-        ("szPhysicalMonitorDescription", wintypes.WCHAR * 128),
-    ]
 
 
-class WinPhysicalMonitor:
-    """Small wrapper around Windows DXVA2 DDC/CI APIs."""
-
-    def __init__(self, handle, description="", display_name="", device_id="", index=0):
-        self.handle = handle
-        self.description = str(description or "").strip()
-        self.display_name = str(display_name or "").strip()
-        self.device_id = str(device_id or "").strip()
-        self.index = int(index)
-        self._closed = False
-        self.name = self._resolve_name()
-
-    def _resolve_name(self):
-        name = _monitor_name_from_device_id(self.device_id)
-        if _is_valid_monitor_name(name):
-            return name
-        if _is_valid_monitor_name(self.description):
-            return self.description
-        return f"Display {self.index + 1}"
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        return False
-
-    def close(self):
-        if self._closed or not self.handle:
-            return
-        try:
-            dxva2 = ctypes.WinDLL("dxva2", use_last_error=True)
-            dxva2.DestroyPhysicalMonitor.argtypes = [wintypes.HANDLE]
-            dxva2.DestroyPhysicalMonitor.restype = wintypes.BOOL
-            dxva2.DestroyPhysicalMonitor(self.handle)
-        except Exception:
-            pass
-        self._closed = True
-        self.handle = None
-
-    def get_vcp_capabilities(self):
-        result = {"model": self.name, "vcp": {}}
-        caps_text = self._read_capabilities_string()
-        if caps_text:
-            result["raw"] = caps_text
-            model = self._parse_capability_model(caps_text)
-            if _is_valid_monitor_name(model):
-                result["model"] = model
-                self.name = model
-            if " 10" in caps_text or "(10" in caps_text or "vcp(10" in caps_text.lower():
-                result["vcp"][0x10] = True
-            if " 12" in caps_text or "(12" in caps_text or "vcp(12" in caps_text.lower():
-                result["vcp"][0x12] = True
-
-        for code in (0x10, 0x12):
-            try:
-                self._get_vcp(code)
-                result["vcp"][code] = True
-            except Exception:
-                pass
-        return result
-
-    def _read_capabilities_string(self):
-        if sys.platform != "win32":
-            return ""
-        try:
-            dxva2 = ctypes.WinDLL("dxva2", use_last_error=True)
-            length = wintypes.DWORD(0)
-            if not dxva2.GetCapabilitiesStringLength(self.handle, ctypes.byref(length)):
-                return ""
-            if length.value <= 1:
-                return ""
-            buf = ctypes.create_string_buffer(length.value)
-            if not dxva2.CapabilitiesRequestAndCapabilitiesReply(self.handle, buf, length.value):
-                return ""
-            return buf.value.decode("ascii", errors="ignore")
-        except Exception:
-            return ""
-
-    def _parse_capability_model(self, caps_text):
-        lower = caps_text.lower()
-        marker = "model("
-        start = lower.find(marker)
-        if start < 0:
-            return None
-        start += len(marker)
-        end = caps_text.find(")", start)
-        if end < 0:
-            return None
-        return caps_text[start:end].strip()
-
-    def _get_vcp(self, code):
-        dxva2 = ctypes.WinDLL("dxva2", use_last_error=True)
-        vcp_type = wintypes.DWORD(0)
-        current = wintypes.DWORD(0)
-        maximum = wintypes.DWORD(0)
-        ok = dxva2.GetVCPFeatureAndVCPFeatureReply(
-            self.handle,
-            wintypes.BYTE(int(code)),
-            ctypes.byref(vcp_type),
-            ctypes.byref(current),
-            ctypes.byref(maximum),
-        )
-        if not ok:
-            raise OSError(ctypes.get_last_error())
-        return int(current.value), int(maximum.value)
-
-    def _set_vcp(self, code, value):
-        dxva2 = ctypes.WinDLL("dxva2", use_last_error=True)
-        ok = dxva2.SetVCPFeature(self.handle, wintypes.BYTE(int(code)), wintypes.DWORD(int(value)))
-        if not ok:
-            raise OSError(ctypes.get_last_error())
-
-    def get_luminance(self):
-        return self._get_vcp(0x10)[0]
-
-    def set_luminance(self, value):
-        self._set_vcp(0x10, value)
-
-    def get_contrast(self):
-        return self._get_vcp(0x12)[0]
-
-    def set_contrast(self, value):
-        self._set_vcp(0x12, value)
 
 
-def _monitor_name_from_device_id(device_id):
-    if winreg is None:
-        return None
-    try:
-        parts = str(device_id).split("\\")
-        if len(parts) < 3:
-            return None
-        vendor = parts[1]
-        instance = parts[2].split("&UID", 1)[0]
-        base = rf"SYSTEM\CurrentControlSet\Enum\DISPLAY\{vendor}"
-        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, base) as vendor_key:
-            candidates = []
-            for idx in range(64):
-                try:
-                    candidates.append(winreg.EnumKey(vendor_key, idx))
-                except OSError:
-                    break
-        candidates.sort(key=lambda item: 0 if item.lower() == instance.lower() else 1)
-        for candidate in candidates:
-            try:
-                path = rf"{base}\{candidate}\Device Parameters"
-                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, path) as params_key:
-                    edid, _typ = winreg.QueryValueEx(params_key, "EDID")
-                name = _parse_edid_monitor_name(bytes(edid))
-                if name:
-                    return name
-            except Exception:
-                continue
-    except Exception:
-        pass
-    return None
 
 
-def get_monitor_device_id(display_name):
-    if sys.platform != "win32":
-        return ""
-    try:
-        class DISPLAY_DEVICEW(ctypes.Structure):
-            _fields_ = [
-                ("cb", wintypes.DWORD),
-                ("DeviceName", wintypes.WCHAR * 32),
-                ("DeviceString", wintypes.WCHAR * 128),
-                ("StateFlags", wintypes.DWORD),
-                ("DeviceID", wintypes.WCHAR * 128),
-                ("DeviceKey", wintypes.WCHAR * 128),
-            ]
-
-        DISPLAY_DEVICE_ACTIVE = 0x00000001
-        user32 = ctypes.windll.user32
-        for monitor_idx in range(16):
-            monitor = DISPLAY_DEVICEW()
-            monitor.cb = ctypes.sizeof(monitor)
-            if not user32.EnumDisplayDevicesW(display_name, monitor_idx, ctypes.byref(monitor), 0):
-                continue
-            if int(monitor.StateFlags) & DISPLAY_DEVICE_ACTIVE:
-                return str(monitor.DeviceID)
-    except Exception:
-        pass
-    return ""
 
 
-def get_windows_physical_monitors():
-    if sys.platform != "win32":
-        return []
-    try:
-        dxva2 = ctypes.WinDLL("dxva2", use_last_error=True)
-        dxva2.GetNumberOfPhysicalMonitorsFromHMONITOR.argtypes = [wintypes.HMONITOR, ctypes.POINTER(wintypes.DWORD)]
-        dxva2.GetNumberOfPhysicalMonitorsFromHMONITOR.restype = wintypes.BOOL
-        dxva2.GetPhysicalMonitorsFromHMONITOR.argtypes = [wintypes.HMONITOR, wintypes.DWORD, ctypes.POINTER(PHYSICAL_MONITOR)]
-        dxva2.GetPhysicalMonitorsFromHMONITOR.restype = wintypes.BOOL
-
-        monitors = []
-        for entry in get_windows_active_display_entries():
-            hmonitor = entry.get("hmonitor")
-            display_name = entry.get("display_name", "")
-            if not hmonitor:
-                continue
-            count = wintypes.DWORD(0)
-            if not dxva2.GetNumberOfPhysicalMonitorsFromHMONITOR(hmonitor, ctypes.byref(count)):
-                continue
-            if count.value <= 0:
-                continue
-            arr_type = PHYSICAL_MONITOR * count.value
-            arr = arr_type()
-            if not dxva2.GetPhysicalMonitorsFromHMONITOR(hmonitor, count, arr):
-                continue
-            device_id = get_monitor_device_id(display_name)
-            for physical_idx in range(count.value):
-                physical = arr[physical_idx]
-                monitors.append(
-                    WinPhysicalMonitor(
-                        physical.hPhysicalMonitor,
-                        physical.szPhysicalMonitorDescription,
-                        display_name=display_name,
-                        device_id=device_id,
-                        index=len(monitors),
-                    )
-                )
-
-        return monitors
-    except Exception as e:
-        if DEBUG_LOG_ENABLED:
-            log_msg(f"DXVA2 physical monitor scan error: {e}")
-        return []
 
 
-def get_local_ddc_monitors():
-    return get_windows_physical_monitors()
 
 
-def _wmi_brightness_supported():
-    try:
-        conn = wmi.WMI(namespace="WMI")
-        methods = list(conn.WmiMonitorBrightnessMethods())
-        monitors = list(conn.WmiMonitorBrightness())
-        return bool(methods and monitors)
-    except Exception:
-        return False
 
 
-def _wmi_set_brightness(value):
-    if not _wmi_brightness_supported():
-        return False
-    try:
-        conn = wmi.WMI(namespace="WMI")
-        percent = int(max(0, min(100, value)))
-        for method in conn.WmiMonitorBrightnessMethods():
-            method.WmiSetBrightness(percent, 0)
-        return True
-    except Exception:
-        return False
 
 
-def _wmi_get_brightness():
-    if not _wmi_brightness_supported():
-        return None
-    try:
-        conn = wmi.WMI(namespace="WMI")
-        monitors = list(conn.WmiMonitorBrightness())
-        if monitors:
-            value = getattr(monitors[0], "CurrentBrightness", None)
-            return int(value) if value is not None else None
-    except Exception:
-        return None
 
 
-def qt_key_event_to_name(event, allow_modifiers=False):
-    key = event.key()
-    modifiers = event.modifiers()
 
-    modifier_map = {
-        QtCore.Qt.Key.Key_Control: "Ctrl",
-        QtCore.Qt.Key.Key_Shift: "Shift",
-        QtCore.Qt.Key.Key_Alt: "Alt",
-        QtCore.Qt.Key.Key_Meta: "Win",
-    }
-    if key in modifier_map:
-        return modifier_map[key] if allow_modifiers else None
 
-    if key in (QtCore.Qt.Key.Key_Control, QtCore.Qt.Key.Key_Shift, QtCore.Qt.Key.Key_Alt, QtCore.Qt.Key.Key_Meta):
-        return None
 
-    keypad_modifier = bool(modifiers & QtCore.Qt.KeyboardModifier.KeypadModifier)
 
-    if QtCore.Qt.Key.Key_0 <= key <= QtCore.Qt.Key.Key_9:
-        digit = str(key - QtCore.Qt.Key.Key_0)
-        return f"NumPad{digit}" if keypad_modifier else digit
 
-    if QtCore.Qt.Key.Key_A <= key <= QtCore.Qt.Key.Key_Z:
-        return chr(key)
 
-    if QtCore.Qt.Key.Key_F1 <= key <= QtCore.Qt.Key.Key_F12:
-        return f"F{key - QtCore.Qt.Key.Key_F1 + 1}"
-
-    if key in (QtCore.Qt.Key.Key_Period, QtCore.Qt.Key.Key_Delete) and keypad_modifier:
-        return "NumPad."
-
-    arrow_map = {
-        QtCore.Qt.Key.Key_Left: "Left",
-        QtCore.Qt.Key.Key_Up: "Up",
-        QtCore.Qt.Key.Key_Right: "Right",
-        QtCore.Qt.Key.Key_Down: "Down",
-        QtCore.Qt.Key.Key_PageUp: "PageUp",
-        QtCore.Qt.Key.Key_PageDown: "PageDown",
-        QtCore.Qt.Key.Key_Home: "Home",
-        QtCore.Qt.Key.Key_End: "End",
-    }
-    if key in arrow_map:
-        return arrow_map[key]
-
-    media_map = {
-        QtCore.Qt.Key.Key_VolumeMute: "音量靜音",
-        QtCore.Qt.Key.Key_VolumeDown: "音量降低",
-        QtCore.Qt.Key.Key_VolumeUp: "音量提高",
-        QtCore.Qt.Key.Key_MediaPrevious: "媒體上一首",
-        QtCore.Qt.Key.Key_MediaNext: "媒體下一首",
-        QtCore.Qt.Key.Key_MediaPlay: "媒體播放",
-        QtCore.Qt.Key.Key_MediaPause: "媒體暫停",
-        QtCore.Qt.Key.Key_MediaStop: "媒體停止",
-    }
-    if key in media_map:
-        return media_map[key]
-
-    return None
 
 
 def set_slider_object_value(slider_obj, value):
@@ -1207,219 +717,12 @@ class GlobalHotkeyWheelHook(QtCore.QObject):
 # =========================
 # Worker Thread
 # =========================
-class DDCWorker(QtCore.QRunnable):
-    def __init__(self, wrapper, brightness=None, contrast=None, contrast_supported=True):
-        super().__init__()
-        self.wrapper = wrapper
-        self.monitor = wrapper.monitor
-        self.lock = wrapper.lock
-        self.brightness = brightness
-        self.contrast = contrast
-        self.contrast_supported = contrast_supported
-
-    def run(self):
-        if not self.wrapper.available or not self.wrapper.can_write_ddc():
-            return
-        if self.monitor is None:
-            self.wrapper.record_ddc_write_failure("monitor handle is not available")
-            return
-
-        desired_brightness = int(self.brightness) if self.brightness is not None else None
-        desired_contrast = (
-            int(self.contrast)
-            if self.contrast_supported and self.contrast is not None
-            else None
-        )
-        write_brightness = (
-            desired_brightness is not None
-            and desired_brightness != self.wrapper._cached_brightness
-        )
-        write_contrast = (
-            desired_contrast is not None
-            and desired_contrast != self.wrapper._cached_contrast
-        )
-        if not write_brightness and not write_contrast:
-            return
-
-        try:
-            with self.lock:
-                with self.monitor as m:
-                    if write_brightness:
-                        try:
-                            m.set_luminance(desired_brightness)
-                            self.wrapper._cached_brightness = desired_brightness
-                        except Exception as e:
-                            if _wmi_set_brightness(desired_brightness):
-                                self.wrapper._cached_brightness = desired_brightness
-                                self.wrapper.record_ddc_write_success()
-                            else:
-                                self.wrapper.record_ddc_write_failure(f"VCP 0x10 brightness: {e}")
-                            return
-                    if write_brightness and write_contrast:
-                        time.sleep(DDC_VCP_WRITE_GAP_SECONDS)
-                    if write_contrast:
-                        try:
-                            m.set_contrast(desired_contrast)
-                            self.wrapper._cached_contrast = desired_contrast
-                        except Exception as e:
-                            self.wrapper.record_ddc_write_failure(f"VCP 0x12 contrast: {e}")
-                            return
-            self.wrapper.record_ddc_write_success()
-        except Exception as e:
-            self.wrapper.record_ddc_write_failure(e)
-            return
 
 
-class LevelReadSignals(QtCore.QObject):
-    result = QtCore.pyqtSignal(object, object, object)
 
 
-class LevelReadWorker(QtCore.QRunnable):
-    def __init__(self, wrapper):
-        super().__init__()
-        self.wrapper = wrapper
-        self.signals = LevelReadSignals()
-
-    def run(self):
-        brightness, contrast = self.wrapper.read_current_levels()
-        self.signals.result.emit(self.wrapper, brightness, contrast)
 
 
-# =========================
-# Monitor Wrapper
-# =========================
-class MonitorWrapper:
-    def __init__(self, monitor=None, index=0, name="", b_range=None, c_range=None):
-        self.monitor = monitor
-        self.lock = threading.Lock()
-        self.index = index
-        self.brightness_range = list(b_range or [0, 100])
-        self.contrast_range = list(c_range or [0, 100])
-        self.supported = False
-        self.brightness_supported = False
-        self.contrast_supported = False
-        self.available = False
-        self.wmi_supported = _wmi_brightness_supported()
-        self.name = name or f"Display {index + 1}"
-        self._cached_brightness: int | None = None
-        self._cached_contrast: int | None = None
-        self._ddc_write_error_count = 0
-        self._ddc_write_cooldown_until = 0.0
-        self._ddc_write_state_lock = threading.Lock()
-
-        if monitor is None:
-            if name and not _is_valid_monitor_name(self.name):
-                self.name = f"Display {index + 1}"
-            return
-
-        self.name = monitor.name
-        self.supported = True
-        self.available = True
-
-        # 用 get_luminance() 測試 DDC 可用性
-        # 成功 → DDC 螢幕；失敗（如 VDD by MTT）→ WMI 備援
-        ddc_ok = False
-        try:
-            with self.lock:
-                with monitor as m:
-                    val = int(m.get_luminance())
-                    self._cached_brightness = val
-                    self.brightness_supported = True
-                    try:
-                        self._cached_contrast = int(m.get_contrast())
-                        self.contrast_supported = True
-                    except Exception:
-                        pass
-                    ddc_ok = True
-        except Exception:
-            pass
-
-        if ddc_ok:
-            return
-
-        # DDC 失敗 → WMI 備援
-        if self.wmi_supported:
-            self.brightness_supported = True
-            self.contrast_supported = False
-        else:
-            self.supported = False
-            self.available = False
-
-    def can_write_ddc(self):
-        if not self.available or self.monitor is None:
-            return False
-        with self._ddc_write_state_lock:
-            return time.monotonic() >= self._ddc_write_cooldown_until
-
-    def record_ddc_write_success(self):
-        with self._ddc_write_state_lock:
-            self._ddc_write_error_count = 0
-            self._ddc_write_cooldown_until = 0.0
-
-    def record_ddc_write_failure(self, error):
-        with self._ddc_write_state_lock:
-            self._ddc_write_error_count += 1
-            if self._ddc_write_error_count < DDC_WRITE_FAILURES_BEFORE_COOLDOWN:
-                if DEBUG_LOG_ENABLED:
-                    log_msg(f"DDC transient write error: {self.name}: {error}")
-                return
-
-            cooldown = min(
-                DDC_WRITE_COOLDOWN_MAX_SECONDS,
-                DDC_WRITE_COOLDOWN_SECONDS * (2 ** max(0, self._ddc_write_error_count - DDC_WRITE_FAILURES_BEFORE_COOLDOWN)),
-            )
-            self._ddc_write_cooldown_until = time.monotonic() + cooldown
-        log_msg(f"DDC Error: {self.name}: {error}; pause DDC writes for {int(cooldown)}s")
-
-    def read_current_levels(self):
-        if not self.available or self.monitor is None:
-            return None, None
-        brightness = None
-        contrast = None
-        try:
-            with self.lock:
-                def _read():
-                    with self.monitor as m:
-                        b = None
-                        c = None
-                        try:
-                            b = int(m.get_luminance())
-                        except Exception:
-                            b = None
-                        try:
-                            c = int(m.get_contrast())
-                        except Exception:
-                            c = None
-                        return b, c
-                brightness, contrast = _run_ddc_with_timeout(
-                    _read, timeout_sec=3.0, default=(None, None)
-                )
-        except Exception:
-            pass
-
-        # 若 DDC 讀取失敗，回退到建構時的快取值（跨執行緒場景特別有用）
-        if brightness is None:
-            brightness = self._cached_brightness
-        if contrast is None:
-            contrast = self._cached_contrast
-
-        if brightness is None:
-            brightness = _wmi_get_brightness()
-
-        if brightness is not None:
-            b_min, b_max = self.brightness_range
-            brightness = max(b_min, min(b_max, brightness))
-        if contrast is None and not self.contrast_supported:
-            contrast = 0
-        if contrast is not None:
-            c_min, c_max = self.contrast_range
-            contrast = max(c_min, min(c_max, contrast))
-
-        return brightness, contrast
-
-# =========================
-# Monitor UI
-# =========================
 class MonitorWidget(QtWidgets.QGroupBox):
     value_changed = QtCore.pyqtSignal(int)
 
@@ -1972,6 +1275,7 @@ class _CaptureThread(QtCore.QThread):
             # 進行截圖（numpy array）
             frame = camera.grab()
             if frame is None:
+                camera = None
                 self.__class__.request_dxgi_reset()
                 return None
 
@@ -1985,9 +1289,10 @@ class _CaptureThread(QtCore.QThread):
         except Exception as e:
             print(f"DXGI 截圖錯誤 (device={device_idx}, output={output_idx}): {e}")
             if "0x887A0026" in str(e):
-                # 螢幕切換/休眠時不可在 worker 內釋放其他 worker 正使用的 COM 資源。
+                camera = None
                 self.__class__.request_dxgi_reset()
             else:
+                camera = None
                 self._disable_dxgi(device_idx, output_idx)
                 self.use_dxgi = False
             return None
@@ -3047,7 +2352,7 @@ class MainWindow(QtWidgets.QWidget):
             pass
 
     def _format_detection_line(self, label, names):
-        names = [str(name) for name in names if _is_valid_monitor_name(str(name))]
+        names = [str(name) for name in names if is_valid_monitor_name(str(name))]
         if names:
             return f"{label}: {len(names)}台, " + ", ".join(names)
         return f"{label}: 0台"
@@ -3104,7 +2409,7 @@ class MainWindow(QtWidgets.QWidget):
             monitors_data = saved.get("monitors", {})
             cleaned_names = []
             for i, name in enumerate(known_names):
-                if not _is_valid_monitor_name(name):
+                if not is_valid_monitor_name(name):
                     print(f"Skipping invalid monitor name from settings: {name!r}")
                     continue
                 b_range = [0, 100]
@@ -3138,7 +2443,7 @@ class MainWindow(QtWidgets.QWidget):
         if self._is_quitting:
             return
         try:
-            ddc_count = _run_ddc_with_timeout(
+            ddc_count = run_ddc_with_timeout(
                 lambda: len(get_local_ddc_monitors()),
                 timeout_sec=2.0,
                 default=-1,
@@ -4860,7 +4165,7 @@ class MainWindow(QtWidgets.QWidget):
         # 直接從 monitor_wrappers 推導有效名稱（不依賴 _known_monitor_names 變數）
         local_wrappers = [w for w in self.monitor_wrappers if not isinstance(w, RemoteMonitorWrapper)]
         valid_names = sorted(
-            w.name for w in local_wrappers if _is_valid_monitor_name(w.name)
+            w.name for w in local_wrappers if is_valid_monitor_name(w.name)
         )
         data = {
             "known_monitor_names": valid_names,
@@ -4906,7 +4211,7 @@ class MainWindow(QtWidgets.QWidget):
 
         for wrapper in local_wrappers:
             name = wrapper.name
-            if _is_valid_monitor_name(name):
+            if is_valid_monitor_name(name):
                 data["monitors"][name] = {
                     "b_range": wrapper.brightness_range,
                     "c_range": wrapper.contrast_range
