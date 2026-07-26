@@ -152,25 +152,36 @@ def get_windows_active_display_entries():
 
 
 def get_monitor_device_id(display_name):
-    if winreg is None:
-        return None
+    """Return DeviceID for a display name using EnumDisplayDevicesW."""
+    if sys.platform != "win32":
+        return ""
     try:
-        idx = display_name.upper().rfind("\\")
-        if idx >= 0:
-            display_name = display_name[idx + 1 :]
-        key_path = (
-            r"SYSTEM\CurrentControlSet\Control\GraphicsDrivers\Connectivity"
-            rf"\{display_name}"
-        )
-        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path) as key:
-            dev_id, _ = winreg.QueryValueEx(key, "MonitorDeviceId")
-            return str(dev_id)
+        class DISPLAY_DEVICEW(ctypes.Structure):
+            _fields_ = [
+                ("cb", wintypes.DWORD),
+                ("DeviceName", wintypes.WCHAR * 32),
+                ("DeviceString", wintypes.WCHAR * 128),
+                ("StateFlags", wintypes.DWORD),
+                ("DeviceID", wintypes.WCHAR * 128),
+                ("DeviceKey", wintypes.WCHAR * 128),
+            ]
+
+        DISPLAY_DEVICE_ACTIVE = 0x00000001
+        user32 = ctypes.windll.user32
+        for monitor_idx in range(16):
+            monitor = DISPLAY_DEVICEW()
+            monitor.cb = ctypes.sizeof(monitor)
+            if not user32.EnumDisplayDevicesW(display_name, monitor_idx, ctypes.byref(monitor), 0):
+                continue
+            if int(monitor.StateFlags) & DISPLAY_DEVICE_ACTIVE:
+                return str(monitor.DeviceID)
     except Exception:
         pass
-    return None
+    return ""
 
 
 def monitor_name_from_device_id(device_id):
+    """Query registry EDID to get the human-readable monitor name."""
     if winreg is None or not device_id:
         return None
     try:
@@ -180,28 +191,24 @@ def monitor_name_from_device_id(device_id):
         vendor = parts[1]
         instance = parts[2].split("&UID", 1)[0]
         base = rf"SYSTEM\CurrentControlSet\Enum\DISPLAY\{vendor}"
-        try:
-            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, base) as key:
-                sub_count = winreg.QueryInfoKey(key)[0]
-                for i in range(sub_count):
-                    sub_name = winreg.EnumKey(key, i)
-                    if sub_name.startswith(instance) or instance.startswith(sub_name):
-                        full_path = rf"{base}\{sub_name}"
-                        try:
-                            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, full_path) as dev_key:
-                                device_params, _ = winreg.QueryValueEx(dev_key, "DeviceParams")
-                                if device_params:
-                                    edid_path = rf"{base}\{sub_name}\Device Parameters"
-                                    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, edid_path) as edid_key:
-                                        raw_edid, _ = winreg.QueryValueEx(edid_key, "EDID")
-                                        if isinstance(raw_edid, bytes):
-                                            name = parse_edid_monitor_name(raw_edid)
-                                            if name:
-                                                return name
-                        except Exception:
-                            pass
-        except Exception:
-            pass
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, base) as vendor_key:
+            candidates = []
+            for idx in range(64):
+                try:
+                    candidates.append(winreg.EnumKey(vendor_key, idx))
+                except OSError:
+                    break
+        candidates.sort(key=lambda item: 0 if item.lower() == instance.lower() else 1)
+        for candidate in candidates:
+            try:
+                path = rf"{base}\{candidate}\Device Parameters"
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, path) as params_key:
+                    edid, _typ = winreg.QueryValueEx(params_key, "EDID")
+                name = parse_edid_monitor_name(bytes(edid))
+                if name:
+                    return name
+            except Exception:
+                continue
     except Exception:
         pass
     return None
