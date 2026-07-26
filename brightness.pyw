@@ -824,10 +824,6 @@ class MonitorWidget(QtWidgets.QGroupBox):
         layout.addWidget(self.b_slider.widget)
         layout.addWidget(self.c_slider.widget)
         layout.addWidget(self.link_slider.widget)
-        self.auto_info_label = QtWidgets.QLabel("畫面亮度: -- | 背光亮度: -- | 加權亮度: -- | 目標亮度: -- | 權重: -- | 來源: --")
-        self.auto_info_label.setWordWrap(True)
-        self.auto_info_label.setStyleSheet("color: gray; font-size: 10px;")
-        layout.addWidget(self.auto_info_label)
 
         self.setLayout(layout)
         self.set_ranges(self.monitor.brightness_range, self.monitor.contrast_range)
@@ -974,9 +970,6 @@ class MonitorWidget(QtWidgets.QGroupBox):
             self.setTitle(self.monitor.name)
         else:
             self.setTitle(f"{self.monitor.name} (不可用)")
-
-    def set_auto_info(self, text):
-        self.auto_info_label.setText(text)
 
 
 class MonitorRangeWidget(QtWidgets.QGroupBox):
@@ -3922,13 +3915,10 @@ class MainWindow(QtWidgets.QWidget):
             backlight = float(self.monitor_widgets[idx].link_slider.slider.value())
             if avg is None:
                 state["current"] = None
-                text = f"畫面亮度: -- | 背光亮度: {backlight:.1f}% | 加權亮度: -- | 目標亮度: {target:.1f}% | 權重: {weight:.2f} | 來源: {source}"
             else:
                 c = get_dynamic_content_coeff(avg)
                 current = (avg * c + backlight * weight) / (c + weight)
                 state["current"] = current
-                text = f"畫面亮度: {avg:.1f}% | 背光亮度: {backlight:.1f}% | 加權亮度: {current:.1f}% | 目標亮度: {target:.1f}% | 權重: {weight:.2f} | 來源: {source}"
-            self.monitor_widgets[idx].set_auto_info(text)
 
         currents = [state.get("current") for state in self._monitor_auto_states if state.get("current") is not None]
         self.current_effective_brightness = sum(currents) / len(currents) if currents else None
