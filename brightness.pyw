@@ -1526,17 +1526,6 @@ class ScreenAnalyzer(QtCore.QObject):
 
         self.luminance_updated.emit(lum)
 
-        # 廣播亮度給已連線的 TCP clients（不論 enabled 狀態）
-        try:
-            parent = self.parent()
-            if parent and getattr(parent, "_network_server_enabled", False) and getattr(parent, "_net_server", None):
-                try:
-                    parent._net_server.broadcast_luminance(lum, source)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
         if not self.enabled:
             return
 
@@ -1785,12 +1774,6 @@ class NetworkMonitorServer:
                         self._clients.remove(client)
             except Exception:
                 pass
-
-    def broadcast_luminance(self, value: float, source: str = "—"):
-        """向所有已連線 client 廣播亮度事件（JSON line）。"""
-        payload = {"event": "luminance", "value": float(value), "source": source, "ts": time.time()}
-        log_network_signal("發送", "畫面亮度", f"{float(value):.1f} source={source}")
-        self._broadcast_payload(payload)
 
     def _monitor_snapshot(self):
         if self._get_monitor_state_callback is not None:
