@@ -94,6 +94,12 @@ try:
 except ImportError:
     winreg = None
 
+# DDC 容錯常數
+DDC_WRITE_FAILURES_BEFORE_COOLDOWN = 3
+DDC_WRITE_COOLDOWN_SECONDS = 30.0
+DDC_WRITE_COOLDOWN_MAX_SECONDS = 300.0
+DDC_VCP_WRITE_GAP_SECONDS = 0.01
+
 
 def _rect_to_tuple(rect):
     return (int(rect.left), int(rect.top), int(rect.right), int(rect.bottom))
@@ -413,7 +419,8 @@ def get_windows_physical_monitors():
                 )
 
         return monitors
-    except Exception:
+    except Exception as e:
+        print(f"[DDC] DXVA2 physical monitor scan error: {e}")
         return []
 
 
@@ -456,8 +463,9 @@ class MonitorWrapper:
         self.name = name or f"Display {index + 1}"
         self._cached_brightness: Optional[int] = None
         self._cached_contrast: Optional[int] = None
-        self._consecutive_ddc_write_failures = 0
-        self.DDC_WRITE_FAILURES_BEFORE_COOLDOWN = 3
+        self._ddc_write_error_count = 0
+        self._ddc_write_cooldown_until = 0.0
+        self._ddc_write_state_lock = threading.Lock()
 
         if monitor is None:
             if name and not is_valid_monitor_name(self.name):
@@ -497,18 +505,29 @@ class MonitorWrapper:
             self.supported = False
             self.available = False
 
-    def record_ddc_write_failure(self, error):
-        self._consecutive_ddc_write_failures += 1
-        if self._consecutive_ddc_write_failures >= self.DDC_WRITE_FAILURES_BEFORE_COOLDOWN:
-            self.brightness_supported = False
-            self.available = False
-
     def can_write_ddc(self):
-        if not self.supported or not self.available:
+        if not self.available or self.monitor is None:
             return False
-        if self._consecutive_ddc_write_failures >= self.DDC_WRITE_FAILURES_BEFORE_COOLDOWN:
-            return False
-        return True
+        with self._ddc_write_state_lock:
+            return time.monotonic() >= self._ddc_write_cooldown_until
+
+    def record_ddc_write_success(self):
+        with self._ddc_write_state_lock:
+            self._ddc_write_error_count = 0
+            self._ddc_write_cooldown_until = 0.0
+
+    def record_ddc_write_failure(self, error):
+        with self._ddc_write_state_lock:
+            self._ddc_write_error_count += 1
+            if self._ddc_write_error_count < DDC_WRITE_FAILURES_BEFORE_COOLDOWN:
+                return
+
+            cooldown = min(
+                DDC_WRITE_COOLDOWN_MAX_SECONDS,
+                DDC_WRITE_COOLDOWN_SECONDS * (2 ** max(0, self._ddc_write_error_count - DDC_WRITE_FAILURES_BEFORE_COOLDOWN)),
+            )
+            self._ddc_write_cooldown_until = time.monotonic() + cooldown
+        print(f"[DDC] Write error on {self.name}: {error}; pause DDC writes for {int(cooldown)}s")
 
     def read_current_levels(self):
         if not self.available or self.monitor is None:
@@ -572,24 +591,56 @@ class DDCWorker(QtCore.QRunnable):
         self.contrast_supported = contrast_supported
 
     def run(self):
-        if not self.wrapper.available:
+        if not self.wrapper.available or not self.wrapper.can_write_ddc():
             return
-        if getattr(self.wrapper, "_consecutive_ddc_write_failures", 0) >= 1:
+        if self.monitor is None:
+            self.wrapper.record_ddc_write_failure("monitor handle is not available")
             return
+
+        desired_brightness = int(self.brightness) if self.brightness is not None else None
+        desired_contrast = (
+            int(self.contrast)
+            if self.contrast_supported and self.contrast is not None
+            else None
+        )
+        write_brightness = (
+            desired_brightness is not None
+            and desired_brightness != self.wrapper._cached_brightness
+        )
+        write_contrast = (
+            desired_contrast is not None
+            and desired_contrast != self.wrapper._cached_contrast
+        )
+        if not write_brightness and not write_contrast:
+            return
+
         try:
             with self.lock:
                 with self.monitor as m:
-                    if self.brightness is not None:
-                        m.set_luminance(int(self.brightness))
-                    if self.contrast_supported and self.contrast is not None:
-                        m.set_contrast(int(self.contrast))
-            self.wrapper._consecutive_ddc_write_failures = 0
-            return
+                    if write_brightness:
+                        try:
+                            m.set_luminance(desired_brightness)
+                            self.wrapper._cached_brightness = desired_brightness
+                        except Exception as e:
+                            if wmi_set_brightness(desired_brightness):
+                                self.wrapper._cached_brightness = desired_brightness
+                                self.wrapper.record_ddc_write_success()
+                            else:
+                                self.wrapper.record_ddc_write_failure(f"VCP 0x10 brightness: {e}")
+                            return
+                    if write_brightness and write_contrast:
+                        time.sleep(DDC_VCP_WRITE_GAP_SECONDS)
+                    if write_contrast:
+                        try:
+                            m.set_contrast(desired_contrast)
+                            self.wrapper._cached_contrast = desired_contrast
+                        except Exception as e:
+                            self.wrapper.record_ddc_write_failure(f"VCP 0x12 contrast: {e}")
+                            return
+            self.wrapper.record_ddc_write_success()
         except Exception as e:
-            if self.brightness is not None and wmi_set_brightness(self.brightness):
-                self.wrapper._consecutive_ddc_write_failures = 0
-                return
             self.wrapper.record_ddc_write_failure(e)
+            return
 
 
 # =========================

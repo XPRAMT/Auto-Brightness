@@ -279,6 +279,66 @@ def get_dynamic_content_coeff(luminance):
     return float(AUTO_BRIGHTNESS_CONTENT_COEFF) * factor
 
 
+def qt_key_event_to_name(event, allow_modifiers=False):
+    key = event.key()
+    modifiers = event.modifiers()
+
+    modifier_map = {
+        QtCore.Qt.Key.Key_Control: "Ctrl",
+        QtCore.Qt.Key.Key_Shift: "Shift",
+        QtCore.Qt.Key.Key_Alt: "Alt",
+        QtCore.Qt.Key.Key_Meta: "Win",
+    }
+    if key in modifier_map:
+        return modifier_map[key] if allow_modifiers else None
+
+    if key in (QtCore.Qt.Key.Key_Control, QtCore.Qt.Key.Key_Shift, QtCore.Qt.Key.Key_Alt, QtCore.Qt.Key.Key_Meta):
+        return None
+
+    keypad_modifier = bool(modifiers & QtCore.Qt.KeyboardModifier.KeypadModifier)
+
+    if QtCore.Qt.Key.Key_0 <= key <= QtCore.Qt.Key.Key_9:
+        digit = str(key - QtCore.Qt.Key.Key_0)
+        return f"NumPad{digit}" if keypad_modifier else digit
+
+    if QtCore.Qt.Key.Key_A <= key <= QtCore.Qt.Key.Key_Z:
+        return chr(key)
+
+    if QtCore.Qt.Key.Key_F1 <= key <= QtCore.Qt.Key.Key_F12:
+        return f"F{key - QtCore.Qt.Key.Key_F1 + 1}"
+
+    if key in (QtCore.Qt.Key.Key_Period, QtCore.Qt.Key.Key_Delete) and keypad_modifier:
+        return "NumPad."
+
+    arrow_map = {
+        QtCore.Qt.Key.Key_Left: "Left",
+        QtCore.Qt.Key.Key_Up: "Up",
+        QtCore.Qt.Key.Key_Right: "Right",
+        QtCore.Qt.Key.Key_Down: "Down",
+        QtCore.Qt.Key.Key_PageUp: "PageUp",
+        QtCore.Qt.Key.Key_PageDown: "PageDown",
+        QtCore.Qt.Key.Key_Home: "Home",
+        QtCore.Qt.Key.Key_End: "End",
+    }
+    if key in arrow_map:
+        return arrow_map[key]
+
+    media_map = {
+        QtCore.Qt.Key.Key_VolumeMute: "音量靜音",
+        QtCore.Qt.Key.Key_VolumeDown: "音量降低",
+        QtCore.Qt.Key.Key_VolumeUp: "音量提高",
+        QtCore.Qt.Key.Key_MediaPrevious: "媒體上一首",
+        QtCore.Qt.Key.Key_MediaNext: "媒體下一首",
+        QtCore.Qt.Key.Key_MediaPlay: "媒體播放",
+        QtCore.Qt.Key.Key_MediaPause: "媒體暫停",
+        QtCore.Qt.Key.Key_MediaStop: "媒體停止",
+    }
+    if key in media_map:
+        return media_map[key]
+
+    return None
+
+
 def _network_log_value(value):
     if isinstance(value, bool):
         return "true" if value else "false"
