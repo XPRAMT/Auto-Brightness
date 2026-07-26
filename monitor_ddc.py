@@ -10,6 +10,35 @@ from PyQt6 import QtCore
 
 
 # =========================
+# 跨執行緒 COM 初始化 (WMI/comtypes)
+# =========================
+try:
+    import comtypes
+    HAS_COMTYPES = True
+except ImportError:
+    comtypes = None
+    HAS_COMTYPES = False
+
+
+def _com_init():
+    """在目前執行緒初始化 COM (僅第一次有效)。"""
+    if HAS_COMTYPES:
+        try:
+            comtypes.CoInitialize()
+        except Exception:
+            pass
+
+
+def _com_uninit():
+    """在目前執行緒解除 COM 初始化。"""
+    if HAS_COMTYPES:
+        try:
+            comtypes.CoUninitialize()
+        except Exception:
+            pass
+
+
+# =========================
 # DDC 逾時包裝
 # =========================
 def run_ddc_with_timeout(func, timeout_sec: float = 3.0, default=None):
@@ -51,6 +80,7 @@ except ImportError:
 def wmi_brightness_supported():
     if not HAS_WMI:
         return False
+    _com_init()
     try:
         conn = wmi_mod.WMI(namespace="WMI")
         methods = list(conn.WmiMonitorBrightnessMethods())
@@ -61,8 +91,9 @@ def wmi_brightness_supported():
 
 
 def wmi_set_brightness(value):
-    if not wmi_brightness_supported():
+    if not HAS_WMI:
         return False
+    _com_init()
     try:
         conn = wmi_mod.WMI(namespace="WMI")
         percent = int(max(0, min(100, value)))
@@ -74,8 +105,9 @@ def wmi_set_brightness(value):
 
 
 def wmi_get_brightness():
-    if not wmi_brightness_supported():
+    if not HAS_WMI:
         return None
+    _com_init()
     try:
         conn = wmi_mod.WMI(namespace="WMI")
         monitors = list(conn.WmiMonitorBrightness())
