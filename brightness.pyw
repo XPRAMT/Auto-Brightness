@@ -1240,33 +1240,41 @@ class _CaptureThread(QtCore.QThread):
         self.use_dxgi = True
 
     @classmethod
-    def _hide_dxgi_helper_windows(cls):
-        """隱藏 dxcam 初始化時可能短暫出現的 D3D/DXGI 輔助視窗。"""
+    def _run_suppressed(cls, func, *args, **kwargs):
+        """在 WH_CBT hook 保護下執行 func，攔截執行緒中建立的 DXGI/D3D 輔助視窗。"""
+        hook = None
         try:
             user32 = ctypes.windll.user32
-            current_pid = os.getpid()
+            kernel32 = ctypes.windll.kernel32
+            thread_id = kernel32.GetCurrentThreadId()
 
-            EnumWindowsProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+            CBTProc = ctypes.WINFUNCTYPE(wintypes.LPARAM, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
 
-            @EnumWindowsProc
-            def enum_proc(hwnd, _lparam):
+            @CBTProc
+            def cbt_proc(nCode, wParam, lParam):
+                if nCode in (3, 5):  # HCBT_CREATEWND / HCBT_ACTIVATE
+                    try:
+                        buf = ctypes.create_unicode_buffer(256)
+                        user32.GetClassNameW(wintypes.HWND(wParam), buf, 256)
+                        class_name = buf.value.lower()
+                        for kw in ("corewindow", "direct3d", "d3d", "windowsgraphicscapture", "d3d window"):
+                            if kw in class_name:
+                                user32.ShowWindow(wintypes.HWND(wParam), 0)
+                                break
+                    except Exception:
+                        pass
+                return user32.CallNextHookEx(0, nCode, wParam, lParam)
+
+            hook = user32.SetWindowsHookExW(5, cbt_proc, kernel32.GetModuleHandleW(None), thread_id)
+            return func(*args, **kwargs)
+        except Exception:
+            return func(*args, **kwargs)
+        finally:
+            if hook:
                 try:
-                    proc_id = wintypes.DWORD(0)
-                    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(proc_id))
-                    if proc_id.value != current_pid:
-                        return True
-                    buf = ctypes.create_unicode_buffer(256)
-                    user32.GetClassNameW(hwnd, buf, 256)
-                    class_name = buf.value
-                    if any(kw in class_name for kw in ("Windows.UI.Core.CoreWindow", "Direct3D", "D3D Window", "WindowsGraphicsCapture")):
-                        user32.ShowWindow(hwnd, 0)  # SW_HIDE
+                    ctypes.windll.user32.UnhookWindowsHookEx(hook)
                 except Exception:
                     pass
-                return True
-
-            user32.EnumWindows(enum_proc, 0)
-        except Exception:
-            pass
 
     @classmethod
     def initialize_dxgi(cls) -> list:
@@ -1276,8 +1284,7 @@ class _CaptureThread(QtCore.QThread):
         try:
             # 確保 factory 被初始化（dxcam.create 會設定 __factory）
             if getattr(dxcam, "__factory", None) is None:
-                cls._get_dxgi_camera(0, 0)
-            cls._hide_dxgi_helper_windows()
+                cls._run_suppressed(cls._get_dxgi_camera, 0, 0)
             return get_dxgi_display_targets()
         except Exception as e:
             print(f"DXGI init error: {e}")
@@ -1301,10 +1308,11 @@ class _CaptureThread(QtCore.QThread):
 
         # dxcam 的 factory 會快取 adapter/output；顯示器拔插後必須重新列舉。
         try:
-            factory_type = type(dxcam.DXFactory)
-            factory_type._instances.pop(dxcam.DXFactory, None)
-            dxcam.__factory = dxcam.DXFactory()
-            cls._hide_dxgi_helper_windows()
+            def _recreate_factory():
+                factory_type = type(dxcam.DXFactory)
+                factory_type._instances.pop(dxcam.DXFactory, None)
+                dxcam.__factory = dxcam.DXFactory()
+            cls._run_suppressed(_recreate_factory)
         except Exception as e:
             print(f"DXGI factory reset error: {e}")
             cls._dxgi_disabled = True
