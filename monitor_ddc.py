@@ -12,26 +12,33 @@ from PyQt6 import QtCore
 # =========================
 # 跨執行緒 COM 初始化 (WMI/comtypes)
 # =========================
-try:
-    import comtypes
-    HAS_COMTYPES = True
-except ImportError:
-    comtypes = None
-    HAS_COMTYPES = False
+_comtypes_mod = None
+
+def _get_comtypes():
+    global _comtypes_mod
+    if _comtypes_mod is None:
+        try:
+            import comtypes as _ct
+            _comtypes_mod = _ct
+        except ImportError:
+            _comtypes_mod = False
+    return _comtypes_mod if _comtypes_mod is not False else None
 
 
 def _com_init():
     """在目前執行緒初始化 COM (僅第一次有效)。"""
-    if HAS_COMTYPES:
+    ct = _get_comtypes()
+    if ct:
         try:
-            comtypes.CoInitialize()
+            ct.CoInitialize()
         except Exception:
             pass
 
 
 def _com_uninit():
     """在目前執行緒解除 COM 初始化。"""
-    if HAS_COMTYPES:
+    ct = _get_comtypes()
+    if ct:
         try:
             comtypes.CoUninitialize()
         except Exception:
