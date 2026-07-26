@@ -825,13 +825,6 @@ class MonitorWidget(QtWidgets.QGroupBox):
         layout.addWidget(self.c_slider.widget)
         layout.addWidget(self.link_slider.widget)
 
-        # 只有本機螢幕顯示亮度/加權資訊欄
-        self.auto_info_label = QtWidgets.QLabel("畫面亮度: -- | 背光亮度: -- | 加權亮度: -- | 目標亮度: -- | 權重: -- | 來源: --")
-        self.auto_info_label.setWordWrap(True)
-        self.auto_info_label.setStyleSheet("color: gray; font-size: 10px;")
-        self.auto_info_label.setVisible(not isinstance(monitor_wrapper, RemoteMonitorWrapper))
-        layout.addWidget(self.auto_info_label)
-
         self.setLayout(layout)
         self.set_ranges(self.monitor.brightness_range, self.monitor.contrast_range)
 
@@ -977,10 +970,6 @@ class MonitorWidget(QtWidgets.QGroupBox):
             self.setTitle(self.monitor.name)
         else:
             self.setTitle(f"{self.monitor.name} (不可用)")
-
-    def set_auto_info(self, text):
-        if self.auto_info_label.isVisible():
-            self.auto_info_label.setText(text)
 
 
 class MonitorRangeWidget(QtWidgets.QGroupBox):
@@ -1240,35 +1229,6 @@ class _CaptureThread(QtCore.QThread):
         self.use_dxgi = True
 
     @classmethod
-    def _hide_dxgi_helper_windows(cls):
-        """隱藏 dxcam 初始化時可能短暫出現的 D3D/DXGI 輔助視窗。"""
-        try:
-            user32 = ctypes.windll.user32
-            current_pid = os.getpid()
-
-            EnumWindowsProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-
-            @EnumWindowsProc
-            def enum_proc(hwnd, _lparam):
-                try:
-                    proc_id = wintypes.DWORD(0)
-                    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(proc_id))
-                    if proc_id.value != current_pid:
-                        return True
-                    buf = ctypes.create_unicode_buffer(256)
-                    user32.GetClassNameW(hwnd, buf, 256)
-                    class_name = buf.value
-                    if any(kw in class_name for kw in ("Windows.UI.Core.CoreWindow", "Direct3D", "D3D Window", "WindowsGraphicsCapture")):
-                        user32.ShowWindow(hwnd, 0)  # SW_HIDE
-                except Exception:
-                    pass
-                return True
-
-            user32.EnumWindows(enum_proc, 0)
-        except Exception:
-            pass
-
-    @classmethod
     def initialize_dxgi(cls) -> list:
         """初始化 DXGI 工廠並回傳可用 targets（供 _init_screen_analyzers 等共用）。
         若 dxcam 不可用或初始化失敗則回傳 []. 同時重置信號狀態。"""
@@ -1277,7 +1237,6 @@ class _CaptureThread(QtCore.QThread):
             # 確保 factory 被初始化（dxcam.create 會設定 __factory）
             if getattr(dxcam, "__factory", None) is None:
                 cls._get_dxgi_camera(0, 0)
-            cls._hide_dxgi_helper_windows()
             return get_dxgi_display_targets()
         except Exception as e:
             print(f"DXGI init error: {e}")
@@ -1304,7 +1263,6 @@ class _CaptureThread(QtCore.QThread):
             factory_type = type(dxcam.DXFactory)
             factory_type._instances.pop(dxcam.DXFactory, None)
             dxcam.__factory = dxcam.DXFactory()
-            cls._hide_dxgi_helper_windows()
         except Exception as e:
             print(f"DXGI factory reset error: {e}")
             cls._dxgi_disabled = True
@@ -3957,13 +3915,10 @@ class MainWindow(QtWidgets.QWidget):
             backlight = float(self.monitor_widgets[idx].link_slider.slider.value())
             if avg is None:
                 state["current"] = None
-                text = f"畫面亮度: -- | 背光亮度: {backlight:.1f}% | 加權亮度: -- | 目標亮度: {target:.1f}% | 權重: {weight:.2f} | 來源: {source}"
             else:
                 c = get_dynamic_content_coeff(avg)
                 current = (avg * c + backlight * weight) / (c + weight)
                 state["current"] = current
-                text = f"畫面亮度: {avg:.1f}% | 背光亮度: {backlight:.1f}% | 加權亮度: {current:.1f}% | 目標亮度: {target:.1f}% | 權重: {weight:.2f} | 來源: {source}"
-            self.monitor_widgets[idx].set_auto_info(text)
 
         currents = [state.get("current") for state in self._monitor_auto_states if state.get("current") is not None]
         self.current_effective_brightness = sum(currents) / len(currents) if currents else None
