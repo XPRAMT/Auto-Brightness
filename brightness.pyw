@@ -1407,6 +1407,8 @@ class ScreenAnalyzer(QtCore.QObject):
         self._no_change_elapsed_seconds = 0.0
         self._last_captured_luminance = None
         self._last_luminance = None
+        self._dxgi_luminance_samples = []
+        self._dxgi_luminance_window_started_at = None
         self._current_ddc = 50
         self._current_ddc_float = 50.0
         self._desired_ddc = 50.0
@@ -1517,11 +1519,7 @@ class ScreenAnalyzer(QtCore.QObject):
         self._last_source = source
         self.luminance_source_updated.emit(source)
         if source == "DXGI":
-            display = self.dxgi_display_name or f"D{self.dxgi_device_idx}O{self.dxgi_output_idx}"
-            log_dxgi(
-                f"{display} (device={self.dxgi_device_idx}, output={self.dxgi_output_idx}) "
-                f"畫面亮度={lum:.2f}%"
-            )
+            self._record_dxgi_luminance(lum)
 
         if self.resource_saving_enabled:
             if self._last_captured_luminance is not None:
@@ -1575,6 +1573,36 @@ class ScreenAnalyzer(QtCore.QObject):
 
         if self._direction != 0 and not self._adjust_timer.isActive():
             self._adjust_timer.start()
+
+    def _record_dxgi_luminance(self, lum):
+        if not DXGI_DEBUG_LOG_ENABLED:
+            self._dxgi_luminance_samples.clear()
+            self._dxgi_luminance_window_started_at = None
+            return
+
+        now = time.monotonic()
+        if self._dxgi_luminance_window_started_at is None:
+            self._dxgi_luminance_window_started_at = now
+        self._dxgi_luminance_samples.append(float(lum))
+        if now - self._dxgi_luminance_window_started_at < 60.0:
+            return
+
+        samples = self._dxgi_luminance_samples
+        display = self.dxgi_display_name or f"D{self.dxgi_device_idx}O{self.dxgi_output_idx}"
+        if len(samples) <= 12:
+            sample_text = ",".join(f"{value:.2f}%" for value in samples)
+        else:
+            head = ",".join(f"{value:.2f}%" for value in samples[:6])
+            tail = ",".join(f"{value:.2f}%" for value in samples[-6:])
+            sample_text = f"{head},...,{tail}"
+        log_dxgi(
+            f"{display} (device={self.dxgi_device_idx}, output={self.dxgi_output_idx}) "
+            f"1分鐘內畫面亮度 n={len(samples)} min={min(samples):.2f}% "
+            f"avg={sum(samples) / len(samples):.2f}% max={max(samples):.2f}% "
+            f"samples={sample_text}"
+        )
+        self._dxgi_luminance_samples = []
+        self._dxgi_luminance_window_started_at = now
 
     def _tick_adjust(self):
         if not self.enabled or self._direction == 0:
