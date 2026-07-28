@@ -52,6 +52,7 @@ AUTO_BRIGHTNESS_CONTENT_COEFF_MAX_FACTOR = 1.5
 AUTO_BRIGHTNESS_WEIGHT_DEFAULT = 1.0
 NETWORK_DEBUG_LOG_ENABLED = False
 DEBUG_LOG_ENABLED = False
+DXGI_DEBUG_LOG_ENABLED = False
 
 
 def log_msg(*args):
@@ -61,6 +62,11 @@ def log_msg(*args):
     millis = int((now - secs) * 1000)
     h, m, s = secs // 3600 % 24, secs // 60 % 60, secs % 60
     print(f"[{h:02d}:{m:02d}:{s:02d}.{millis:03d}]{' '.join(str(a) for a in args)}")
+
+
+def log_dxgi(message):
+    if DXGI_DEBUG_LOG_ENABLED:
+        log_msg(f"DXGI {message}")
 
 
 MODIFIER_ORDER = ["Alt", "Ctrl", "Shift", "Win"]
@@ -256,7 +262,7 @@ def get_dxgi_display_targets():
 
         return sorted(targets, key=sort_key)
     except Exception as e:
-        print(f"DXGI output mapping error: {e}")
+        log_dxgi(f"output mapping error: {e}")
         return []
 
 
@@ -1251,7 +1257,7 @@ class _CaptureThread(QtCore.QThread):
                 cls._get_dxgi_camera(0, 0)
             return get_dxgi_display_targets()
         except Exception as e:
-            print(f"DXGI init error: {e}")
+            log_dxgi(f"init error: {e}")
             cls._dxgi_disabled = True
             return []
 
@@ -1276,7 +1282,7 @@ class _CaptureThread(QtCore.QThread):
             factory_type._instances.pop(dxcam.DXFactory, None)
             dxcam.__factory = dxcam.DXFactory()
         except Exception as e:
-            print(f"DXGI factory reset error: {e}")
+            log_dxgi(f"factory reset error: {e}")
             cls._dxgi_disabled = True
 
     @classmethod
@@ -1284,7 +1290,7 @@ class _CaptureThread(QtCore.QThread):
         """由擷取執行緒標記恢復需求；資源釋放必須留給 UI 執行緒協調。"""
         with cls._dxgi_lock:
             if not cls._dxgi_reset_requested:
-                print("DXGI output changed; scheduling camera recreation.")
+                log_dxgi("output changed; scheduling camera recreation.")
             cls._dxgi_reset_requested = True
 
     @classmethod
@@ -1352,7 +1358,7 @@ class _CaptureThread(QtCore.QThread):
             avg = np.mean(downsampled)
             return avg / 255.0 * 100.0
         except Exception as e:
-            print(f"DXGI 截圖錯誤 (device={device_idx}, output={output_idx}): {e}")
+            log_dxgi(f"截圖錯誤 (device={device_idx}, output={output_idx}): {e}")
             if "0x887A0026" in str(e):
                 camera = None
                 self.__class__.request_dxgi_reset()
@@ -1510,6 +1516,12 @@ class ScreenAnalyzer(QtCore.QObject):
         self._last_luminance = lum
         self._last_source = source
         self.luminance_source_updated.emit(source)
+        if source == "DXGI":
+            display = self.dxgi_display_name or f"D{self.dxgi_device_idx}O{self.dxgi_output_idx}"
+            log_dxgi(
+                f"{display} (device={self.dxgi_device_idx}, output={self.dxgi_output_idx}) "
+                f"畫面亮度={lum:.2f}%"
+            )
 
         if self.resource_saving_enabled:
             if self._last_captured_luminance is not None:
@@ -2261,6 +2273,7 @@ class MainWindow(QtWidgets.QWidget):
         self.auto_start_enabled = False
         self.network_debug_enabled = False
         self.debug_log_enabled = False
+        self.dxgi_debug_enabled = False
         self.level_shortcuts = [dict(item) for item in DEFAULT_LEVEL_SHORTCUTS]
         self.global_hook = None
         self._loading_settings = False
@@ -2561,12 +2574,16 @@ class MainWindow(QtWidgets.QWidget):
 
             dxgi_target = dxgi_targets[dxgi_idx] if dxgi_targets and dxgi_idx < len(dxgi_targets) else None
             if dxgi_target is None:
-                print(f"DXGI target missing for monitor {wrapper.name}")
+                log_dxgi(f"target missing for monitor {wrapper.name}")
                 self._monitor_auto_states.append({"avg": None, "source": "—", "current": None})
                 self.screen_analyzers.append(None)
                 dxgi_idx += 1
                 continue
 
+            log_dxgi(
+                f"{wrapper.name} -> {dxgi_target.get('display_name', 'unknown')} "
+                f"(device={dxgi_target['device_idx']}, output={dxgi_target['output_idx']})"
+            )
             analyzer = ScreenAnalyzer(self, output_idx=dxgi_idx, dxgi_target=dxgi_target)
             self._configure_screen_analyzer(analyzer)
             if dxgi_idx < len(self.monitor_widgets):
@@ -2726,6 +2743,11 @@ class MainWindow(QtWidgets.QWidget):
         self.link_debug_checkbox.setChecked(self.debug_log_enabled)
         self.link_debug_checkbox.toggled.connect(self.on_link_debug_toggled)
         global_grid.addWidget(self.link_debug_checkbox, 3, 0, 1, 2)
+
+        self.dxgi_debug_checkbox = QtWidgets.QCheckBox("Debug DXGI 狀態")
+        self.dxgi_debug_checkbox.setChecked(self.dxgi_debug_enabled)
+        self.dxgi_debug_checkbox.toggled.connect(self.on_dxgi_debug_toggled)
+        global_grid.addWidget(self.dxgi_debug_checkbox, 4, 0, 1, 2)
         global_group.setLayout(global_grid)
         gen_layout.addWidget(global_group)
 
@@ -2968,7 +2990,7 @@ class MainWindow(QtWidgets.QWidget):
         self._refresh_in_progress = True
         try:
             if not self._stop_screen_analyzers_for_refresh():
-                print("  DXGI 擷取尚在結束，稍後重試重新偵測")
+                log_dxgi("擷取尚在結束，稍後重試重新偵測")
                 QtCore.QTimer.singleShot(250, self.refresh_monitors)
                 return
 
@@ -4067,6 +4089,12 @@ class MainWindow(QtWidgets.QWidget):
         DEBUG_LOG_ENABLED = self.debug_log_enabled
         self.trigger_save()
 
+    def on_dxgi_debug_toggled(self, checked):
+        global DXGI_DEBUG_LOG_ENABLED
+        self.dxgi_debug_enabled = bool(checked)
+        DXGI_DEBUG_LOG_ENABLED = self.dxgi_debug_enabled
+        self.trigger_save()
+
     def create_tray_icon(self, current_value, target_value=None):
         """ 動態繪製托盤圖示；啟用自動亮度時顯示上下兩行數值 """
         pixmap = QtGui.QPixmap(32, 32)
@@ -4242,6 +4270,7 @@ class MainWindow(QtWidgets.QWidget):
             "auto_start": self.auto_start_enabled,
             "network_debug": self.network_debug_enabled,
             "debug_log": self.debug_log_enabled,
+            "dxgi_debug": self.dxgi_debug_enabled,
             "shortcut": {
                 "key1": self.shortcut_key1,
                 "key2": self.shortcut_key2,
@@ -4307,6 +4336,7 @@ class MainWindow(QtWidgets.QWidget):
             saved_auto_start = data.get("auto_start", self.is_startup_enabled()) if isinstance(data, dict) else self.is_startup_enabled()
             saved_network_debug = bool(data.get("network_debug", False)) if isinstance(data, dict) else False
             saved_debug_log = bool(data.get("debug_log", False)) if isinstance(data, dict) else False
+            saved_dxgi_debug = bool(data.get("dxgi_debug", False)) if isinstance(data, dict) else False
             shortcut = data.get("shortcut", {}) if isinstance(data, dict) else {}
             saved_level_shortcuts = data.get("level_shortcuts", [dict(item) for item in DEFAULT_LEVEL_SHORTCUTS]) if isinstance(data, dict) else [dict(item) for item in DEFAULT_LEVEL_SHORTCUTS]
             saved_trigger_keys = shortcut.get("keys") if isinstance(shortcut, dict) else None
@@ -4341,6 +4371,9 @@ class MainWindow(QtWidgets.QWidget):
             self.debug_log_enabled = saved_debug_log
             global DEBUG_LOG_ENABLED
             DEBUG_LOG_ENABLED = self.debug_log_enabled
+            self.dxgi_debug_enabled = saved_dxgi_debug
+            global DXGI_DEBUG_LOG_ENABLED
+            DXGI_DEBUG_LOG_ENABLED = self.dxgi_debug_enabled
 
             # 先決定是否啟用自動調整，避免啟動流程誤下發 DDC 指令
             self.auto_adjust_enabled = bool(auto_adjust_data.get("enabled", False))
@@ -4422,6 +4455,10 @@ class MainWindow(QtWidgets.QWidget):
                 self.link_debug_checkbox.blockSignals(True)
                 self.link_debug_checkbox.setChecked(self.debug_log_enabled)
                 self.link_debug_checkbox.blockSignals(False)
+            if hasattr(self, "dxgi_debug_checkbox"):
+                self.dxgi_debug_checkbox.blockSignals(True)
+                self.dxgi_debug_checkbox.setChecked(self.dxgi_debug_enabled)
+                self.dxgi_debug_checkbox.blockSignals(False)
             self.auto_adjust_checkbox.blockSignals(True)
             if hasattr(self, "main_auto_adjust_checkbox"):
                 self.main_auto_adjust_checkbox.blockSignals(True)
