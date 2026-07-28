@@ -62,8 +62,11 @@ def log_msg(*args):
     now = time.time()
     secs = int(now)
     millis = int((now - secs) * 1000)
-    h, m, s = secs // 3600 % 24, secs // 60 % 60, secs % 60
-    line = f"[{h:02d}:{m:02d}:{s:02d}.{millis:03d}]{' '.join(str(a) for a in args)}"
+    local_time = time.localtime(now)
+    line = (
+        f"[{local_time.tm_hour:02d}:{local_time.tm_min:02d}:{local_time.tm_sec:02d}.{millis:03d}]"
+        f"{' '.join(str(a) for a in args)}"
+    )
     print(line)
     try:
         with _LOG_WRITE_LOCK:
