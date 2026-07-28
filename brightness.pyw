@@ -1356,10 +1356,9 @@ class _CaptureThread(QtCore.QThread):
                 return None
 
             # 進行截圖（numpy array）
-            frame = camera.grab()
+            # 靜態桌面沒有新 frame 時，沿用最近一次成功擷取；這不是 output change。
+            frame = camera.grab(new_frame_only=False)
             if frame is None:
-                camera = None
-                self.__class__.request_dxgi_reset()
                 return None
 
             # 轉為灰度並計算平均值
