@@ -43,6 +43,8 @@ except ImportError:
 
 SETTINGS_FILE = "settings.json"
 SETTINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), SETTINGS_FILE)
+LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "brightness.log")
+_LOG_WRITE_LOCK = threading.Lock()
 
 # 自動亮度公式係數（可在此統一調整）
 # 當前亮度 = (avg * AUTO_BRIGHTNESS_CONTENT_COEFF + backlight * weight) / (AUTO_BRIGHTNESS_CONTENT_COEFF + weight)
@@ -61,7 +63,14 @@ def log_msg(*args):
     secs = int(now)
     millis = int((now - secs) * 1000)
     h, m, s = secs // 3600 % 24, secs // 60 % 60, secs % 60
-    print(f"[{h:02d}:{m:02d}:{s:02d}.{millis:03d}]{' '.join(str(a) for a in args)}")
+    line = f"[{h:02d}:{m:02d}:{s:02d}.{millis:03d}]{' '.join(str(a) for a in args)}"
+    print(line)
+    try:
+        with _LOG_WRITE_LOCK:
+            with open(LOG_PATH, "a", encoding="utf-8") as log_file:
+                log_file.write(line + "\n")
+    except OSError:
+        pass
 
 
 def log_dxgi(message):
