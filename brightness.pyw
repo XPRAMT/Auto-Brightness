@@ -1934,6 +1934,18 @@ class NetworkMonitorClient(QtCore.QObject):
                 return
         except Exception:
             pass
+        existing = self._discovered_servers.get(name)
+        if existing is not None:
+            old_info = existing["info"]
+            old_addresses = old_info.parsed_addresses()
+            new_addresses = info.parsed_addresses()
+            endpoint_changed = old_addresses != new_addresses or old_info.port != info.port
+            existing["info"] = info
+            if endpoint_changed:
+                self._stop_subscription(name)
+                self._query_server(name)
+                self._start_subscription(name)
+            return
         self._discovered_servers[name] = {"info": info, "monitors": [], "state": {}}
         self._query_server(name)
         self._start_subscription(name)
@@ -2003,6 +2015,14 @@ class NetworkMonitorClient(QtCore.QObject):
             return
         monitors = message.get("monitors", [])
         normalized_monitors = [dict(m) for m in monitors if isinstance(m, dict)] if isinstance(monitors, list) else []
+        if not normalized_monitors and entry.get("monitors"):
+            empty_since = entry.setdefault("_empty_monitor_snapshot_since", time.monotonic())
+            if time.monotonic() - empty_since < 15.0:
+                if DEBUG_LOG_ENABLED:
+                    log_msg(f"Ignore transient empty monitor snapshot from {name}")
+                return
+        else:
+            entry.pop("_empty_monitor_snapshot_since", None)
         state = {}
         if "auto_target" in message:
             state["auto_target"] = message.get("auto_target")
