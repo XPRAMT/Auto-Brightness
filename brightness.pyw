@@ -2039,7 +2039,7 @@ class NetworkMonitorClient(QtCore.QObject):
         hostname = info.properties.get(b"hostname", b"unknown").decode()
         monitor_count = len(entry["monitors"])
         if entry.get("_last_monitor_count") != monitor_count:
-            print(f"Remote server {hostname}: {monitor_count} monitors")
+            log_msg(f"Remote server {hostname}: {monitor_count} monitors")
             entry["_last_monitor_count"] = monitor_count
         self._emit_remote_monitors()
         if state:
