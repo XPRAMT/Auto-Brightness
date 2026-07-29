@@ -3019,18 +3019,42 @@ class MainWindow(QtWidgets.QWidget):
 
         for thread in threads:
             thread.wait(wait_ms)
-        return not any(thread.isRunning() for thread in threads)
+        running_threads = [thread for thread in threads if thread.isRunning()]
+        if running_threads:
+            self._wait_for_dxgi_capture_threads(running_threads)
+            return False
+        return True
+
+    def _wait_for_dxgi_capture_threads(self, threads):
+        """等待 DXGI worker 收尾，不以短間隔輪詢重複執行完整重新偵測。"""
+        if getattr(self, "_waiting_for_dxgi_capture_stop", False):
+            return
+        self._waiting_for_dxgi_capture_stop = True
+        log_dxgi("擷取尚在結束，等待背景 thread 結束後再重新偵測")
+        for thread in threads:
+            thread.finished.connect(self._resume_monitor_refresh_after_dxgi_capture)
+
+    def _resume_monitor_refresh_after_dxgi_capture(self):
+        if not getattr(self, "_waiting_for_dxgi_capture_stop", False):
+            return
+        for analyzer in getattr(self, "screen_analyzers", []):
+            thread = getattr(analyzer, "_capture_thread", None) if analyzer is not None else None
+            if thread is not None and thread.isRunning():
+                return
+        self._waiting_for_dxgi_capture_stop = False
+        if not self._is_quitting:
+            QtCore.QTimer.singleShot(0, self.refresh_monitors)
 
     def refresh_monitors(self):
         """釋放舊資源後，使用與程式啟動相同的流程重新偵測螢幕。"""
+        if getattr(self, "_waiting_for_dxgi_capture_stop", False):
+            return
         if getattr(self, "_refresh_in_progress", False):
             print("  重新偵測已在進行中，跳過")
             return
         self._refresh_in_progress = True
         try:
             if not self._stop_screen_analyzers_for_refresh():
-                log_dxgi("擷取尚在結束，稍後重試重新偵測")
-                QtCore.QTimer.singleShot(250, self.refresh_monitors)
                 return
 
             self._initializing_ui = True
