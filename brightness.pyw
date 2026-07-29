@@ -3033,6 +3033,8 @@ class MainWindow(QtWidgets.QWidget):
         log_dxgi("擷取尚在結束，等待背景 thread 結束後再重新偵測")
         for thread in threads:
             thread.finished.connect(self._resume_monitor_refresh_after_dxgi_capture)
+        # 避免 thread 恰好在 isRunning() 檢查與 finished.connect() 間結束而遺失通知。
+        self._resume_monitor_refresh_after_dxgi_capture()
 
     def _resume_monitor_refresh_after_dxgi_capture(self):
         if not getattr(self, "_waiting_for_dxgi_capture_stop", False):
