@@ -81,6 +81,16 @@ def log_dxgi(message):
         log_msg(f"DXGI {message}")
 
 
+class NoWheelComboBox(QtWidgets.QComboBox):
+    """收合時忽略滾輪，避免意外切換目前選項。"""
+
+    def wheelEvent(self, event):
+        if self.view().isVisible():
+            super().wheelEvent(event)
+        else:
+            event.ignore()
+
+
 MODIFIER_ORDER = ["Alt", "Ctrl", "Shift", "Win"]
 SHORTCUT_MODIFIER_OPTIONS = ["None"] + MODIFIER_ORDER
 SHORTCUT_KEY_OPTIONS = (
@@ -1082,7 +1092,7 @@ class ShortcutConfigRow(QtWidgets.QWidget):
         self.key1_button = KeyCaptureButton(allow_none=True, allow_modifiers=True)
         self.key2_button = KeyCaptureButton(allow_none=True, allow_modifiers=True)
         self.key3_button = KeyCaptureButton(allow_none=True, allow_modifiers=True)
-        self.type_combo = QtWidgets.QComboBox()
+        self.type_combo = NoWheelComboBox()
         self.type_combo.addItems(SHORTCUT_TYPE_OPTIONS)
         self.value_label = QtWidgets.QLabel("亮度 %")
         self.value_spin = QtWidgets.QSpinBox()
@@ -2752,7 +2762,7 @@ class MainWindow(QtWidgets.QWidget):
         global_grid.setContentsMargins(6, 6, 6, 6)
         global_grid.setSpacing(6)
 
-        self.step_combo = QtWidgets.QComboBox()
+        self.step_combo = NoWheelComboBox()
         STEP_OPTIONS = ["1", "2", "2.5", "4", "5","10"]
         self.step_combo.addItems(STEP_OPTIONS)
         default_idx = 0
@@ -2868,7 +2878,7 @@ class MainWindow(QtWidgets.QWidget):
         self.auto_adjust_k_spin.setToolTip("倍率係數，同時作用於曲線與線性模式，越大越快。預設 0.8")
         self.auto_adjust_k_spin.valueChanged.connect(self.on_auto_adjust_settings_changed)
 
-        self.auto_adjust_mode_combo = QtWidgets.QComboBox()
+        self.auto_adjust_mode_combo = NoWheelComboBox()
         self.auto_adjust_mode_combo.addItems(["曲線 (sqrt)", "線性"])
         self.auto_adjust_mode_combo.setCurrentIndex({"sqrt": 0, "linear": 1}.get(self.auto_adjust_mode, 0))
         self.auto_adjust_mode_combo.currentIndexChanged.connect(self.on_auto_adjust_settings_changed)
@@ -2964,7 +2974,7 @@ class MainWindow(QtWidgets.QWidget):
         net_grid.setContentsMargins(6, 6, 6, 6)
         net_grid.setSpacing(6)
 
-        self.net_mode_combo = QtWidgets.QComboBox()
+        self.net_mode_combo = NoWheelComboBox()
         self.net_mode_combo.addItems(["停用", "啟用伺服器", "啟用用戶端"])
         self.net_mode_combo.setCurrentIndex({"disabled": 0, "server": 1, "client": 2}.get(self._network_mode, 0))
         self.net_mode_combo.currentIndexChanged.connect(self._on_net_mode_changed)
