@@ -91,6 +91,20 @@ class NoWheelComboBox(QtWidgets.QComboBox):
             event.ignore()
 
 
+class NoWheelSpinBox(QtWidgets.QSpinBox):
+    """忽略滾輪，避免捲動頁面時意外修改數值。"""
+
+    def wheelEvent(self, event):
+        event.ignore()
+
+
+class NoWheelDoubleSpinBox(QtWidgets.QDoubleSpinBox):
+    """忽略滾輪，避免捲動頁面時意外修改數值。"""
+
+    def wheelEvent(self, event):
+        event.ignore()
+
+
 MODIFIER_ORDER = ["Alt", "Ctrl", "Shift", "Win"]
 SHORTCUT_MODIFIER_OPTIONS = ["None"] + MODIFIER_ORDER
 SHORTCUT_KEY_OPTIONS = (
@@ -1028,10 +1042,10 @@ class MonitorRangeWidget(QtWidgets.QGroupBox):
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(6)
 
-        self.b_min = QtWidgets.QSpinBox()
-        self.b_max = QtWidgets.QSpinBox()
-        self.c_min = QtWidgets.QSpinBox()
-        self.c_max = QtWidgets.QSpinBox()
+        self.b_min = NoWheelSpinBox()
+        self.b_max = NoWheelSpinBox()
+        self.c_min = NoWheelSpinBox()
+        self.c_max = NoWheelSpinBox()
 
         for widget in [self.b_min, self.b_max, self.c_min, self.c_max]:
             widget.setRange(0, 100)
@@ -1095,7 +1109,7 @@ class ShortcutConfigRow(QtWidgets.QWidget):
         self.type_combo = NoWheelComboBox()
         self.type_combo.addItems(SHORTCUT_TYPE_OPTIONS)
         self.value_label = QtWidgets.QLabel("亮度 %")
-        self.value_spin = QtWidgets.QSpinBox()
+        self.value_spin = NoWheelSpinBox()
         self.value_spin.setRange(0, 100)
         self.value_label.setFixedWidth(self.value_label.sizeHint().width())
         self.value_spin.setFixedWidth(max(70, self.value_spin.sizeHint().width()))
@@ -2870,7 +2884,7 @@ class MainWindow(QtWidgets.QWidget):
         self.auto_adjust_checkbox.setChecked(self.auto_adjust_enabled)
         self.auto_adjust_checkbox.toggled.connect(self.on_auto_adjust_toggled)
 
-        self.auto_adjust_k_spin = QtWidgets.QDoubleSpinBox()
+        self.auto_adjust_k_spin = NoWheelDoubleSpinBox()
         self.auto_adjust_k_spin.setRange(0.01, 5.0)
         self.auto_adjust_k_spin.setSingleStep(0.05)
         self.auto_adjust_k_spin.setDecimals(2)
@@ -2883,7 +2897,7 @@ class MainWindow(QtWidgets.QWidget):
         self.auto_adjust_mode_combo.setCurrentIndex({"sqrt": 0, "linear": 1}.get(self.auto_adjust_mode, 0))
         self.auto_adjust_mode_combo.currentIndexChanged.connect(self.on_auto_adjust_settings_changed)
 
-        self.auto_adjust_weight_spin = QtWidgets.QDoubleSpinBox()
+        self.auto_adjust_weight_spin = NoWheelDoubleSpinBox()
         self.auto_adjust_weight_spin.setRange(0.1, 10.0)
         self.auto_adjust_weight_spin.setSingleStep(0.1)
         self.auto_adjust_weight_spin.setDecimals(2)
@@ -2891,7 +2905,7 @@ class MainWindow(QtWidgets.QWidget):
         self.auto_adjust_weight_spin.setToolTip("背光權重，預設 1.0")
         self.auto_adjust_weight_spin.valueChanged.connect(self.on_auto_adjust_settings_changed)
 
-        self.auto_adjust_capture_interval_spin = QtWidgets.QDoubleSpinBox()
+        self.auto_adjust_capture_interval_spin = NoWheelDoubleSpinBox()
         self.auto_adjust_capture_interval_spin.setRange(0.1, 5.0)
         self.auto_adjust_capture_interval_spin.setSingleStep(0.01)
         self.auto_adjust_capture_interval_spin.setDecimals(2)
@@ -2904,7 +2918,7 @@ class MainWindow(QtWidgets.QWidget):
         self.auto_adjust_resource_saving_checkbox.setChecked(self.auto_adjust_resource_saving_enabled)
         self.auto_adjust_resource_saving_checkbox.toggled.connect(self.on_auto_adjust_settings_changed)
 
-        self.auto_adjust_resource_saving_idle_spin = QtWidgets.QDoubleSpinBox()
+        self.auto_adjust_resource_saving_idle_spin = NoWheelDoubleSpinBox()
         self.auto_adjust_resource_saving_idle_spin.setRange(0.1, 60.0)
         self.auto_adjust_resource_saving_idle_spin.setSingleStep(0.1)
         self.auto_adjust_resource_saving_idle_spin.setDecimals(1)
@@ -2913,7 +2927,7 @@ class MainWindow(QtWidgets.QWidget):
         self.auto_adjust_resource_saving_idle_spin.setToolTip("畫面亮度差異為 0 持續多久後，開始倍增截圖間隔")
         self.auto_adjust_resource_saving_idle_spin.valueChanged.connect(self.on_auto_adjust_settings_changed)
 
-        self.auto_adjust_tick_interval_spin = QtWidgets.QSpinBox()
+        self.auto_adjust_tick_interval_spin = NoWheelSpinBox()
         self.auto_adjust_tick_interval_spin.setRange(10, 2000)
         self.auto_adjust_tick_interval_spin.setSingleStep(10)
         self.auto_adjust_tick_interval_spin.setValue(self.auto_adjust_tick_interval)
